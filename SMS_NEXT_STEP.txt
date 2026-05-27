@@ -1,0 +1,29 @@
+SMS — CONFIGURED (Semaphore)
+============================
+
+Firebase function onSmsRequestSend is DEPLOYED with SEMAPHORE_API_KEY (from functions/.env.jurislink-app).
+
+After changing the API key, edit functions/.env.jurislink-app then:
+
+  firebase deploy --only functions:onSmsRequestSend
+
+Optional (instead of .env): .\scripts\set-semaphore-cloudrun.ps1 -ApiKey "YOUR_KEY"
+
+Firestore "sent" with providerMessageId = "semaphore" means NO real SMS was queued
+(invalid API key or no credits). A real send shows providerMessageId like "12345678".
+
+6) Hot restart Flutter app and test signup with your phone 09XXXXXXXXX
+
+7) Check Firestore → sms_requests → latest doc → status should be "sent"
+
+---
+
+Supabase Edge (faster path for app — optional):
+
+  .\scripts\install-supabase-cli-windows.ps1
+  .\scripts\supabase-set-semaphore-secrets.ps1 -ApiKey "YOUR_KEY_HERE"
+
+---
+
+Without SEMAPHORE_API_KEY, SMS will queue but status = failed with error
+"No SMS provider configured".

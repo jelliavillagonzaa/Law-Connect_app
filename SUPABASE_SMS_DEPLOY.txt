@@ -1,0 +1,32 @@
+SMS via Supabase Edge Function (send-sms)
+========================================
+
+Philippines (recommended): Semaphore — https://semaphore.co
+International: Twilio
+
+1) Install Supabase CLI: https://supabase.com/docs/guides/cli
+
+2) Link project (once):
+   supabase link --project-ref upevoqkiufiqgyfrepfg
+
+3a) Semaphore secrets:
+   supabase secrets set SEMAPHORE_API_KEY=your_key
+   supabase secrets set FIREBASE_PROJECT_ID=jurislink-app
+
+3b) OR Twilio secrets:
+   supabase secrets set TWILIO_ACCOUNT_SID=ACxxxxxxxx
+   supabase secrets set TWILIO_AUTH_TOKEN=xxxxxxxx
+   supabase secrets set TWILIO_FROM_NUMBER=+1xxxxxxxxxx
+   supabase secrets set FIREBASE_PROJECT_ID=jurislink-app
+
+4) Deploy:
+   supabase functions deploy send-sms
+
+5) Firebase backup (when Supabase fails, app uses Firestore sms_requests):
+   Set SEMAPHORE_API_KEY in Function env OR Twilio secrets, then:
+   firebase deploy --only functions:onSmsRequestSend,firestore:indexes
+
+6) Flutter: supabase_local_overrides.dart must have URL + anon key.
+   Run: .\scripts\setup-sms.ps1 for guided setup.
+
+See docs/SMS_SETUP_PH.md for full guide.

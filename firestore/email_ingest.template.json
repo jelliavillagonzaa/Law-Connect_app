@@ -1,0 +1,10 @@
+{
+  "automationUserId": "REPLACE_WITH_FIREBASE_AUTH_UID",
+  "defaultAttorneyId": null,
+  "notifyUserIds": [],
+  "pythonOcrUrl": "https://YOUR-PYTHON-OCR-CLOUD-RUN.run.app",
+  "imapHost": "imap.gmail.com",
+  "imapMailboxes": ["INBOX", "[Gmail]/Spam"],
+  "autoCreateMinConfidence": "high",
+  "allowedFromDomains": []
+}

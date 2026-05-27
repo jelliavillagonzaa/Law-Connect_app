@@ -1,0 +1,46 @@
+{
+  "project_info": {
+    "project_number": "969711743833",
+    "project_id": "jurislink-app",
+    "storage_bucket": "jurislink-app.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:969711743833:android:12db52dbd2114b941e1248",
+        "android_client_info": {
+          "package_name": "com.example.jurislink_app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "969711743833-n1k5ppfu3q8b24dtlcm8akg58j4fsfiq.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDYhAD-NA5fr_xayommEg9vGP0WyuqGLqM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "969711743833-n1k5ppfu3q8b24dtlcm8akg58j4fsfiq.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "969711743833-qqsni8trq344q2bfn92rnvi3tk7m184g.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.jurislinkApp"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

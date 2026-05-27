@@ -1,0 +1,12 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET"/>
+
+  <application>
+    <!-- Fixed App Check debug secret (debug builds only). Register this UUID in
+         Firebase Console → App Check → Apps → Android → Manage debug tokens:
+         c4e8a1f2-6d3b-4f9e-a7c2-010203040506 -->
+    <meta-data
+        android:name="firebaseAppCheckDebugSecret"
+        android:value="c4e8a1f2-6d3b-4f9e-a7c2-010203040506" />
+  </application>
+</manifest>

@@ -1,0 +1,15 @@
+{
+  "name": "law-connect-sms-worker",
+  "private": true,
+  "version": "1.0.0",
+  "description": "SMS Worker: Firestore sms_requests -> Android SMS gateway",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  }
+}
+
+

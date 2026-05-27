@@ -1,0 +1,89 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Profile photos - users can upload/update their own photos
+    match /profile_photos/{userId}/{fileName} {
+      // Allow read: anyone can read profile photos (for displaying)
+      allow read: if true;
+      
+      // Allow write: only the user can upload/update their own profile photo
+      allow write: if request.auth != null 
+                  && request.auth.uid == userId
+                  && request.resource.size < 5 * 1024 * 1024 // 5MB limit
+                  && request.resource.contentType.matches('image/.*');
+      
+      // Allow delete: only the user can delete their own photo
+      allow delete: if request.auth != null && request.auth.uid == userId;
+    }
+    
+    // Chat attachments - participants can upload
+    match /chat_attachments/{chatId}/{fileName} {
+      // Allow read: authenticated users can read
+      allow read: if request.auth != null;
+      
+      // Allow write: authenticated users can upload
+      allow write: if request.auth != null
+                  && request.resource.size < 10 * 1024 * 1024 // 10MB limit
+                  && (request.resource.contentType.matches('image/.*')
+                      || request.resource.contentType.matches('application/pdf')
+                      || request.resource.contentType.matches('application/.*'));
+      
+      // Allow delete: authenticated users can delete
+      allow delete: if request.auth != null;
+    }
+    
+    // Case documents - case participants can upload
+    match /case_documents/{caseId}/{fileName} {
+      // Allow read: authenticated users can read
+      allow read: if request.auth != null;
+      
+      // Allow write: authenticated users can upload
+      allow write: if request.auth != null
+                  && request.resource.size < 10 * 1024 * 1024 // 10MB limit;
+      
+      // Allow delete: authenticated users can delete
+      allow delete: if request.auth != null;
+    }
+    
+    // Attorney licenses - allow upload during signup (unauthenticated)
+    // Only admins can read these documents for verification
+    match /attorney_licenses/{email}/{fileName} {
+      // Allow read: only authenticated admins can read
+      allow read: if request.auth != null;
+      
+      // Allow write: anyone can upload during signup (with restrictions)
+      // This is needed because users aren't authenticated during signup
+      allow write: if request.resource.size < 10 * 1024 * 1024 // 10MB limit
+                  && (request.resource.contentType.matches('application/pdf')
+                      || request.resource.contentType.matches('image/.*'));
+      
+      // Allow delete: only authenticated admins can delete
+      allow delete: if request.auth != null;
+    }
+    
+    // Task attachments - task participants can upload
+    match /task_attachments/{taskId}/{fileName} {
+      // Allow read: authenticated users can read
+      allow read: if request.auth != null;
+      
+      // Allow write: authenticated users can upload (up to 100MB for large files)
+      allow write: if request.auth != null
+                  && request.resource.size < 100 * 1024 * 1024 // 100MB limit for large files
+                  && (request.resource.contentType.matches('image/.*')
+                      || request.resource.contentType.matches('application/pdf')
+                      || request.resource.contentType.matches('application/.*')
+                      || request.resource.contentType.matches('video/.*')
+                      || request.resource.contentType.matches('audio/.*')
+                      || request.resource.contentType.matches('text/.*'));
+      
+      // Allow delete: authenticated users can delete
+      allow delete: if request.auth != null;
+    }
+    
+    // Default: deny all other access
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
+

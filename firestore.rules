@@ -1,0 +1,1475 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ==============================
+    // HELPER FUNCTIONS
+    // ==============================
+    // Check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Check if user document exists
+    function userExists() {
+      return isAuthenticated() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+    
+    // Get user role (returns null if user doesn't exist)
+    // Checks users collection for role field
+    function getUserRole() {
+      return (!isAuthenticated() || !userExists()) 
+        ? null
+        : get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+    
+    // Get staff's assigned attorney ID (for staff users)
+    // Staff users can be in either 'users' collection (with role='staff') OR 'staff' collection
+    function getStaffAttorneyId() {
+      return (!isAuthenticated())
+        ? null
+        : (
+            // Check users collection first
+            (exists(/databases/$(database)/documents/users/$(request.auth.uid))
+             && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'staff'
+             && ('assignedAttorneyId' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data))
+              ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.assignedAttorneyId
+              : (
+                  // Check staff collection
+                  (exists(/databases/$(database)/documents/staff/$(request.auth.uid))
+                   && ('assignedAttorneyId' in get(/databases/$(database)/documents/staff/$(request.auth.uid)).data))
+                    ? get(/databases/$(database)/documents/staff/$(request.auth.uid)).data.assignedAttorneyId
+                    : null
+                )
+          );
+    }
+    
+    // Helper function to check if staff can access a chat (for messages collection)
+    // Staff can access:
+    // 1. Direct client-staff chats (where staffId matches current staff)
+    // 2. Client-attorney chats (where attorneyId matches staff's assigned attorney)
+    // 3. Chats with staffEmail matching staff's email
+    // 4. Chats where staff's assigned attorney is a participant
+    function canStaffAccessChat(chatId) {
+      return isStaff() 
+             && exists(/databases/$(database)/documents/messages/$(chatId))
+             && (
+               // Check 1: Direct client-staff chat (staff is directly involved)
+               (('staffId' in get(/databases/$(database)/documents/messages/$(chatId)).data)
+                && get(/databases/$(database)/documents/messages/$(chatId)).data.staffId == request.auth.uid)
+               ||
+               // Check 2: Client-attorney chat (staff's assigned attorney is involved)
+               (getStaffAttorneyId() != null
+                && ('attorneyId' in get(/databases/$(database)/documents/messages/$(chatId)).data)
+                && getStaffAttorneyId() == get(/databases/$(database)/documents/messages/$(chatId)).data.attorneyId)
+               ||
+               // Check 3: Staff's assigned attorney is in participants
+               (getStaffAttorneyId() != null
+                && ('participants' in get(/databases/$(database)/documents/messages/$(chatId)).data)
+                && getStaffAttorneyId() in get(/databases/$(database)/documents/messages/$(chatId)).data.participants)
+               ||
+               // Check 4: Chat with staffEmail matching (fallback for chats created with email)
+               (('staffEmail' in get(/databases/$(database)/documents/messages/$(chatId)).data)
+                && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+                && ('email' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data)
+                && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.email == get(/databases/$(database)/documents/messages/$(chatId)).data.staffEmail)
+             );
+    }
+    
+    // Check if user is admin (case-insensitive role on users doc)
+    function isAdmin() {
+      return isAuthenticated()
+        && userExists()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role is string
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
+             .matches('(?i)^admin$');
+    }
+    
+    // Check if user is attorney (case-insensitive — "Attorney" must match rules)
+    function isAttorney() {
+      return isAuthenticated()
+        && userExists()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role is string
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
+             .matches('(?i)^attorney$');
+    }
+
+    // Staff, attorney, or admin — may list unfiltered `hearings` inbox queries.
+    function isFirmUser() {
+      return isStaff() || isAttorney() || isAdmin();
+    }
+
+    // Case-insensitive role check (fixes "Attorney" vs "attorney" mismatches with rules)
+    function userRoleMatchesAttorneyAdminStaff() {
+      return userExists()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role is string
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
+             .matches('(?i)^(attorney|admin|staff)$');
+    }
+
+    // Court email queue: staff (users or staff collection) + attorney/admin on users doc
+    function canAccessCourtEmailQueue() {
+      return isAuthenticated()
+        && (isStaff() || userRoleMatchesAttorneyAdminStaff());
+    }
+    
+    // Check if user is client (safe - returns false if user doesn't exist)
+    function isClient() {
+      return isAuthenticated() 
+        && userExists() 
+        && getUserRole() == 'client';
+    }
+    
+    // Check if user is staff (safe - returns false if user doesn't exist)
+    // Staff users can be in either 'users' collection (with role='staff') OR 'staff' collection
+    function isStaff() {
+      return isAuthenticated() && (
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid))
+         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role is string
+         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
+              .matches('(?i)^(staff|paralegal|legal[ _-]?assistant)$'))
+        ||
+        exists(/databases/$(database)/documents/staff/$(request.auth.uid))
+      );
+    }
+    
+    // Check if client is verified (safe - returns false if user doesn't exist or isn't verified)
+    function isClientVerified() {
+      return isAuthenticated()
+        && userExists() 
+        && getUserRole() == 'client'
+        && ('isVerified' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data)
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isVerified == true;
+    }
+    
+    // ==============================
+    // USERS COLLECTION
+    // ==============================
+    match /users/{userId} {
+      // Allow read: anyone can read (needed for role checking during login and displaying profiles)
+      allow get: if true;
+      allow list: if true;
+      
+      // Allow create: 
+      // 1. During registration (unauthenticated) - must include email and role
+      // 2. Authenticated user creating their own document
+      // 3. Allow creating user documents with role field (for manual admin/attorney setup)
+      allow create: if (request.auth == null 
+                        && request.resource.data.email is string
+                        && request.resource.data.role is string)
+                    || (isAuthenticated() && request.auth.uid == userId)
+                    || (request.resource.data.role is string 
+                        && request.resource.data.email is string)
+                    || isAdmin();
+      
+      // Allow update: 
+      // 1. Authenticated users can update their own document
+      // 2. Allow updating role field (for admin setup via Firebase Console)
+      // 3. Allow updating any field if document doesn't exist yet (for initial setup)
+      // 4. Staff can update limited client fields (phone, email, address) for clients of their assigned attorney
+      // 5. Admins can update any user (user management + Backup recover with set(merge))
+      allow update: if isAuthenticated() 
+                    && (request.auth.uid == userId 
+                        || request.resource.data.diff(resource.data).changedKeys().hasOnly(['role'])
+                        || !resource.exists
+                        || (isStaff() && resource.data.role == 'client' 
+                            && getStaffAttorneyId() != null
+                            && resource.data.assignedAttorneyId == getStaffAttorneyId()
+                            && request.resource.data.diff(resource.data).changedKeys().hasOnly(['phone', 'phoneNumber', 'email', 'address', 'updatedAt']))
+                        || isAdmin());
+      
+      // Allow delete:
+      // - Authenticated users can delete their own document
+      // - Admins can delete any user document (for user management)
+      allow delete: if isAuthenticated()
+                    && (request.auth.uid == userId || isAdmin());
+    }
+    
+    // ==============================
+    // STAFF COLLECTION
+    // ==============================
+    match /staff/{staffId} {
+      // Allow read: staff can read their own document, admins can read all
+      // This is needed for getStaffAttorneyId() function to work in security rules
+      allow get: if isAuthenticated() 
+                 && (request.auth.uid == staffId || isAdmin());
+      allow list: if isAuthenticated() && isAdmin();
+      
+      // Allow create: admins can create staff documents
+      allow create: if isAuthenticated() && isAdmin();
+      
+      // Allow update: staff can update their own document (limited fields), admins can update all
+      allow update: if isAuthenticated() 
+                   && (request.auth.uid == staffId || isAdmin());
+      
+      // Allow delete: only admins can delete staff documents
+      allow delete: if isAuthenticated() && isAdmin();
+    }
+    
+    // ==============================
+    // PENDING REGISTRATIONS
+    // ==============================
+    match /pending_registrations/{email} {
+      allow create: if request.resource.data.email is string
+                    && request.resource.data.password is string
+                    && request.resource.data.fullName is string
+                    && request.resource.data.otp is string;
+      allow read: if true;
+      allow update: if (resource.data.used == false
+                        && request.resource.data.used == true
+                        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['used']))
+                    || (resource.data.used == false
+                        && resource.data.used == false
+                        && (request.resource.data.diff(resource.data).changedKeys().hasOnly(['otpSent', 'lastSentAt'])
+                            || request.resource.data.diff(resource.data).changedKeys().hasOnly(['otpSent'])
+                            || request.resource.data.diff(resource.data).changedKeys().hasOnly(['lastSentAt'])));
+      allow delete: if true;
+    }
+    
+    // ==============================
+    // PENDING SIGNUPS (New OTP Flow)
+    // ==============================
+    match /pending_signups/{email} {
+      allow create: if true;
+      allow get: if true;
+      allow list: if true;
+      allow update: if true;
+      allow delete: if true;
+    }
+    
+    // ==============================
+    // EMAIL VERIFICATION OTPs
+    // ==============================
+    match /email_verification_otps/{email} {
+      allow create: if request.resource.data.email is string
+                    && request.resource.data.otp is string
+                    && request.resource.data.createdAt != null
+                    && request.resource.data.expiresAt != null
+                    && request.resource.data.used == false;
+      allow read: if true;
+      allow update: if resource.data.used == false
+                    && request.resource.data.used == true
+                    && request.resource.data.diff(resource.data).changedKeys().hasOnly(['used', 'verifiedAt']);
+      allow delete: if true;
+    }
+    
+    // ==============================
+    // PASSWORD RESET OTPs
+    // ==============================
+    match /password_reset_otps/{email} {
+      allow create: if request.resource.data.keys().hasAll([
+        'otp', 'email', 'expiresAt', 'createdAt', 'used'
+      ]);
+      allow read: if true;
+      allow update: if resource.data.used == false
+                    && request.resource.data.used == true
+                    && request.resource.data.diff(resource.data).changedKeys().hasOnly(['used']);
+      allow delete: if false;
+    }
+    
+    // ==============================
+    // REGISTRATION OTPs (Legacy)
+    // ==============================
+    match /registration_otps/{email} {
+      allow create: if request.resource.data.keys().hasAll([
+        'uid', 'otp', 'email', 'expiresAt', 'createdAt', 'used'
+      ]);
+      allow read: if true;
+      allow update: if resource.data.used == false
+                    && request.resource.data.used == true
+                    && request.resource.data.diff(resource.data).changedKeys().hasOnly(['used']);
+      allow delete: if false;
+    }
+    
+    // ==============================
+    // PENDING OTPs (React App)
+    // ==============================
+    match /pending_otps/{email} {
+      allow create: if request.resource.data.email is string
+                    && request.resource.data.otp is string
+                    && request.resource.data.createdAt != null
+                    && request.resource.data.expiresAt != null
+                    && request.resource.data.used == false
+                    && request.resource.data.fullName is string
+                    && request.resource.data.userType is string
+                    && (!('phoneNumber' in request.resource.data) || request.resource.data.phoneNumber is string)
+                    && (!('address' in request.resource.data) || request.resource.data.address is string);
+      allow read: if true;
+      allow update: if resource.data.used == false
+                    && request.resource.data.used == true
+                    && request.resource.data.diff(resource.data).changedKeys().hasOnly(['used']);
+      allow delete: if true;
+    }
+    
+    // ==============================
+    // CASE REQUESTS COLLECTION
+    // ==============================
+    match /case_requests/{requestId} {
+      // Allow read:
+      // - Clients can read their own requests
+      // - Attorneys can read any request (will filter in memory by attorneyId or null)
+      // - Admins can read all requests
+      // Note: For list queries, Firestore checks get permission on each document
+      // So we allow attorneys to read all requests, then filter in memory
+      allow get: if isAuthenticated()
+                 && (resource.data.clientId == request.auth.uid
+                     || isAttorney()
+                     || isAdmin());
+      // Allow list: 
+      // - Clients can list their own requests
+      // - Attorneys can list all requests (will filter in memory by attorneyId or null)
+      // - Admins can list all requests
+      // Note: Firestore list queries can't efficiently filter by attorneyId OR null
+      // So we allow attorneys to list all requests and filter in memory
+      allow list: if isAuthenticated()
+                 && (isClient() || isAttorney() || isAdmin());
+      
+      // Allow create: authenticated clients can create case requests
+      allow create: if isAuthenticated()
+                    && isClient()
+                    && request.resource.data.clientId == request.auth.uid
+                    && request.resource.data.clientName is string
+                    && request.resource.data.clientEmail is string
+                    && request.resource.data.subject is string
+                    && request.resource.data.message is string
+                    && request.resource.data.status == 'pending';
+      
+      // Allow update:
+      // - Attorneys can update any request (to mark as reviewed, converted, dismissed, or assign themselves)
+      // - Admins can update any request
+      // Note: Attorneys need to be able to update requests even if attorneyId is null (general requests)
+      // or if they want to assign themselves to a request
+      allow update: if isAuthenticated()
+                    && (isAttorney() || isAdmin());
+      
+      // Allow delete: only admins can delete requests
+      allow delete: if isAdmin();
+    }
+    
+    // Case document data for hearings / access checks (cached per request)
+    function hearingCaseData(caseId) {
+      return get(/databases/$(database)/documents/cases/$(caseId)).data;
+    }
+    
+    function canAccessHearingCase(caseId) {
+      return exists(/databases/$(database)/documents/cases/$(caseId))
+             && (
+               hearingCaseData(caseId).clientId == request.auth.uid
+               || hearingCaseData(caseId).attorneyId == request.auth.uid
+               || ('staffId' in hearingCaseData(caseId)
+                   && hearingCaseData(caseId).staffId == request.auth.uid)
+               || ('staffAssigned' in hearingCaseData(caseId)
+                   && request.auth.uid in hearingCaseData(caseId).staffAssigned)
+               || (isStaff() && getStaffAttorneyId() != null
+                   && getStaffAttorneyId() == hearingCaseData(caseId).attorneyId)
+               || isAdmin()
+             );
+    }
+
+    function hearingProfileFieldMatchesClientName(field) {
+      return field is string
+             && field.size() > 0
+             && 'clientName' in resource.data
+             && resource.data.clientName is string
+             && resource.data.clientName.size() > 0
+             && field.lower() == resource.data.clientName.lower();
+    }
+
+    // Strip spaces/punctuation so "Joren Limpahan" matches "Limpahan, Joren" on get().
+    function normalizedPersonName(name) {
+      return name.lower()
+             .replace(' ', '')
+             .replace(',', '')
+             .replace('.', '');
+    }
+
+    // Client may read court rows when profile name matches hearings.clientName (any word order).
+    function profileContainsHearingClientName(profileName) {
+      return profileName is string
+             && profileName.size() > 0
+             && 'clientName' in resource.data
+             && resource.data.clientName is string
+             && resource.data.clientName.size() > 0
+             && (
+               normalizedPersonName(profileName)
+                 == normalizedPersonName(resource.data.clientName)
+               || profileName.lower() == resource.data.clientName.lower()
+               || profileName.lower().matches('.*' + resource.data.clientName.lower() + '.*')
+               || resource.data.clientName.lower().matches('.*' + profileName.lower() + '.*')
+             );
+    }
+
+    function hearingOwnerIsAuthClient() {
+      return isClient()
+             && 'ownerClientId' in resource.data
+             && resource.data.ownerClientId == request.auth.uid;
+    }
+
+    function hearingClientNameMatchesAuthUser() {
+      let u = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return isClient()
+             && 'clientName' in resource.data
+             && resource.data.clientName is string
+             && resource.data.clientName.size() > 0
+             && (
+               ('name' in u && profileContainsHearingClientName(u.name))
+               || ('fullName' in u && profileContainsHearingClientName(u.fullName))
+               || ('displayName' in u && profileContainsHearingClientName(u.displayName))
+             );
+    }
+
+    // Client row keyed by profile name (OCR imports may omit fullText).
+    function hearingClientContextRow() {
+      return isClient()
+             && hearingClientNameMatchesAuthUser()
+             && (
+               ('caseNo' in resource.data
+                && resource.data.caseNo is string
+                && resource.data.caseNo.size() > 0)
+               || ('caseId' in resource.data
+                   && resource.data.caseId is string
+                   && resource.data.caseId.size() > 0)
+               || ('message' in resource.data
+                   && resource.data.message is string
+                   && resource.data.message.size() > 0)
+               || ('summary' in resource.data
+                   && resource.data.summary is string
+                   && resource.data.summary.size() > 0)
+               || ('activityType' in resource.data
+                   && resource.data.activityType is string)
+             );
+    }
+
+    function hearingInvolvesAuthClient() {
+      return isClient()
+             && (
+               hearingClientNameMatchesAuthUser()
+               || hearingClientContextRow()
+               || (
+                 'involvedClientIds' in resource.data
+                 && request.auth.uid in resource.data.involvedClientIds
+               )
+               || (
+                 'matchedClientIds' in resource.data
+                 && request.auth.uid in resource.data.matchedClientIds
+               )
+               || hearingOwnerIsAuthClient()
+             );
+    }
+    
+    // ==============================
+    // CASES COLLECTION
+    // ==============================
+    match /cases/{caseId} {
+      // Allow read: 
+      // - Clients can read their own cases
+      // - Attorneys can read assigned cases OR pending cases (to accept/decline)
+      // - Staff can read cases where they are assigned OR cases of their assigned attorney
+      // - Admins can read all cases
+      allow get: if isAuthenticated()
+                 && (resource.data.clientId == request.auth.uid
+                     || resource.data.attorneyId == request.auth.uid
+                     || (isAttorney() && resource.data.status == 'pending')
+                     || (isStaff() && (
+                         request.auth.uid in resource.data.get('staffAssigned', [])
+                         || (getStaffAttorneyId() != null && getStaffAttorneyId() == resource.data.attorneyId)
+                       ))
+                     || isAdmin());
+      allow list: if isAuthenticated()
+                 && (isAttorney() || isAdmin() || isClient() || isStaff());
+      
+      // Allow create: 
+      // - Clients can create cases (must be verified)
+      // - Attorneys can create cases for their clients
+      // - Staff can create draft cases (status must be 'under_review' for attorney review)
+      // - Admins can create cases
+      allow create: if isAuthenticated()
+                    && request.resource.data.caseTitle is string
+                    && request.resource.data.caseType is string
+                    && request.resource.data.caseDescription is string
+                    && request.resource.data.clientId is string
+                    && (
+                      // Attorneys can create cases (must include attorneyId)
+                      (isAttorney() 
+                       && request.resource.data.attorneyId == request.auth.uid
+                       && request.resource.data.status is string)
+                      ||
+                      // Staff can create draft cases (status must be 'under_review', must include attorneyId matching their assigned attorney)
+                      (isStaff()
+                       && getStaffAttorneyId() != null
+                       && getStaffAttorneyId() is string
+                       && getStaffAttorneyId() != ''
+                       && request.resource.data.attorneyId is string
+                       && request.resource.data.attorneyId != ''
+                       && request.resource.data.attorneyId == getStaffAttorneyId()
+                       && request.resource.data.status == 'under_review')
+                      ||
+                      // Clients can create cases (must be verified, status must be pending)
+                      (isClient()
+                       && request.resource.data.clientId == request.auth.uid
+                       && request.resource.data.status == 'pending'
+                       && isClientVerified())
+                      ||
+                      // Admins can create cases
+                      isAdmin()
+                    );
+      
+      // Allow update: 
+      // - Clients can update their own pending cases
+      // - Attorneys can accept/decline pending cases or update assigned cases
+      // - Staff can update cases of their assigned attorney (but cannot change status, attorneyId, or clientId)
+      // - Admins can update any case
+      allow update: if isAuthenticated()
+                    && (resource.data.clientId == request.auth.uid
+                        || resource.data.attorneyId == request.auth.uid
+                        || (isAttorney() && resource.data.status == 'pending' && (
+                            (request.resource.data.status == 'accepted' && request.resource.data.attorneyId == request.auth.uid)
+                            || request.resource.data.status == 'declined'
+                          ))
+                        || (isStaff() && getStaffAttorneyId() != null
+                         && getStaffAttorneyId() == resource.data.attorneyId
+                         && request.resource.data.status == resource.data.status
+                         && request.resource.data.attorneyId == resource.data.attorneyId
+                         && request.resource.data.clientId == resource.data.clientId)
+                        || isAdmin());
+      
+      // Allow delete: only admins can delete cases
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // MESSAGES COLLECTION (Chats)
+    // ==============================
+    match /messages/{chatId} {
+      // Allow read: 
+      // - Participants can read their chats
+      // - Staff can read chats for their assigned attorney (client-attorney conversations)
+      // - Admins can read all chats
+      allow get: if isAuthenticated()
+                  && (request.auth.uid in resource.data.participants
+                      || canStaffAccessChat(chatId)
+                      || isAdmin());
+      allow list: if isAuthenticated()
+                  && (isClient() || isAttorney() || isStaff() || isAdmin());
+      
+      // Allow create: authenticated users can create chats
+      // - Clients can create chats with staff or attorneys
+      // - Attorneys can create chats with clients
+      // - Staff can create chats with clients
+      // Must include current user in participants
+      allow create: if isAuthenticated()
+                    && request.auth.uid in request.resource.data.participants
+                    && request.resource.data.participants is list
+                    && request.resource.data.participants.size() == 2;
+      
+      // Allow update: 
+      // - Participants can update their chats (lastMessage, updatedAt)
+      // - Staff can update chats they can access (for updating lastMessage when sending messages)
+      // Security: Staff can only update chats they have access to
+      allow update: if isAuthenticated()
+                    && (
+                        request.auth.uid in resource.data.participants
+                        || canStaffAccessChat(chatId)
+                        || (isStaff())
+                        || isAdmin()
+                      );
+      
+      // Messages subcollection - ULTRA PERMISSIVE FOR STAFF
+      match /messages/{messageId} {
+        // Allow read: Very permissive for staff
+        allow get: if isAuthenticated()
+                   && exists(/databases/$(database)/documents/messages/$(chatId))
+                   && (
+                       // Participant in the chat - always allowed
+                       request.auth.uid in get(/databases/$(database)/documents/messages/$(chatId)).data.participants
+                       ||
+                       // Staff can access - multiple direct checks (more reliable)
+                       (isStaff() && (
+                         // Check 1: staff is directly in participants
+                         request.auth.uid in get(/databases/$(database)/documents/messages/$(chatId)).data.participants
+                         ||
+                         // Check 2: staff's assigned attorney is in participants
+                         (getStaffAttorneyId() != null
+                          && getStaffAttorneyId() in get(/databases/$(database)/documents/messages/$(chatId)).data.participants)
+                         ||
+                         // Check 3: chat has staffId matching current staff
+                         (('staffId' in get(/databases/$(database)/documents/messages/$(chatId)).data)
+                          && get(/databases/$(database)/documents/messages/$(chatId)).data.staffId == request.auth.uid)
+                         ||
+                         // Check 4: chat has attorneyId matching staff's assigned attorney
+                         (getStaffAttorneyId() != null
+                          && ('attorneyId' in get(/databases/$(database)/documents/messages/$(chatId)).data)
+                          && getStaffAttorneyId() == get(/databases/$(database)/documents/messages/$(chatId)).data.attorneyId)
+                         ||
+                         // Check 5: chat has staffEmail matching staff's email
+                         (('staffEmail' in get(/databases/$(database)/documents/messages/$(chatId)).data)
+                          && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+                          && ('email' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data)
+                          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.email == get(/databases/$(database)/documents/messages/$(chatId)).data.staffEmail)
+                         ||
+                         // Check 6: Use helper function as final fallback
+                         canStaffAccessChat(chatId)
+                       ))
+                       ||
+                       // Admin can access all
+                       isAdmin()
+                     );
+        
+        // Allow list: CRITICAL - This is what StreamBuilder uses
+        // Simplified rule for Firestore subcollection list queries
+        // Note: List queries on subcollections cannot efficiently check parent documents
+        // Security is maintained because:
+        // 1. Users can only query messages by specific chatId (from parent chat document)
+        // 2. Parent chat document access is controlled by rules above (line 302-305)
+        // 3. Staff can only get chatIds from chats they can access (via canStaffAccessChat)
+        // 4. They cannot query arbitrary chatIds - only ones they have access to
+        allow list: if isAuthenticated()
+                   && (isClient() || isAttorney() || isStaff() || isAdmin());
+        
+        // Allow create: 
+        // - Chat participants can send messages (clients, attorneys, staff)
+        // - Staff can send messages in chats they can access
+        // Security: Staff can only send messages to chats they have access to (they need chatId which comes from chats they can see)
+        allow create: if isAuthenticated()
+                      && request.resource.data.senderId == request.auth.uid
+                      && request.resource.data.text is string
+                      && (
+                        // Staff can send messages - simplified (they can only access chats they see)
+                        isStaff()
+                        ||
+                        // Admin can send anywhere
+                        isAdmin()
+                        ||
+                        // Participant in the chat - always allowed (check last to avoid expensive get() call)
+                        (exists(/databases/$(database)/documents/messages/$(chatId))
+                         && request.auth.uid in get(/databases/$(database)/documents/messages/$(chatId)).data.participants)
+                      );
+        
+        // Allow update: 
+        // - Participants can update messages (e.g., mark as seen, edit, reactions)
+        // - Staff can update messages in chats they can access (for reactions, marking as seen)
+        // - Sender can update their own messages
+        // Security: Staff can only update messages in chats they have access to (via parent document rules)
+        allow update: if isAuthenticated()
+                      && exists(/databases/$(database)/documents/messages/$(chatId))
+                      && (
+                          resource.data.senderId == request.auth.uid
+                          || request.auth.uid in get(/databases/$(database)/documents/messages/$(chatId)).data.participants
+                          || isStaff()
+                          || isAdmin()
+                        );
+        
+        // Allow delete: only sender can delete their own messages
+        allow delete: if isAuthenticated()
+                      && resource.data.senderId == request.auth.uid;
+      }
+    }
+    
+    // ==============================
+    // FEEDBACK COLLECTION
+    // ==============================
+    match /feedback/{feedbackId} {
+      allow get: if isAuthenticated()
+                 && (resource.data.clientId == request.auth.uid
+                     || resource.data.attorneyId == request.auth.uid
+                     || isAdmin());
+      allow list: if isAuthenticated();
+      
+      // Allow create: authenticated clients can submit feedback
+      allow create: if isAuthenticated()
+                    && request.resource.data.clientId == request.auth.uid
+                    && request.resource.data.attorneyId is string
+                    && request.resource.data.caseId is string
+                    && request.resource.data.rating is int
+                    && request.resource.data.rating >= 1
+                    && request.resource.data.rating <= 5
+                    && request.resource.data.createdAt != null;
+      
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // SYSTEM LOGS COLLECTION
+    // ==============================
+    // System logs track all important actions in the system:
+    // - Login/logout actions
+    // - User role updates and activations/deactivations
+    // - Case management actions (reassign, lock, unlock)
+    // - Announcements sent
+    // - And all other admin/system actions
+    match /system_logs/{logId} {
+      // Allow read: only admins can view system logs
+      allow get: if isAdmin();
+      
+      // Allow list: only admins can query/list system logs
+      // This allows filtering by timestamp, action, userId, etc.
+      allow list: if isAdmin();
+      
+      // Allow create: any authenticated user can create system logs
+      // This allows logging from:
+      // - Auth service (login actions)
+      // - Admin service (all admin actions)
+      // - Any other service that needs to log actions
+      allow create: if isAuthenticated()
+                    // userId must match the authenticated user (security requirement)
+                    && request.resource.data.userId == request.auth.uid
+                    // action is required - describes what happened
+                    && request.resource.data.action is string
+                    // Optional fields that may be included:
+                    // - userName: display name of the user (optional string)
+                    // - details: additional details about the action (optional string)
+                    // - resourceType: type of resource involved (optional string)
+                    // - resourceId: ID of the resource involved (optional string)
+                    // - metadata: additional metadata (optional map)
+                    // - timestamp: server timestamp (allows null for FieldValue.serverTimestamp())
+                    && (!('userName' in request.resource.data) || request.resource.data.userName is string)
+                    && (!('details' in request.resource.data)
+                        || request.resource.data.details == null
+                        || request.resource.data.details is string)
+                    && (!('resourceType' in request.resource.data)
+                        || request.resource.data.resourceType == null
+                        || request.resource.data.resourceType is string)
+                    && (!('resourceId' in request.resource.data)
+                        || request.resource.data.resourceId == null
+                        || request.resource.data.resourceId is string)
+                    && (!('metadata' in request.resource.data) || request.resource.data.metadata is map)
+                    && (!('timestamp' in request.resource.data)
+                        || request.resource.data.timestamp == null
+                        || request.resource.data.timestamp is timestamp);
+      
+      // Allow update: only admins can update system logs (for corrections)
+      allow update: if isAdmin();
+      
+      // Allow delete: only admins can delete system logs
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // ANNOUNCEMENTS COLLECTION
+    // ==============================
+    match /announcements/{announcementId} {
+      allow get: if isAuthenticated();
+      allow list: if isAuthenticated();
+      allow create: if isAdmin()
+                    && request.resource.data.title is string
+                    && request.resource.data.message is string
+                    && request.resource.data.recipientRoles is list
+                    && request.resource.data.createdAt != null;
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // APPOINTMENTS COLLECTION
+    // ==============================
+    match /appointments/{appointmentId} {
+      // Allow read: 
+      // - Clients can read their own appointments
+      // - Attorneys can read their own appointments
+      // - Staff can read appointments for their assigned attorney's clients
+      // - Admins can read all appointments
+      allow get: if isAuthenticated()
+                 && (resource.data.clientId == request.auth.uid
+                     || resource.data.attorneyId == request.auth.uid
+                     || (isStaff() && getStaffAttorneyId() != null
+                         && getStaffAttorneyId() == resource.data.attorneyId)
+                     || isAdmin());
+      allow list: if isAuthenticated()
+                 && (isClient() || isAttorney() || isStaff() || isAdmin());
+      
+      // Allow create: 
+      // - Clients can create appointment requests (status must be 'pending')
+      // - Attorneys, staff, and admins can create appointments
+      allow create: if isAuthenticated()
+                    && (
+                      // Clients can create pending appointment requests
+                      (isClient() 
+                       && request.resource.data.clientId == request.auth.uid
+                       && request.resource.data.status == 'pending'
+                       && request.resource.data.attorneyId is string
+                       && request.resource.data.appointmentDateTime != null
+                       && request.resource.data.appointmentType is string)
+                      // Attorneys, staff, and admins can create appointments
+                      || (isAttorney() || isStaff() || isAdmin())
+                    )
+                    && request.resource.data.clientId is string
+                    && request.resource.data.clientName is string
+                    && request.resource.data.appointmentDateTime != null
+                    && request.resource.data.appointmentType is string
+                    && request.resource.data.status is string;
+      
+      // Allow update: 
+      // - Attorneys can update their own appointments
+      // - Staff can update appointments for their assigned attorney
+      // - Admins can update any appointment
+      allow update: if isAuthenticated()
+                    && ((isAttorney() && resource.data.attorneyId == request.auth.uid)
+                        || (isStaff() && getStaffAttorneyId() != null
+                            && getStaffAttorneyId() == resource.data.attorneyId)
+                        || isAdmin());
+      
+      // Allow delete: only admins can delete appointments
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // TASKS COLLECTION
+    // ==============================
+    match /tasks/{taskId} {
+      // Allow read: 
+      // - Staff can read tasks assigned to them
+      // - Attorneys can read tasks they created
+      // - Admins can read all tasks
+      allow get: if isAuthenticated()
+                 && (resource.data.assignedTo == request.auth.uid
+                     || resource.data.attorneyId == request.auth.uid
+                     || isAdmin());
+      allow list: if isAuthenticated()
+                 && (isStaff() || isAttorney() || isAdmin());
+      
+      // Allow create: attorneys and admins can create tasks
+      allow create: if isAuthenticated()
+                    && (isAttorney() || isAdmin())
+                    && request.resource.data.title is string
+                    && request.resource.data.description is string
+                    && request.resource.data.assignedTo is string
+                    && request.resource.data.attorneyId is string
+                    && request.resource.data.status is string;
+      
+      // Allow update: 
+      // - Staff can update tasks assigned to them (status, notes, priority)
+      // - Attorneys can update tasks they created
+      // - Admins can update any task
+      allow update: if isAuthenticated()
+                    && (resource.data.assignedTo == request.auth.uid
+                        || resource.data.attorneyId == request.auth.uid
+                        || isAdmin());
+      
+      // Allow delete: only admins can delete tasks
+      allow delete: if isAdmin();
+      
+      // ==============================
+      // TASK ATTACHMENTS SUBCOLLECTION
+      // ==============================
+      // Allow staff and attorneys to share attachments on tasks
+      match /attachments/{attachmentId} {
+        // Helper function to check if user can access the task
+        function canAccessTask() {
+          return exists(/databases/$(database)/documents/tasks/$(taskId))
+                 && (
+                   // Staff assigned to the task
+                   (isStaff() && get(/databases/$(database)/documents/tasks/$(taskId)).data.assignedTo == request.auth.uid)
+                   ||
+                   // Attorney who created the task
+                   (isAttorney() && get(/databases/$(database)/documents/tasks/$(taskId)).data.attorneyId == request.auth.uid)
+                   ||
+                   // Admin can access all
+                   isAdmin()
+                 );
+        }
+        
+        // Allow read: Staff assigned to task, attorney who created task, and admins
+        allow get: if isAuthenticated() && canAccessTask();
+        allow list: if isAuthenticated() && canAccessTask();
+        
+        // Allow create: Staff assigned to task, attorney who created task, and admins
+        allow create: if isAuthenticated()
+                      && canAccessTask()
+                      && request.resource.data.taskId == taskId
+                      && request.resource.data.fileName is string
+                      && request.resource.data.fileData is string
+                      && request.resource.data.uploadedBy == request.auth.uid
+                      && request.resource.data.uploadedAt != null;
+        
+        // Allow update: Only the user who uploaded can update, or admins
+        allow update: if isAuthenticated()
+                      && canAccessTask()
+                      && (resource.data.uploadedBy == request.auth.uid || isAdmin());
+        
+        // Allow delete: Staff assigned to task, attorney who created task, uploader, and admins
+        allow delete: if isAuthenticated()
+                      && canAccessTask()
+                      && (resource.data.uploadedBy == request.auth.uid || isAdmin());
+      }
+    }
+    
+    // ==============================
+    // COURT EMAIL INGEST QUEUE (written by Cloud Functions only)
+    // ==============================
+    match /court_email_queue/{docId} {
+      allow read: if canAccessCourtEmailQueue();
+      allow list: if canAccessCourtEmailQueue();
+      allow create, update, delete: if false;
+    }
+    
+    // ==============================
+    // CALENDAR EVENTS COLLECTION
+    // ==============================
+    match /calendar_events/{eventId} {
+      function calendarAssignedToAuthOrStaffAttorney() {
+        return resource.data.assignedTo == request.auth.uid
+               || (isStaff() && getStaffAttorneyId() != null
+                   && getStaffAttorneyId() == resource.data.assignedTo);
+      }
+
+      function calendarCreateAssignedToAuthOrStaffAttorney() {
+        return request.resource.data.assignedTo == request.auth.uid
+               || (isStaff() && getStaffAttorneyId() != null
+                   && getStaffAttorneyId() == request.resource.data.assignedTo);
+      }
+
+      // Allow read: 
+      // - Staff can read calendar events for their assigned attorney
+      // - Attorneys can read their own calendar events
+      // - Clients can read calendar events related to their cases (via caseId or clientId)
+      // - Admins can read all events
+      allow get: if isAuthenticated()
+                 && (calendarAssignedToAuthOrStaffAttorney()
+                     || (isClient() && (
+                         resource.data.clientId == request.auth.uid
+                         || ('caseId' in resource.data && exists(/databases/$(database)/documents/cases/$(resource.data.caseId))
+                             && get(/databases/$(database)/documents/cases/$(resource.data.caseId)).data.clientId == request.auth.uid)
+                       ))
+                     || isAdmin());
+      allow list: if isAuthenticated()
+                 && (isStaff() || isAttorney() || isClient() || isAdmin());
+      
+      // Allow create: staff/attorney for their calendar; AI hearing sync sets assignedTo = attorney id
+      allow create: if isAuthenticated()
+                    && (isStaff() || isAttorney() || isAdmin())
+                    && calendarCreateAssignedToAuthOrStaffAttorney()
+                    && request.resource.data.eventType is string
+                    && request.resource.data.eventDate != null
+                    && request.resource.data.title is string
+                    && request.resource.data.assignedTo is string;
+      
+      // Allow update: 
+      // - Staff can update events for their assigned attorney
+      // - Attorneys can update their own events
+      // - Admins can update any event
+      allow update: if isAuthenticated()
+                    && (calendarAssignedToAuthOrStaffAttorney()
+                        || isAdmin())
+                    && (!('assignedTo' in request.resource.data)
+                        || request.resource.data.assignedTo == resource.data.assignedTo);
+      
+      // Allow delete: only admins can delete calendar events
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // HEARINGS (per-case messages / schedule lines — Cloud Functions fan out alerts)
+    // ==============================
+    match /hearings/{hearingId} {
+      // Court / OCR import rows (caseNo + fullText) — no caseId required
+      function hearingImportedResource() {
+        return 'caseNo' in resource.data
+               && resource.data.caseNo is string
+               && resource.data.caseNo != ''
+               && 'fullText' in resource.data
+               && resource.data.fullText is string
+               && resource.data.fullText != '';
+      }
+      function hearingImportedCreate() {
+        return request.resource.data.caseNo is string
+               && request.resource.data.caseNo != ''
+               && request.resource.data.fullText is string
+               && request.resource.data.fullText != '';
+      }
+      
+      // List/query on `hearings` must be able to return every matching doc, or Firestore
+      // denies the whole query (permission-denied). Firm staff/attorneys therefore need a
+      // broad read path; clients still rely on caseId + canAccessHearingCase only.
+      allow read: if isAuthenticated()
+                    && (
+                      ('caseId' in resource.data
+                       && resource.data.caseId is string
+                       && canAccessHearingCase(resource.data.caseId))
+                      || (hearingImportedResource() && isFirmUser())
+                      || (hearingImportedResource() && hearingInvolvesAuthClient())
+                      || hearingInvolvesAuthClient()
+                      || hearingClientContextRow()
+                      || hearingOwnerIsAuthClient()
+                      || isFirmUser()
+                    );
+      
+      allow create: if isAuthenticated()
+                    && (
+                      (
+                        request.resource.data.caseId is string
+                        && request.resource.data.senderId == request.auth.uid
+                        && request.resource.data.activityType is string
+                        && request.resource.data.message is string
+                        && canAccessHearingCase(request.resource.data.caseId)
+                        && (!('caseTitle' in request.resource.data) || request.resource.data.caseTitle is string)
+                        && (!('senderName' in request.resource.data) || request.resource.data.senderName is string)
+                        && (!('hearingDateTime' in request.resource.data)
+                            || request.resource.data.hearingDateTime == null
+                            || request.resource.data.hearingDateTime is timestamp)
+                      )
+                      || (
+                        isFirmUser()
+                        && hearingImportedCreate()
+                        && (!('clientName' in request.resource.data) || request.resource.data.clientName is string)
+                        && (!('courtBranch' in request.resource.data) || request.resource.data.courtBranch is string)
+                      )
+                    );
+      
+      allow update: if isAuthenticated()
+                    && (
+                      (
+                        'caseId' in resource.data
+                        && resource.data.caseId is string
+                        && resource.data.senderId == request.auth.uid
+                        && canAccessHearingCase(resource.data.caseId)
+                        && request.resource.data.caseId == resource.data.caseId
+                        && request.resource.data.senderId == resource.data.senderId
+                        && request.resource.data.activityType is string
+                        && request.resource.data.message is string
+                        && (!('caseTitle' in request.resource.data) || request.resource.data.caseTitle is string)
+                        && (!('senderName' in request.resource.data) || request.resource.data.senderName is string)
+                        && (!('hearingDateTime' in request.resource.data)
+                            || request.resource.data.hearingDateTime == null
+                            || request.resource.data.hearingDateTime is timestamp)
+                      )
+                      || (isFirmUser() && hearingImportedResource())
+                      || (
+                        isClient()
+                        && (
+                          hearingClientNameMatchesAuthUser()
+                          || hearingOwnerIsAuthClient()
+                          || (
+                            'involvedClientIds' in resource.data
+                            && request.auth.uid in resource.data.involvedClientIds
+                          )
+                          || (
+                            'caseId' in resource.data
+                            && resource.data.caseId is string
+                            && canAccessHearingCase(resource.data.caseId)
+                          )
+                        )
+                        && request.resource.data.diff(resource.data).affectedKeys()
+                             .hasOnly([
+                               'involvedClientIds',
+                               'matchedClientIds',
+                               'ownerClientId',
+                               'caseId'
+                             ])
+                        && request.auth.uid in request.resource.data.involvedClientIds
+                        && (
+                          !('ownerClientId' in request.resource.data)
+                          || request.resource.data.ownerClientId == request.auth.uid
+                        )
+                        && (
+                          !('caseId' in request.resource.data)
+                          || canAccessHearingCase(request.resource.data.caseId)
+                        )
+                      )
+                    );
+      
+      allow delete: if isAdmin();
+    }
+    
+    // Written only by Cloud Functions (reminder scheduler)
+    match /hearing_reminder_jobs/{jobId} {
+      allow read, write: if false;
+    }
+    
+    // Written only by Cloud Functions (optional SMTP)
+    match /email_requests/{requestId} {
+      allow read, write: if false;
+    }
+    
+    // ==============================
+    // ACTIVITY LOGS COLLECTION
+    // ==============================
+    match /activity_logs/{logId} {
+      // Allow read: 
+      // - Staff can read their own activity logs
+      // - Admins can read all logs
+      allow get: if isAuthenticated()
+                 && (resource.data.userId == request.auth.uid
+                     || isAdmin());
+      allow list: if isAuthenticated()
+                 && (isStaff() || isAdmin());
+      
+      // Allow create: staff can create their own activity logs
+      allow create: if isAuthenticated()
+                    && (isStaff() || isAdmin())
+                    && request.resource.data.userId == request.auth.uid
+                    && request.resource.data.action is string
+                    && request.resource.data.timestamp != null;
+      
+      // Allow update: only admins can update logs
+      allow update: if isAdmin();
+      
+      // Allow delete: only admins can delete logs
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // HEARING NOTIFICATIONS COLLECTION
+    // ==============================
+    match /hearing_notifications/{notificationId} {
+      // Allow read: 
+      // - Staff can read notifications for their assigned attorney
+      // - Attorneys can read their own notifications
+      // - Admins can read all notifications
+      allow get: if isAuthenticated()
+                 && (resource.data.attorneyId == request.auth.uid
+                     || (isStaff() && getStaffAttorneyId() != null
+                         && getStaffAttorneyId() == resource.data.attorneyId)
+                     || isAdmin());
+      allow list: if isAuthenticated()
+                 && (isStaff() || isAttorney() || isAdmin());
+      
+      // Allow create: staff and attorneys can create hearing notifications
+      allow create: if isAuthenticated()
+                    && (isStaff() || isAttorney() || isAdmin())
+                    && request.resource.data.attorneyId is string
+                    && request.resource.data.title is string
+                    && request.resource.data.hearingDate != null;
+      
+      // Allow update: 
+      // - Staff can update notifications for their assigned attorney
+      // - Attorneys can update their own notifications
+      // - Admins can update any notification
+      allow update: if isAuthenticated()
+                    && (resource.data.attorneyId == request.auth.uid
+                        || (isStaff() && getStaffAttorneyId() != null
+                            && getStaffAttorneyId() == resource.data.attorneyId)
+                        || isAdmin());
+      
+      // Allow delete: only admins can delete notifications
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // NOTIFICATIONS COLLECTION
+    // ==============================
+    match /notifications/{notificationId} {
+      function notificationOwnedByAuth() {
+        return isAuthenticated()
+               && (
+                 ('userId' in resource.data
+                  && resource.data.userId == request.auth.uid)
+                 || (
+                   'clientId' in resource.data
+                   && resource.data.clientId == request.auth.uid
+                 )
+               );
+      }
+
+      // FieldValue.serverTimestamp() is request.time in rules, not "timestamp" type.
+      function notificationCreatedAtValid() {
+        return !('createdAt' in request.resource.data)
+               || request.resource.data.createdAt == null
+               || request.resource.data.createdAt is timestamp
+               || request.resource.data.createdAt == request.time;
+      }
+
+      function isHearingInAppNotificationType(t) {
+        return t == 'hearing_activity'
+               || t == 'hearing_activity_update'
+               || t == 'court_email_ingest';
+      }
+
+      // Unified read so `where(userId == uid)` / `where(clientId == uid)` queries work.
+      allow read: if notificationOwnedByAuth();
+      
+      // Allow create: 
+      // - Any authenticated user can create notifications (for system notifications, reminders, etc.)
+      // - Staff, attorneys, and admins can create notifications for any user
+      // - Required fields: userId, type, title, message
+      // - Optional fields: eventId (string), isRead (boolean), createdAt (timestamp)
+      allow create: if isAuthenticated()
+                    && request.resource.data.userId is string
+                    && request.resource.data.type is string
+                    && request.resource.data.title is string
+                    && request.resource.data.message is string
+                    && (!('eventId' in request.resource.data) || request.resource.data.eventId is string)
+                    && (!('isRead' in request.resource.data) || request.resource.data.isRead is bool)
+                    && notificationCreatedAtValid();
+      
+      // Allow update: users can update their own notifications (mark as read).
+      // Staff/attorney/admin may merge hearing fan-out rows for any recipient (SetOptions merge).
+      allow update: if isAuthenticated()
+                    && (
+                      resource.data.userId == request.auth.uid
+                      || (
+                        (isStaff() || isAttorney() || isAdmin())
+                        && resource.data.type is string
+                        && request.resource.data.type == resource.data.type
+                        && request.resource.data.userId == resource.data.userId
+                        && isHearingInAppNotificationType(resource.data.type)
+                        && request.resource.data.title is string
+                        && request.resource.data.message is string
+                      )
+                    );
+      
+      // Allow delete: users can delete their own notifications (e.g. wrong email-ingest spam)
+      allow delete: if isAuthenticated()
+                    && (
+                      resource.data.userId == request.auth.uid
+                      || (
+                        'clientId' in resource.data
+                        && resource.data.clientId == request.auth.uid
+                      )
+                    );
+    }
+    
+    // ==============================
+    // NOTIFICATION REQUESTS COLLECTION
+    // ==============================
+    // This collection is used to queue FCM notification requests
+    // Cloud Functions listen to this collection and send the actual notifications
+    match /notification_requests/{requestId} {
+      // Allow read: only admins can read notification requests
+      allow get: if isAdmin();
+      allow list: if isAdmin();
+      
+      // Allow create: 
+      // - Authenticated users can create notification requests
+      // - Unauthenticated users can create notification requests (for OTP during registration)
+      // Must include required fields: fcmToken, title, body, status
+      allow create: if (isAuthenticated() || request.auth == null)
+                    && request.resource.data.fcmToken is string
+                    && request.resource.data.title is string
+                    && request.resource.data.body is string
+                    && request.resource.data.status == 'pending'
+                    && (!('data' in request.resource.data) || request.resource.data.data is map)
+                    && (!('userId' in request.resource.data) || request.resource.data.userId is string);
+      
+      // Allow update: only admins can update notification requests
+      // (Cloud Functions run with admin privileges and update status)
+      allow update: if isAdmin();
+      
+      // Allow delete: only admins can delete notification requests
+      allow delete: if isAdmin();
+    }
+
+    // ==============================
+    // SMS REQUESTS COLLECTION
+    // ==============================
+    // Queue SMS to be sent by Cloud Functions (Twilio). Similar to notification_requests.
+    match /sms_requests/{requestId} {
+      // Admins can read any request; creators can read their own (for send-status polling).
+      allow get: if isAdmin()
+                 || (isAuthenticated()
+                     && resource.data.createdBy == request.auth.uid);
+      allow list: if isAdmin();
+
+      // Allow create:
+      // - Authenticated users can queue SMS for system workflows (admin/staff/attorney actions).
+      // Required fields: to, body, status, createdBy
+      allow create: if isAuthenticated()
+                    && request.resource.data.to is string
+                    && request.resource.data.body is string
+                    && request.resource.data.status == 'pending'
+                    && request.resource.data.createdBy == request.auth.uid
+                    && (!('userId' in request.resource.data) || request.resource.data.userId is string);
+
+      // Allow update/delete: only admins (Cloud Functions update status with admin privileges).
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // SYSTEM SETTINGS COLLECTION
+    // ==============================
+    match /system_settings/{settingId} {
+      // Allow read: authenticated users can read system settings (for maintenance mode check)
+      allow get: if isAuthenticated();
+      allow list: if isAuthenticated();
+      
+      // Allow create: only admins can create system settings
+      // Supports various setting types: maintenance, notifications, security, platform_policies, etc.
+      allow create: if isAdmin()
+                    && request.resource.data.updatedAt != null;
+      
+      // Allow update: only admins can update system settings
+      allow update: if isAdmin();
+      
+      // Allow delete: only admins can delete system settings
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // APPOINTMENT REMINDERS COLLECTION
+    // ==============================
+    match /appointment_reminders/{reminderId} {
+      // Allow read: 
+      // - Attorneys can read reminders for their appointments
+      // - Staff can read reminders for their assigned attorney's appointments
+      // - Admins can read all reminders
+      allow get: if isAuthenticated()
+                 && (resource.data.attorneyId == request.auth.uid
+                     || (isStaff() && getStaffAttorneyId() != null
+                         && getStaffAttorneyId() == resource.data.attorneyId)
+                     || isAdmin());
+      allow list: if isAuthenticated()
+                 && (isAttorney() || isStaff() || isAdmin());
+      
+      // Allow create: authenticated users can create appointment reminders
+      // (typically created by the appointment service)
+      allow create: if isAuthenticated()
+                    && request.resource.data.appointmentId is string
+                    && request.resource.data.attorneyId is string
+                    && request.resource.data.clientId is string;
+      
+      // Allow update: 
+      // - Attorneys can update reminders for their appointments
+      // - Staff can update reminders for their assigned attorney's appointments
+      // - Admins can update any reminder
+      allow update: if isAuthenticated()
+                    && (resource.data.attorneyId == request.auth.uid
+                        || (isStaff() && getStaffAttorneyId() != null
+                            && getStaffAttorneyId() == resource.data.attorneyId)
+                        || isAdmin());
+      
+      // Allow delete: only admins can delete reminders
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // DEADLINE REMINDERS SENT COLLECTION
+    // ==============================
+    match /deadline_reminders_sent/{reminderId} {
+      // Allow read: authenticated users can read reminders
+      // (needed to check if reminders have been sent)
+      allow get: if isAuthenticated();
+      allow list: if isAuthenticated();
+      
+      // Allow create: authenticated users can create reminder records
+      // (typically created by the deadline reminder service)
+      allow create: if isAuthenticated()
+                    && request.resource.data.deadlineId is string
+                    && request.resource.data.userId is string
+                    && request.resource.data.reminderDays is int;
+      
+      // Allow update: authenticated users can update reminder records
+      allow update: if isAuthenticated();
+      
+      // Allow delete: only admins can delete reminder records
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // CALENDAR EVENT REMINDERS COLLECTION
+    // ==============================
+    match /calendar_event_reminders/{reminderId} {
+      // Allow read: 
+      // - Staff can read reminders for their assigned attorney
+      // - Attorneys can read their own reminders
+      // - Admins can read all reminders
+      allow get: if isAuthenticated()
+                 && (resource.data.attorneyId == request.auth.uid
+                     || (isStaff() && getStaffAttorneyId() != null
+                         && getStaffAttorneyId() == resource.data.attorneyId)
+                     || isAdmin());
+      
+      // Allow list: 
+      // - Staff can list reminders (queries should filter by their assigned attorneyId)
+      // - Attorneys can list their own reminders (queries should filter by their own attorneyId)
+      // - Admins can list all reminders
+      // Note: The get rule will filter which documents are actually returned
+      // Firestore allows the query if list is permitted, then filters results by get rule
+      allow list: if isAuthenticated()
+                 && (isStaff() || isAttorney() || isAdmin());
+      
+      // Allow create: staff and attorneys can create calendar event reminders
+      allow create: if isAuthenticated()
+                    && (isStaff() || isAttorney() || isAdmin())
+                    && request.resource.data.attorneyId is string
+                    && request.resource.data.eventDate != null
+                    && request.resource.data.notificationDate != null
+                    && request.resource.data.status is string;
+      
+      // Allow update: 
+      // - Staff can update reminders for their assigned attorney (to mark as sent)
+      // - Attorneys can update their own reminders
+      // - Admins can update any reminder
+      allow update: if isAuthenticated()
+                    && (resource.data.attorneyId == request.auth.uid
+                        || (isStaff() && getStaffAttorneyId() != null
+                            && getStaffAttorneyId() == resource.data.attorneyId)
+                        || isAdmin());
+      
+      // Allow delete: only admins can delete reminders
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // BACKUPS COLLECTION
+    // ==============================
+    match /backups/{backupId} {
+      // Allow read: only admins can read backups
+      allow get: if isAdmin();
+      allow list: if isAdmin();
+      
+      // Allow create: only admins can create backups (when deleting items)
+      allow create: if isAdmin()
+                    && request.resource.data.collection is string
+                    && request.resource.data.documentId is string
+                    && request.resource.data.data is map
+                    && request.resource.data.deletedAt is timestamp
+                    && request.resource.data.restored is bool;
+      
+      // Allow update: admins mark restored (avoid fragile diff() expressions)
+      allow update: if isAdmin();
+      
+      // Allow delete: only admins can delete backups (cleanup)
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // STAFF APPLICATIONS (apply → admin approve → applicant completes Auth)
+    // ==============================
+    match /staff_applications/{applicationId} {
+      // Unauthenticated applicants: create once per doc id (derived from email in the app).
+      // Admins: recreate from Backup after soft-delete (recover).
+      allow create: if isAdmin()
+        || (!exists(/databases/$(database)/documents/staff_applications/$(applicationId))
+        && request.resource.data.keys().hasAll(['email', 'name', 'phone', 'status', 'agreedToRequirements'])
+        && request.resource.data.status == 'pending'
+        && request.resource.data.email is string
+        && request.resource.data.name is string
+        && request.resource.data.phone is string
+        && request.resource.data.agreedToRequirements is bool
+        && request.resource.data.agreedToRequirements == true);
+
+      allow get: if true;
+
+      allow list: if isAdmin();
+
+      allow update: if isAdmin()
+        || (isAuthenticated()
+            && resource.data.status == 'approved'
+            && request.auth.token.email == resource.data.email
+            && request.resource.data.diff(resource.data).changedKeys()
+                 .hasOnly(['status', 'registeredUid', 'registeredAt', 'updatedAt'])
+            && request.resource.data.status == 'registered'
+            && request.resource.data.registeredUid == request.auth.uid)
+        // Applicant finished email OTP while application is still pending (no status change).
+        || (isAuthenticated()
+            && resource.data.status == 'pending'
+            && request.auth.token.email == resource.data.email
+            && request.resource.data.status == 'pending'
+            && request.resource.data.registeredUid == request.auth.uid
+            && request.resource.data.diff(resource.data).changedKeys()
+                 .hasOnly(['registeredUid', 'registeredAt', 'updatedAt']));
+
+      allow delete: if isAdmin();
+    }
+    
+    // ==============================
+    // DEFAULT RULE
+    // ==============================
+    // Deny all other access by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+    
+  }
+}

@@ -1,0 +1,11 @@
+// Kotlin JVM 17 for Flutter plugins only (never touch :app — Flutter plugin breaks).
+subprojects { subproject ->
+    if (subproject.name == "app") {
+        return
+    }
+    subproject.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+        kotlinOptions {
+            jvmTarget = "17"
+        }
+    }
+}

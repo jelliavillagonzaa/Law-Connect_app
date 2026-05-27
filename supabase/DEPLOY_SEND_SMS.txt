@@ -1,0 +1,85 @@
+Law Connect — Supabase Edge Function `send-sms` (Twilio)
+
+================================================================================
+IF YOU SEE: "supabase is not recognized" OR "scoop is not recognized"
+================================================================================
+Scoop is optional and must be installed separately from https://scoop.sh — skip it if you do not use Scoop.
+
+RECOMMENDED ON WINDOWS (no Scoop, no global npm):
+  1) Install the CLI binary into this repo (downloads from GitHub):
+       .\scripts\install-supabase-cli-windows.ps1
+  2) Then use the wrapper (same commands as `supabase`):
+       .\scripts\supabase-cli.ps1 login
+       .\scripts\supabase-cli.ps1 link --project-ref YOUR_PROJECT_REF
+       ... etc.
+
+Option A — Helper only (uses .tools\supabase\supabase.exe if present, else npx):
+  From C:\law_connect4 run:
+    .\scripts\supabase-cli.ps1 login
+    .\scripts\supabase-cli.ps1 link --project-ref YOUR_PROJECT_REF
+
+  IMPORTANT — PowerShell multiline trap:
+    Do NOT press Enter after the first KEY=value. Only the first line runs; the next
+    lines become invalid commands (TWILIO_AUTH_TOKEN=... is not a cmdlet).
+    Use ONE of these:
+
+  (1) Easiest — helper script (quotes protect + in phone number):
+    .\scripts\supabase-set-twilio-secrets.ps1 -TwilioAccountSid "AC..." -TwilioAuthToken "..." -TwilioFromNumber "+15551234567" -FirebaseProjectId "jurislink-app"
+
+  (2) One single line (no Enter until the end):
+    .\scripts\supabase-cli.ps1 secrets set TWILIO_ACCOUNT_SID=AC... TWILIO_AUTH_TOKEN=... TWILIO_FROM_NUMBER="+15551234567" FIREBASE_PROJECT_ID=jurislink-app
+
+  (3) Line continuation with backtick ` at end of each line (last line has no backtick):
+    .\scripts\supabase-cli.ps1 secrets set `
+      TWILIO_ACCOUNT_SID=AC... `
+      TWILIO_AUTH_TOKEN=... `
+      TWILIO_FROM_NUMBER="+15551234567" `
+      FIREBASE_PROJECT_ID=jurislink-app
+
+    .\scripts\supabase-cli.ps1 functions deploy send-sms --project-ref YOUR_PROJECT_REF
+
+  Replace YOUR_PROJECT_REF with your Supabase reference ID (Dashboard → Settings → General).
+  First `npx` run can take 1–2 minutes to download the CLI.
+
+IF YOU SEE: npm error EBUSY / rename ... node_modules\supabase
+  Another process locked the default npm npx cache (second terminal, antivirus, stuck Node).
+  1) Close every PowerShell/terminal that ran npx or supabase.
+  2) Run the script again — it now uses a folder inside this repo: .npm-supabase-cli\
+  3) If it still fails: Task Manager → end any stuck "Node.js" processes, then retry.
+  4) Last resort: delete folder
+       %LocalAppData%\npm-cache\_npx
+     (only when no Node/npm tasks are running), then retry.
+
+Option B — Scoop (only if you already installed Scoop from https://scoop.sh ):
+  scoop bucket add supabase https://github.com/supabase/scoop-bucket.git
+  scoop install supabase
+  supabase login
+
+Option C — Official installers / other methods:
+  https://supabase.com/docs/guides/cli/getting-started
+
+NOTE: `npm install -g supabase` is NOT supported and will fail on purpose.
+
+================================================================================
+PREREQUISITES
+================================================================================
+- Node.js (for Option A) OR Scoop-installed CLI (Option B)
+- Twilio: Account SID, Auth Token, FROM number in E.164 (+country...) allowed in Twilio
+- FIREBASE_PROJECT_ID = same as lib/firebase_options.dart projectId for your app build
+
+================================================================================
+COMMANDS (if `supabase` is already on PATH — same args as helper script)
+================================================================================
+1) supabase login
+2) supabase link --project-ref YOUR_PROJECT_REF
+3) supabase secrets set --project-ref YOUR_PROJECT_REF TWILIO_ACCOUNT_SID=... TWILIO_AUTH_TOKEN=... TWILIO_FROM_NUMBER=+1... FIREBASE_PROJECT_ID=...
+4) supabase functions deploy send-sms --project-ref YOUR_PROJECT_REF
+
+PowerShell one line for secrets (no line breaks):
+  supabase secrets set --project-ref YOUR_PROJECT_REF TWILIO_ACCOUNT_SID=ACxxx TWILIO_AUTH_TOKEN=xxx TWILIO_FROM_NUMBER=+15551234567 FIREBASE_PROJECT_ID=jurislink-app
+
+================================================================================
+FLUTTER APP
+================================================================================
+- lib/services/sms_service.dart invokes `send-sms` with x-firebase-token when Supabase is initialized.
+- On failure, SMS falls back to Firestore `sms_requests`.

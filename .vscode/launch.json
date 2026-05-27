@@ -1,0 +1,72 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        
+
+
+        {
+            "name": "law_connect4 (Android)",
+            "request": "launch",
+            "type": "dart",
+            "program": "lib/main.dart",
+            "deviceId": "android"
+        },
+        {
+            "name": "law_connect4 (TECNO CM5)",
+            "request": "launch",
+            "type": "dart",
+            "program": "lib/main.dart",
+            "deviceId": "138462555G001138"
+        },
+        {
+            "name": "law_connect4 (Windows)",
+            "request": "launch",
+            "type": "dart",
+            "program": "lib/main.dart",
+            "deviceId": "windows"
+        },
+        {
+            "name": "law_connect4 + Supabase (Windows)",
+            "request": "launch",
+            "type": "dart",
+            "program": "lib/main.dart",
+            "deviceId": "windows",
+            "toolArgs": [
+                "--dart-define=SUPABASE_URL=REPLACE_WITH_PROJECT_URL",
+                "--dart-define=SUPABASE_ANON_KEY=REPLACE_WITH_PUBLISHABLE_KEY"
+            ]
+        },
+        {
+            "name": "law_connect4 (Web — web-server)",
+            "request": "launch",
+            "type": "dart",
+            "program": "lib/main.dart",
+            "deviceId": "web-server"
+        },
+        {
+            "name": "law_connect4 (Edge)",
+            "request": "launch",
+            "type": "dart",
+            "program": "lib/main.dart",
+            "deviceId": "edge"
+        },
+        {
+            "name": "Attach Camel Debugger after starting the Camel Application using the preLaunchTask specified",
+            "type": "apache.camel",
+            "request": "attach",
+            "preLaunchTask": "Start Camel application"
+        },
+        {
+            "name": "Attach Camel Debugger",
+            "type": "apache.camel",
+            "request": "attach"
+        },
+        {
+            "type": "chrome",
+            "request": "launch",
+            "name": "Launch Chrome against localhost",
+            "url": "http://localhost:8080",
+            "webRoot": "${workspaceFolder}"
+        }
+    ]
+}

@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <base href="$FLUTTER_BASE_HREF">
+
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="X-UA-Compatible" content="IE=Edge">
+  <meta name="description" content="Law Connect — professional legal services">
+
+  <!-- PWA / install -->
+  <meta name="theme-color" content="#0F2E57">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Law Connect">
+  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="manifest" href="manifest.json">
+
+  <title>Law Connect</title>
+
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background-color: #0F2E57;
+    }
+  </style>
+</head>
+<body>
+  <!-- Shown until Flutter paints the first frame -->
+  <div id="loading" aria-live="polite" aria-busy="true">
+    <style>
+      #loading {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1.25rem;
+        background-color: #0F2E57;
+        color: #ffffff;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        z-index: 9999;
+      }
+      #loading .logo {
+        width: 72px;
+        height: 72px;
+        border-radius: 18px;
+        background: #ffffff;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+      }
+      #loading .logo img {
+        width: 48px;
+        height: 48px;
+        object-fit: contain;
+      }
+      #loading h1 {
+        margin: 0;
+        font-size: 1.5rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+      #loading p {
+        margin: 0;
+        font-size: 0.875rem;
+        color: rgba(255, 255, 255, 0.85);
+      }
+      #loading .spinner {
+        width: 28px;
+        height: 28px;
+        border: 3px solid rgba(241, 196, 15, 0.35);
+        border-top-color: #F1C40F;
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+    </style>
+    <div class="logo">
+      <img src="icons/Icon-192.png" alt="" width="48" height="48">
+    </div>
+    <h1>Law Connect</h1>
+    <p>Loading…</p>
+    <div class="spinner" role="status" aria-label="Loading"></div>
+  </div>
+
+  <script>
+    // Firebase Cloud Messaging (web push) — must not be served as SPA index.html
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('firebase-messaging-sw.js').catch(function () {});
+    }
+
+    window.addEventListener('flutter-first-frame', function () {
+      var el = document.getElementById('loading');
+      if (el) el.remove();
+    });
+  </script>
+  <script src="flutter_bootstrap.js" async></script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+# Link once: supabase link --project-ref YOUR_PROJECT_REF
+#
+# Set secrets (pick Semaphore for PH or Twilio):
+#   supabase secrets set SEMAPHORE_API_KEY=your_key
+#   supabase secrets set FIREBASE_PROJECT_ID=jurislink-app
+# Or Twilio:
+#   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER
+#
+# TWILIO_FROM_NUMBER must be E.164 and verified/allowed in Twilio for your account.
+#
+# Deploy:
+#   supabase functions deploy send-sms --project-ref YOUR_PROJECT_REF
+
+[functions.send-sms]
+verify_jwt = false
