@@ -44,6 +44,13 @@
             "deviceId": "web-server"
         },
         {
+            "name": "law_connect4 (Chrome)",
+            "request": "launch",
+            "type": "dart",
+            "program": "lib/main.dart",
+            "deviceId": "chrome"
+        },
+        {
             "name": "law_connect4 (Edge)",
             "request": "launch",
             "type": "dart",

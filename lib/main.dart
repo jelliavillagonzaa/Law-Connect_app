@@ -100,17 +100,7 @@ Future<void> _bootstrap() async {
   } catch (_) {}
 
   Get.config(enableLog: false);
-  runZonedGuarded(
-    () => runApp(const LawConnectApp()),
-    (error, stack) {
-      if (_isBenignFirestoreRuntimeError(error)) return;
-      if (kShowFrameworkErrors) {
-        FlutterError.presentError(
-          FlutterErrorDetails(exception: error, stack: stack),
-        );
-      }
-    },
-  );
+  runApp(const LawConnectApp());
   unawaited(_initDeferredServices());
 }
 
