@@ -5,10 +5,15 @@ class LazyIndexedStack extends StatefulWidget {
   final int index;
   final List<Widget Function()> builders;
 
+  /// When this value changes, the visible tab is rebuilt (e.g. dashboard stats updated).
+  /// Other parent [setState] calls do not rebuild the cached visible tab.
+  final Object? activeTabRevision;
+
   const LazyIndexedStack({
     super.key,
     required this.index,
     required this.builders,
+    this.activeTabRevision,
   }) : assert(builders.length > 0);
 
   @override
@@ -18,6 +23,7 @@ class LazyIndexedStack extends StatefulWidget {
 class LazyIndexedStackState extends State<LazyIndexedStack> {
   late final List<Widget?> _built =
       List<Widget?>.filled(widget.builders.length, null);
+  Object? _lastRevision;
 
   /// Build a tab in the background so the first tap is instant (e.g. calendar).
   void prewarm(int tabIndex) {
@@ -29,16 +35,23 @@ class LazyIndexedStackState extends State<LazyIndexedStack> {
   @override
   void didUpdateWidget(LazyIndexedStack oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.index == widget.index) return;
     final i = widget.index.clamp(0, widget.builders.length - 1);
-    _built[i] ??= widget.builders[i]();
+    if (oldWidget.index != widget.index ||
+        widget.activeTabRevision != oldWidget.activeTabRevision) {
+      _lastRevision = widget.activeTabRevision;
+      _built[i] = widget.builders[i]();
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final i = widget.index.clamp(0, widget.builders.length - 1);
-    if (_built[i] == null) {
+    final revision = widget.activeTabRevision;
+    if (revision != _lastRevision) {
+      _lastRevision = revision;
       _built[i] = widget.builders[i]();
+    } else {
+      _built[i] ??= widget.builders[i]();
     }
 
     return IndexedStack(

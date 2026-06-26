@@ -14,6 +14,22 @@
       },
       "oauth_client": [
         {
+          "client_id": "969711743833-6s422n7tlfa911d36kdpknsqh9s5gcrl.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.jurislink_app",
+            "certificate_hash": "a1ab370aa1db95894dd563059ba3248f954bdbaf"
+          }
+        },
+        {
+          "client_id": "969711743833-qro8r0c51tc5krn18oagudjaqh3fnpe6.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.jurislink_app",
+            "certificate_hash": "073308dba8e38f9397e6f76815797af260770c04"
+          }
+        },
+        {
           "client_id": "969711743833-n1k5ppfu3q8b24dtlcm8akg58j4fsfiq.apps.googleusercontent.com",
           "client_type": 3
         }

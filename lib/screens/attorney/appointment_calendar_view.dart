@@ -133,11 +133,11 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
   /// Live projection from `hearings` (ensures marks show even if sync write lags).
   List<Map<String, dynamic>> _hearingOverlay = [];
   StreamSubscription<List<Map<String, dynamic>>>? _calendarEventsSub;
-  StreamSubscription<List<Map<String, dynamic>>>? _hearingOverlaySub;
   StreamSubscription<List<AppointmentModel>>? _appointmentsSub;
   String? _attachedAttorneyId;
   bool _ownsAppointmentsStream = false;
-  Timer? _syncAttachTimer;
+  Timer? _calendarUiDebounce;
+  // Hearing overlay disabled on mobile to avoid ANR.
 
   final Map<String, String> _clientNameCache =
       <String, String>{}; // Cache for client full names
@@ -198,12 +198,10 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     final user = _authService.currentUser;
     if (user != null) {
       _attachedAttorneyId = user.uid;
-      _subscribeHearingOverlay();
-      unawaited(_loadHearingsFromFirestoreFallback(user.uid));
-      _syncAttachTimer = Timer(const Duration(milliseconds: 300), () {
-        if (!mounted) return;
-        HearingCalendarSyncService.instance.attachForAttorney(user.uid);
-      });
+      // NOTE: Avoid attaching heavy `hearings` listeners / bulk reads on open;
+      // these can ANR on some devices. The calendar still shows `calendar_events`
+      // + appointments; hearing overlay can be added back behind an explicit
+      // "refresh AI hearings" action if needed.
     }
   }
 
@@ -220,37 +218,10 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     }
   }
 
-  /// One-shot load so calendar cells populate even if the live overlay stream errors.
-  Future<void> _loadHearingsFromFirestoreFallback(String attorneyId) async {
-    try {
-      final casesSnap = await _firestore
-          .collection('cases')
-          .where('attorneyId', isEqualTo: attorneyId)
-          .get();
-      final caseMaps = casesSnap.docs
-          .map((d) => <String, dynamic>{'id': d.id, ...d.data()})
-          .toList();
-
-      final hearingsSnap =
-          await _firestore.collection('hearings').limit(500).get();
-      final rows = HearingCalendarSyncService.instance.projectHearingsFromDocs(
-        attorneyId,
-        caseMaps,
-        hearingsSnap.docs,
-      );
-      if (!mounted || rows.isEmpty) return;
-      setState(() {
-        _hearingOverlay = rows;
-        _maybeFocusFirstHearingMonth(rows);
-      });
-    } catch (_) {}
-  }
-
   @override
   void dispose() {
-    _syncAttachTimer?.cancel();
+    _calendarUiDebounce?.cancel();
     _calendarEventsSub?.cancel();
-    _hearingOverlaySub?.cancel();
     if (_ownsAppointmentsStream) {
       _appointmentsSub?.cancel();
     }
@@ -259,6 +230,17 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       HearingCalendarSyncService.instance.detachForAttorney(aid);
     }
     super.dispose();
+  }
+
+  void _scheduleCalendarEventsUi(List<Map<String, dynamic>> events) {
+    _calendarUiDebounce?.cancel();
+    _calendarUiDebounce = Timer(const Duration(milliseconds: 280), () {
+      if (!mounted) return;
+      setState(() {
+        _calendarEvents = _mergeCalendarEventsFromServer(events);
+        _maybeFocusFirstHearingMonth();
+      });
+    });
   }
 
   /// Keeps Add Appointment rows visible until Firestore stream includes them.
@@ -284,41 +266,37 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     final user = _authService.currentUser;
     if (user == null) return;
     _calendarEventsSub?.cancel();
-    _calendarEventsSub = _staffService.getCalendarEvents(user.uid).listen((
-      events,
-    ) {
-      if (mounted) {
-        setState(
-          () => _calendarEvents = _mergeCalendarEventsFromServer(events),
-        );
-      }
-    });
-  }
-
-  void _subscribeHearingOverlay() {
-    final user = _authService.currentUser;
-    if (user == null) return;
-    _hearingOverlaySub?.cancel();
-    _hearingOverlaySub = HearingCalendarSyncService.instance
-        .watchHearingEntriesForAttorney(user.uid)
-        .listen(
-      (rows) {
-        if (mounted) {
-          setState(() {
-            _hearingOverlay = rows;
-            _maybeFocusFirstHearingMonth(rows);
-          });
-        }
-      },
+    _calendarEventsSub = _staffService.getCalendarEvents(user.uid).listen(
+      _scheduleCalendarEventsUi,
       onError: (_) {},
     );
+  }
+
+  /// Automated hearing entries from the live overlay plus the persisted synced
+  /// `calendar_events` (deduped by hearingDocId) so navigation stays resilient.
+  List<Map<String, dynamic>> _allHearingNavEvents() {
+    final out = <Map<String, dynamic>>[];
+    final seenHearingIds = <String>{};
+    void add(Map<String, dynamic> ev) {
+      final hid = (ev['hearingDocId'] as String?)?.trim() ?? '';
+      if (hid.isNotEmpty && !seenHearingIds.add(hid)) return;
+      out.add(ev);
+    }
+
+    for (final ev in _hearingOverlay) {
+      add(ev);
+    }
+    for (final ev in _calendarEvents) {
+      if (isFirestoreSyncedHearingCalendarRow(ev)) add(ev);
+    }
+    return out;
   }
 
   /// Months with Firestore `hearings` not shown in the current calendar view.
   List<DateTime> _hearingMonthsOutsideView() {
     final seen = <String>{};
     final out = <DateTime>[];
-    for (final ev in _hearingOverlay) {
+    for (final ev in _allHearingNavEvents()) {
       final d = _dateTimeFromField(ev['eventDate']);
       if (d == null) continue;
       if (d.year == _viewDate.year && d.month == _viewDate.month) continue;
@@ -389,10 +367,10 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
   DateTime _calendarDay(DateTime d) => DateTime(d.year, d.month, d.day);
 
   /// If Firestore hearings are in another month (e.g. April), open that month once.
-  void _maybeFocusFirstHearingMonth(List<Map<String, dynamic>> rows) {
-    if (_didAutoFocusHearingMonth || rows.isEmpty) return;
+  void _maybeFocusFirstHearingMonth() {
+    if (_didAutoFocusHearingMonth) return;
     final dates = <DateTime>[];
-    for (final row in rows) {
+    for (final row in _allHearingNavEvents()) {
       final d = _dateTimeFromField(row['eventDate']);
       if (d != null) dates.add(d);
     }
@@ -403,37 +381,12 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     );
     if (hasInViewMonth) return;
     _didAutoFocusHearingMonth = true;
-    final first = dates.first;
-    _viewDate = DateTime(first.year, first.month);
-  }
-
-  AppointmentModel? _appointmentFromCalendarEvent(Map<String, dynamic> ev) {
-    var id = (ev['appointmentId'] as String?)?.trim() ?? '';
-    if (id.isEmpty) {
-      final docId = (ev['id'] as String?)?.trim() ?? '';
-      if (docId.startsWith('appt_')) {
-        id = docId.substring(5);
-      }
-    }
-    if (id.isEmpty) return null;
-
-    final eventDate = _dateTimeFromField(ev['eventDate']);
-    if (eventDate == null) return null;
-
-    return AppointmentModel(
-      id: id,
-      clientId: (ev['clientId'] as String?) ?? '',
-      clientName: (ev['clientName'] as String?) ?? 'Client',
-      attorneyId: ev['assignedTo'] as String?,
-      caseId: ev['caseId'] as String?,
-      caseTitle: ev['caseTitle'] as String?,
-      appointmentDateTime: eventDate,
-      appointmentType: (ev['appointmentType'] as String?) ?? 'meeting_office',
-      notes: ev['notes'] as String?,
-      status: 'upcoming',
-      createdAt: DateTime.now(),
-      updatedAt: DateTime.now(),
-    );
+    // Prefer the nearest upcoming hearing month; fall back to the earliest.
+    final now = DateTime.now();
+    final monthStart = DateTime(now.year, now.month);
+    final upcoming = dates.where((d) => !d.isBefore(monthStart)).toList();
+    final target = upcoming.isNotEmpty ? upcoming.first : dates.first;
+    _viewDate = DateTime(target.year, target.month);
   }
 
   List<_AttorneyCalendarEntry> _getEntriesForDate(DateTime date) {
@@ -470,21 +423,56 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       out.add(_AttorneyCalendarEntry.fromHearing(ev));
     }
 
-    // Overlay uses live `hearingDate` — prefer it over stale `calendar_events` rows.
+    // Overlay uses live `hearingDate` and is added first, so it wins on dedup.
     for (final ev in _hearingOverlay) {
       addHearing(ev);
     }
+    // Include persisted `calendar_events` (incl. synced hearings) as a resilient
+    // fallback: addHearing() dedups by hearingDocId, so the live overlay is still
+    // preferred when present, but automated hearings stay visible even if the
+    // live `hearings` read fails or returns empty.
     for (final ev in _calendarEvents) {
-      if (isFirestoreSyncedHearingCalendarRow(ev)) continue;
-      if (ev['eventType'] == 'hearing') {
-        final hid = (ev['hearingDocId'] as String?)?.trim() ?? '';
-        if (hid.isNotEmpty) continue;
-      }
       addHearing(ev);
     }
 
     out.sort((a, b) => a.startTime.compareTo(b.startTime));
-    return out;
+    return _dedupeCalendarEntriesForDay(out);
+  }
+
+  /// Same case/hearing from overlay + calendar_events can appear twice.
+  List<_AttorneyCalendarEntry> _dedupeCalendarEntriesForDay(
+    List<_AttorneyCalendarEntry> entries,
+  ) {
+    final byKey = <String, _AttorneyCalendarEntry>{};
+    for (final e in entries) {
+      if (e.appointment != null) {
+        final id = e.appointment!.id.trim();
+        byKey[id.isEmpty ? 'apt:${e.hashCode}' : 'apt:$id'] = e;
+        continue;
+      }
+      final ev = e.hearingEvent!;
+      final hid = (ev['hearingDocId'] as String?)?.trim() ?? '';
+      final cn = (ev['caseNo'] as String?)?.trim().toLowerCase() ?? '';
+      final title = e.hearingTitle().trim().toLowerCase();
+      final d = e.startTime;
+      final dayKey = '${d.year}${d.month}${d.day}';
+      final key = hid.isNotEmpty
+          ? 'h:$hid'
+          : 'c:${cn.isNotEmpty ? cn : title}:$dayKey';
+      final existing = byKey[key];
+      if (existing == null) {
+        byKey[key] = e;
+        continue;
+      }
+      final existingHid =
+          (existing.hearingEvent?['hearingDocId'] as String?)?.trim() ?? '';
+      if (existingHid.isEmpty && hid.isNotEmpty) {
+        byKey[key] = e;
+      }
+    }
+    final deduped = byKey.values.toList()
+      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    return deduped;
   }
 
   void _bindAppointments() {
@@ -1394,17 +1382,16 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
               ),
             ),
           ),
-          // Appointments + calendar events
           Expanded(
             child: ListView.builder(
               padding: const EdgeInsets.all(4),
+              physics: const NeverScrollableScrollPhysics(),
               itemCount: dayEntries.length,
               itemBuilder: (context, index) {
                 return _buildCalendarEntrySlot(dayEntries[index]);
               },
             ),
           ),
-          // Add button
           InkWell(
             onTap: () async {
               final created = await _createAppointmentForDate(day);
@@ -1445,7 +1432,6 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Date number - tappable if has items
           InkWell(
             onTap: entries.isNotEmpty
                 ? () => _showEntriesForDate(day, entries)
@@ -1501,12 +1487,26 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
               ),
             ),
           ),
-          // Appointments + hearings — show up to 3
           Expanded(
             child: ListView.builder(
               padding: const EdgeInsets.symmetric(horizontal: 4),
-              itemCount: entries.length > 3 ? 3 : entries.length,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: (entries.length > 3 ? 3 : entries.length) +
+                  (entries.length > 3 ? 1 : 0),
               itemBuilder: (context, index) {
+                final shownCount = entries.length > 3 ? 3 : entries.length;
+                if (index >= shownCount) {
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 4,
+                      vertical: 2,
+                    ),
+                    child: Text(
+                      '+${entries.length - 3} more',
+                      style: TextStyle(fontSize: 9, color: Colors.grey[600]),
+                    ),
+                  );
+                }
                 final entry = entries[index];
                 return InkWell(
                   onTap: () => _showEntryDetails(entry),
@@ -1553,7 +1553,7 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
                                     fontWeight: FontWeight.w800,
                                   ),
                                 ),
-                              )
+                              ),
                           ],
                         ),
                         Text(
@@ -1577,14 +1577,6 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
               },
             ),
           ),
-          if (entries.length > 3)
-            Padding(
-              padding: const EdgeInsets.all(4),
-              child: Text(
-                '+${entries.length - 3} more',
-                style: TextStyle(fontSize: 10, color: Colors.grey[600]),
-              ),
-            ),
         ],
       ),
     );
@@ -1699,74 +1691,86 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     // every setState and would otherwise reset the list to [entries].
     var dayEntries = List<_AttorneyCalendarEntry>.from(entries);
 
+    final dialogMaxH = MediaQuery.sizeOf(context).height * 0.88;
+
     showDialog(
       context: context,
       builder: (dialogContext) => Dialog(
-        child: Container(
-          width: MediaQuery.of(dialogContext).size.width > 600
-              ? 500
-              : double.infinity,
-          padding: const EdgeInsets.all(24),
-          child: StatefulBuilder(
-            builder: (context, setDialogState) {
-              final apptN =
-                  dayEntries.where((e) => e.appointment != null).length;
-              final calN = dayEntries.length - apptN;
-              final aiN = dayEntries.where((e) => e.isAiScheduled).length;
-
-              return Column(
+        insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: MediaQuery.sizeOf(dialogContext).width > 600
+                ? 500
+                : MediaQuery.sizeOf(dialogContext).width * 0.94,
+            maxHeight: dialogMaxH,
+          ),
+          child: Column(
             mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text(
-                    DateFormat('MMMM dd, yyyy').format(date),
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.close),
-                    onPressed: () => Navigator.pop(dialogContext),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '${dayEntries.length} scheduled item${dayEntries.length != 1 ? 's' : ''}',
-                    style: TextStyle(fontSize: 14, color: Colors.grey[700]),
-                  ),
-                  if (apptN > 0 || calN > 0) ...[
-                    const SizedBox(height: 4),
-                    Text(
-                      [
-                        if (apptN > 0)
-                          '$apptN client appointment${apptN != 1 ? 's' : ''}',
-                        if (apptN > 0 && calN > 0) ' · ',
-                        if (calN > 0)
-                          '$calN calendar event${calN != 1 ? 's' : ''}'
-                          '${aiN > 0 ? ' ($aiN AI)' : ''}',
-                      ].join(),
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Colors.grey[600],
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 20, 12, 0),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        DateFormat('MMMM dd, yyyy').format(date),
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
                     ),
+                    IconButton(
+                      icon: const Icon(Icons.close),
+                      onPressed: () => Navigator.pop(dialogContext),
+                    ),
                   ],
-                ],
+                ),
               ),
-              const SizedBox(height: 16),
               Flexible(
-                child: ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: dayEntries.length,
-                  itemBuilder: (context, index) {
+                child: StatefulBuilder(
+                  builder: (context, setDialogState) {
+                    final apptN =
+                        dayEntries.where((e) => e.appointment != null).length;
+                    final calN = dayEntries.length - apptN;
+                    final aiN =
+                        dayEntries.where((e) => e.isAiScheduled).length;
+
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: SingleChildScrollView(
+                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '${dayEntries.length} scheduled item${dayEntries.length != 1 ? 's' : ''}',
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: Colors.grey[700],
+                            ),
+                          ),
+                          if (apptN > 0 || calN > 0) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              [
+                                if (apptN > 0)
+                                  '$apptN client appointment${apptN != 1 ? 's' : ''}',
+                                if (apptN > 0 && calN > 0) ' · ',
+                                if (calN > 0)
+                                  '$calN calendar event${calN != 1 ? 's' : ''}'
+                                  '${aiN > 0 ? ' ($aiN AI)' : ''}',
+                              ].join(),
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey[600],
+                              ),
+                            ),
+                          ],
+                          const SizedBox(height: 16),
+                          ...List.generate(dayEntries.length, (index) {
                     final entry = dayEntries[index];
                     final apt = entry.appointment;
                     if (apt != null) {
@@ -1944,44 +1948,59 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
                                 ],
                               ),
                               const SizedBox(height: 8),
-                              const SizedBox(height: 8),
                               HearingCalendarEventBody(
                                 data: ev,
                                 dense: true,
-                                maxLines: 7,
+                                maxLines: 3,
                               ),
                             ],
                           ),
                         ),
                       ),
                     );
+                          }),
+                        ],
+                      ),
+                    ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(0, 8, 0, 0),
+                          child: SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton.icon(
+                              onPressed: () async {
+                                final created =
+                                    await _createAppointmentForDate(date);
+                                if (created == null || !context.mounted) {
+                                  return;
+                                }
+                                final showDay =
+                                    _calendarDay(created.appointmentDateTime);
+                                final updated = _entriesForDateWithAppointment(
+                                  showDay,
+                                  _getEntriesForDate(showDay),
+                                  created: created,
+                                );
+                                setDialogState(() => dayEntries = updated);
+                                if (mounted) setState(() {});
+                              },
+                              icon: const Icon(Icons.add),
+                              label: const Text('Add Appointment'),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: calendarBlue,
+                                foregroundColor: Colors.white,
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 14),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    );
                   },
                 ),
               ),
-              const SizedBox(height: 16),
-              ElevatedButton.icon(
-                onPressed: () async {
-                  final created = await _createAppointmentForDate(date);
-                  if (created == null || !context.mounted) return;
-                  final showDay = _calendarDay(created.appointmentDateTime);
-                  final updated = _entriesForDateWithAppointment(
-                    showDay,
-                    _getEntriesForDate(showDay),
-                    created: created,
-                  );
-                  setDialogState(() => dayEntries = updated);
-                  if (mounted) setState(() {});
-                },
-                icon: const Icon(Icons.add),
-                label: const Text('Add Appointment'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: calendarBlue,
-                  foregroundColor: Colors.white,
-                ),
-              ),
             ],
-          );
-            },
           ),
         ),
       ),

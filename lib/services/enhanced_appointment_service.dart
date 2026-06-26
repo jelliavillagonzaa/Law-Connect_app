@@ -2,6 +2,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
 import '../models/appointment_model.dart';
+import 'firestore_mirror_helper.dart';
 
 class EnhancedAppointmentService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -61,11 +62,15 @@ class EnhancedAppointmentService {
         updatedAt: DateTime.now(),
       );
 
-      final docRef = await _firestore
-          .collection('appointments')
-          .add(appointment.toFirestore());
+      final addResult = await HybridDatastore.add(
+        collection: 'appointments',
+        data: appointment.toFirestore(),
+      );
+      if (!addResult.isSuccess) {
+        return {'success': false, 'message': addResult.failureMessage};
+      }
 
-      final appointmentId = docRef.id;
+      final appointmentId = addResult.id!;
 
       // Get creator name (who scheduled the appointment)
       final creatorDoc = await _firestore
@@ -303,10 +308,7 @@ class EnhancedAppointmentService {
 
       // Also create a Cloud Function trigger document for 3-day reminder
       // This will be processed by a Cloud Function scheduled task
-      await _firestore
-          .collection('appointment_reminders')
-          .doc(appointmentId)
-          .set({
+      final reminderData = <String, dynamic>{
             'appointmentId': appointmentId,
             'clientId': clientId,
             'attorneyId': attorneyId,
@@ -320,7 +322,12 @@ class EnhancedAppointmentService {
             'status': 'pending',
             'notificationsSent': false,
             'createdAt': FieldValue.serverTimestamp(),
-          });
+          };
+      await HybridDatastore.set(
+        collection: 'appointment_reminders',
+        id: appointmentId,
+        data: reminderData,
+      );
     } catch (e) {
       // Ignore scheduling errors
       print('Error scheduling 3-day advance notification: $e');
@@ -354,10 +361,8 @@ class EnhancedAppointmentService {
       }
 
       // Create reminder document for same-day reminder
-      await _firestore
-          .collection('appointment_reminders')
-          .doc('${appointmentId}_sameday')
-          .set({
+      final sameDayId = '${appointmentId}_sameday';
+      final sameDayData = <String, dynamic>{
             'appointmentId': appointmentId,
             'clientId': clientId,
             'attorneyId': attorneyId,
@@ -372,7 +377,12 @@ class EnhancedAppointmentService {
             'status': 'pending',
             'notificationsSent': false,
             'createdAt': FieldValue.serverTimestamp(),
-          });
+          };
+      await HybridDatastore.set(
+        collection: 'appointment_reminders',
+        id: sameDayId,
+        data: sameDayData,
+      );
     } catch (e) {
       // Ignore scheduling errors
       print('Error scheduling same-day reminder: $e');
@@ -388,15 +398,16 @@ class EnhancedAppointmentService {
     String? appointmentId,
   }) async {
     try {
-      await _firestore.collection('notifications').add({
+      final notifData = <String, dynamic>{
         'userId': userId,
         'type': type,
         'title': title,
         'message': message,
-        'appointmentId': appointmentId,
+        if (appointmentId != null) 'appointmentId': appointmentId,
         'isRead': false,
         'createdAt': FieldValue.serverTimestamp(),
-      });
+      };
+      await HybridDatastore.add(collection: 'notifications', data: notifData);
     } catch (e) {
       // Ignore individual notification failures
       print('Error creating notification for user $userId: $e');
@@ -762,7 +773,7 @@ class EnhancedAppointmentService {
       // This is intentionally outside the batch so that stricter
       // security rules on `notifications` do not block the core flow.
       try {
-        await _firestore.collection('notifications').add({
+        final notifData = <String, dynamic>{
           'type': 'appointment_accepted',
           'clientId': request.clientId,
           'attorneyId': currentUser.uid,
@@ -772,7 +783,8 @@ class EnhancedAppointmentService {
               'Your appointment request has been accepted and scheduled.',
           'isRead': false,
           'createdAt': FieldValue.serverTimestamp(),
-        });
+        };
+        await HybridDatastore.add(collection: 'notifications', data: notifData);
       } catch (_) {
         // Ignore notification write failures (e.g. permission-denied)
       }
@@ -935,7 +947,7 @@ class EnhancedAppointmentService {
             message = 'Your appointment request status changed to $status.';
           }
 
-          await _firestore.collection('notifications').add({
+          final notifData = <String, dynamic>{
             'type': type,
             'clientId': clientId,
             'attorneyId': existingAttorneyId ?? currentAttorneyId,
@@ -944,7 +956,8 @@ class EnhancedAppointmentService {
             'message': message,
             'isRead': false,
             'createdAt': FieldValue.serverTimestamp(),
-          });
+          };
+          await HybridDatastore.add(collection: 'notifications', data: notifData);
         }
       } catch (_) {
         // Ignore notification failures

@@ -6,6 +6,7 @@ import 'fcm_service.dart';
 import 'staff_auth_service.dart';
 import 'backup_service.dart';
 import 'sms_service.dart';
+import 'firestore_mirror_helper.dart';
 
 enum _CaseAnalyticsBucket { pending, inProgress, completed }
 
@@ -70,7 +71,7 @@ class AdminService {
         entry['resourceId'] = resourceId.trim();
       }
 
-      await _firestore.collection('system_logs').add(entry);
+      await HybridDatastore.add(collection: 'system_logs', data: entry);
     } catch (e) {
       // Silently fail logging - don't break the app
       if (kDebugMode) {
@@ -259,7 +260,13 @@ class AdminService {
 
   // User Management
   Future<void> updateUserRole(String userId, String newRole) async {
-    await _firestore.collection('users').doc(userId).update({'role': newRole});
+    final patch = <String, dynamic>{'role': newRole};
+    final result = await HybridDatastore.update(
+      collection: 'users',
+      id: userId,
+      patch: patch,
+    );
+    if (!result.isSuccess) throw Exception(result.failureMessage);
     await logAction(
       action: 'user_role_updated',
       resourceType: 'user',
@@ -269,10 +276,16 @@ class AdminService {
   }
 
   Future<void> deactivateUser(String userId) async {
-    await _firestore.collection('users').doc(userId).update({
+    final patch = <String, dynamic>{
       'isActive': false,
       'deactivatedAt': FieldValue.serverTimestamp(),
-    });
+    };
+    final result = await HybridDatastore.update(
+      collection: 'users',
+      id: userId,
+      patch: patch,
+    );
+    if (!result.isSuccess) throw Exception(result.failureMessage);
     await logAction(
       action: 'user_deactivated',
       resourceType: 'user',
@@ -281,10 +294,16 @@ class AdminService {
   }
 
   Future<void> activateUser(String userId) async {
-    await _firestore.collection('users').doc(userId).update({
+    final patch = <String, dynamic>{
       'isActive': true,
       'deactivatedAt': FieldValue.delete(),
-    });
+    };
+    final result = await HybridDatastore.update(
+      collection: 'users',
+      id: userId,
+      patch: patch,
+    );
+    if (!result.isSuccess) throw Exception(result.failureMessage);
     await logAction(
       action: 'user_activated',
       resourceType: 'user',
@@ -308,10 +327,14 @@ class AdminService {
 
   // Case Management
   Future<void> reassignCase(String caseId, String newAttorneyId) async {
-    await _firestore.collection('cases').doc(caseId).update({
-      'attorneyId': newAttorneyId,
-      'updatedAt': FieldValue.serverTimestamp(),
-    });
+    final result = await HybridDatastore.updateCase(
+      id: caseId,
+      patch: {
+        'attorneyId': newAttorneyId,
+        'updatedAt': FieldValue.serverTimestamp(),
+      },
+    );
+    if (!result.isSuccess) throw Exception(result.failureMessage);
     await logAction(
       action: 'case_reassigned',
       resourceType: 'case',
@@ -321,11 +344,15 @@ class AdminService {
   }
 
   Future<void> lockCase(String caseId, String reason) async {
-    await _firestore.collection('cases').doc(caseId).update({
-      'isLocked': true,
-      'lockReason': reason,
-      'lockedAt': FieldValue.serverTimestamp(),
-    });
+    final result = await HybridDatastore.updateCase(
+      id: caseId,
+      patch: {
+        'isLocked': true,
+        'lockReason': reason,
+        'lockedAt': FieldValue.serverTimestamp(),
+      },
+    );
+    if (!result.isSuccess) throw Exception(result.failureMessage);
     await logAction(
       action: 'case_locked',
       resourceType: 'case',
@@ -335,11 +362,15 @@ class AdminService {
   }
 
   Future<void> unlockCase(String caseId) async {
-    await _firestore.collection('cases').doc(caseId).update({
-      'isLocked': false,
-      'lockReason': FieldValue.delete(),
-      'lockedAt': FieldValue.delete(),
-    });
+    final result = await HybridDatastore.updateCase(
+      id: caseId,
+      patch: {
+        'isLocked': false,
+        'lockReason': FieldValue.delete(),
+        'lockedAt': FieldValue.delete(),
+      },
+    );
+    if (!result.isSuccess) throw Exception(result.failureMessage);
     await logAction(
       action: 'case_unlocked',
       resourceType: 'case',
@@ -349,12 +380,16 @@ class AdminService {
 
   /// Moves a case to archive storage (hidden from Case Oversight).
   Future<void> archiveCase(String caseId) async {
-    await _firestore.collection('cases').doc(caseId).update({
-      'isArchived': true,
-      'archivedAt': FieldValue.serverTimestamp(),
-      'archivedBy': _auth.currentUser?.uid,
-      'updatedAt': FieldValue.serverTimestamp(),
-    });
+    final result = await HybridDatastore.updateCase(
+      id: caseId,
+      patch: {
+        'isArchived': true,
+        'archivedAt': FieldValue.serverTimestamp(),
+        'archivedBy': _auth.currentUser?.uid,
+        'updatedAt': FieldValue.serverTimestamp(),
+      },
+    );
+    if (!result.isSuccess) throw Exception(result.failureMessage);
     await logAction(
       action: 'case_archived',
       resourceType: 'case',
@@ -364,12 +399,16 @@ class AdminService {
 
   /// Restores a case from archive storage back to Case Oversight.
   Future<void> restoreArchivedCase(String caseId) async {
-    await _firestore.collection('cases').doc(caseId).update({
-      'isArchived': false,
-      'archivedAt': FieldValue.delete(),
-      'archivedBy': FieldValue.delete(),
-      'updatedAt': FieldValue.serverTimestamp(),
-    });
+    final result = await HybridDatastore.updateCase(
+      id: caseId,
+      patch: {
+        'isArchived': false,
+        'archivedAt': FieldValue.delete(),
+        'archivedBy': FieldValue.delete(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      },
+    );
+    if (!result.isSuccess) throw Exception(result.failureMessage);
     await logAction(
       action: 'case_restored_from_archive',
       resourceType: 'case',
@@ -396,7 +435,8 @@ class AdminService {
       data: backupData,
       deletedBy: _auth.currentUser?.uid,
     );
-    await _firestore.collection('cases').doc(caseId).delete();
+    final deleteResult = await HybridDatastore.deleteCase(caseId);
+    if (!deleteResult.isSuccess) throw Exception(deleteResult.failureMessage);
     await logAction(
       action: 'case_deleted_to_backup',
       resourceType: 'case',
@@ -410,10 +450,7 @@ class AdminService {
       for (final doc in snapshot.docs) {
         final data = doc.data();
         if (data['isArchived'] != true) continue;
-        items.add({
-          'id': doc.id,
-          ...data,
-        });
+        items.add({'id': doc.id, ...data});
       }
       items.sort((a, b) {
         final ta = a['archivedAt'] as Timestamp?;
@@ -431,10 +468,16 @@ class AdminService {
   Future<void> setMaintenanceMode(bool enabled) async {
     try {
       // Use set with merge to handle both create and update
-      await _firestore.collection('system_settings').doc('maintenance').set({
-        'maintenanceMode': enabled,
-        'updatedAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
+      final result = await HybridDatastore.set(
+        collection: 'system_settings',
+        id: 'maintenance',
+        data: {
+          'maintenanceMode': enabled,
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+        options: SetOptions(merge: true),
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       await logAction(
         action: 'maintenance_mode_${enabled ? 'enabled' : 'disabled'}',
@@ -498,6 +541,7 @@ class AdminService {
     DateTime? startDate,
     DateTime? endDate,
     int? year,
+
     /// 1–12; with [year] limits to that calendar month.
     int? month,
   }) async {
@@ -569,12 +613,11 @@ class AdminService {
     var peakMonthCount = 0;
     if (year != null && month == null && monthlyCases.isNotEmpty) {
       final prefix = '$year-';
-      Iterable<MapEntry<String, int>> yearMonths = monthlyCases.entries
-          .where((e) => e.key.startsWith(prefix));
+      Iterable<MapEntry<String, int>> yearMonths = monthlyCases.entries.where(
+        (e) => e.key.startsWith(prefix),
+      );
       if (yearMonths.isNotEmpty) {
-        final peak = yearMonths.reduce(
-          (a, b) => a.value >= b.value ? a : b,
-        );
+        final peak = yearMonths.reduce((a, b) => a.value >= b.value ? a : b);
         peakMonthCount = peak.value;
         final parts = peak.key.split('-');
         if (parts.length == 2) {
@@ -770,7 +813,7 @@ class AdminService {
       final userId = credential.user!.uid;
 
       // Create user document in Firestore
-      await _firestore.collection('users').doc(userId).set({
+      final attorneyData = <String, dynamic>{
         'name': name,
         'email': email,
         'role': 'attorney',
@@ -781,7 +824,13 @@ class AdminService {
             : [],
         'createdAt': FieldValue.serverTimestamp(),
         'updatedAt': FieldValue.serverTimestamp(),
-      });
+      };
+      final result = await HybridDatastore.set(
+        collection: 'users',
+        id: userId,
+        data: attorneyData,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       // Send password reset email so attorney can set their own password
       await _auth.sendPasswordResetEmail(email: email);
@@ -822,13 +871,19 @@ class AdminService {
       }
 
       // Activate the attorney account
-      await _firestore.collection('users').doc(attorneyId).update({
+      final activatePatch = <String, dynamic>{
         'isActive': true,
         'pendingApproval': false,
         'activatedAt': FieldValue.serverTimestamp(),
         'activatedBy': _auth.currentUser?.uid,
         'updatedAt': FieldValue.serverTimestamp(),
-      });
+      };
+      final result = await HybridDatastore.update(
+        collection: 'users',
+        id: attorneyId,
+        patch: activatePatch,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       // Log the action
       await logAction(
@@ -855,7 +910,7 @@ class AdminService {
         }
 
         // Create notification in Firestore
-        await _firestore.collection('notifications').add({
+        final notifData = <String, dynamic>{
           'userId': attorneyId,
           'clientId': attorneyId, // For compatibility with notification screen
           'title': 'Account Activated',
@@ -865,7 +920,8 @@ class AdminService {
           'data': {'attorneyId': attorneyId},
           'isRead': false,
           'createdAt': FieldValue.serverTimestamp(),
-        });
+        };
+        await HybridDatastore.add(collection: 'notifications', data: notifData);
       } catch (e) {
         if (kDebugMode) {
           debugPrint(
@@ -897,12 +953,18 @@ class AdminService {
       }
 
       // Deactivate the attorney account
-      await _firestore.collection('users').doc(attorneyId).update({
+      final deactivatePatch = <String, dynamic>{
         'isActive': false,
         'deactivatedAt': FieldValue.serverTimestamp(),
         'deactivatedBy': _auth.currentUser?.uid,
         'updatedAt': FieldValue.serverTimestamp(),
-      });
+      };
+      final result = await HybridDatastore.update(
+        collection: 'users',
+        id: attorneyId,
+        patch: deactivatePatch,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       // Log the action
       await logAction(
@@ -961,7 +1023,12 @@ class AdminService {
       if (specializations != null)
         updateData['specializations'] = specializations;
 
-      await _firestore.collection('users').doc(userId).update(updateData);
+      final result = await HybridDatastore.update(
+        collection: 'users',
+        id: userId,
+        patch: updateData,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       await logAction(
         action: 'user_updated',
@@ -1010,7 +1077,11 @@ class AdminService {
         );
       }
 
-      await _firestore.collection('users').doc(userId).delete();
+      final result = await HybridDatastore.delete(
+        collection: 'users',
+        id: userId,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       await logAction(
         action: 'user_deleted',
@@ -1040,10 +1111,16 @@ class AdminService {
 
       documents.remove(documentUrl);
 
-      await _firestore.collection('cases').doc(caseId).update({
-        'documents': documents,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+      final result = await HybridDatastore.updateCase(
+        id: caseId,
+        patch: {
+          'documents': documents,
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      );
+      if (!result.isSuccess) {
+        return {'success': false, 'message': result.failureMessage};
+      }
 
       await logAction(
         action: 'document_deleted',

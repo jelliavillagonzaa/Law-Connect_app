@@ -5,6 +5,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 
 import 'hearing_calendar_sync_service.dart';
 import 'hearing_notification_fanout_service.dart';
+import 'firestore_mirror_helper.dart';
 
 /// Activity rows in Firestore `hearings`. Cloud Functions send push, email (if SMTP
 /// configured), and in-app `notifications` to everyone on the case — including the sender.
@@ -75,7 +76,9 @@ class HearingActivityService {
       data['notifyUserIds'] = notifyUserIds;
     }
 
-    final ref = await _hearings.add(data);
+    final result = await HybridDatastore.add(collection: 'hearings', data: data);
+    if (!result.isSuccess) throw Exception(result.failureMessage);
+    final ref = _hearings.doc(result.id!);
     HearingNotificationFanoutService.instance.scheduleProcess(ref);
     unawaited(HearingCalendarSyncService.instance.syncHearingDoc(ref));
     return ref;
@@ -108,12 +111,14 @@ class HearingActivityService {
       data['hearingDateTime'] = Timestamp.fromDate(hearingDateTime);
     }
 
-    final ref = await _hearings.add(data);
+    final result = await HybridDatastore.add(collection: 'hearings', data: data);
+    if (!result.isSuccess) throw Exception(result.failureMessage);
+    final ref = _hearings.doc(result.id!);
     HearingNotificationFanoutService.instance.scheduleProcess(ref);
     return ref;
   }
 
-  /// Updates an existing activity (same sender only — see Firestore rules). Triggers reminder reschedule when [hearingDateTime] changes.
+  /// Updates an existing activity
   Future<void> updateHearingActivity({
     required String hearingDocId,
     required String message,
@@ -138,8 +143,13 @@ class HearingActivityService {
     }
     if (caseTitle != null) data['caseTitle'] = caseTitle;
 
+    final result = await HybridDatastore.update(
+      collection: 'hearings',
+      id: hearingDocId,
+      patch: data,
+    );
+    if (!result.isSuccess) throw Exception(result.failureMessage);
     final ref = _hearings.doc(hearingDocId);
-    await ref.update(data);
     HearingNotificationFanoutService.instance.scheduleProcess(ref);
     unawaited(HearingCalendarSyncService.instance.syncHearingDoc(ref));
   }

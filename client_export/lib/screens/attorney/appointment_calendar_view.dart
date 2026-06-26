@@ -484,7 +484,42 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     }
 
     out.sort((a, b) => a.startTime.compareTo(b.startTime));
-    return out;
+    return _dedupeCalendarEntriesForDay(out);
+  }
+
+  List<_AttorneyCalendarEntry> _dedupeCalendarEntriesForDay(
+    List<_AttorneyCalendarEntry> entries,
+  ) {
+    final byKey = <String, _AttorneyCalendarEntry>{};
+    for (final e in entries) {
+      if (e.appointment != null) {
+        final id = e.appointment!.id.trim();
+        byKey[id.isEmpty ? 'apt:${e.hashCode}' : 'apt:$id'] = e;
+        continue;
+      }
+      final ev = e.hearingEvent!;
+      final hid = (ev['hearingDocId'] as String?)?.trim() ?? '';
+      final cn = (ev['caseNo'] as String?)?.trim().toLowerCase() ?? '';
+      final title = e.hearingTitle().trim().toLowerCase();
+      final d = e.startTime;
+      final dayKey = '${d.year}${d.month}${d.day}';
+      final key = hid.isNotEmpty
+          ? 'h:$hid'
+          : 'c:${cn.isNotEmpty ? cn : title}:$dayKey';
+      final existing = byKey[key];
+      if (existing == null) {
+        byKey[key] = e;
+        continue;
+      }
+      final existingHid =
+          (existing.hearingEvent?['hearingDocId'] as String?)?.trim() ?? '';
+      if (existingHid.isEmpty && hid.isNotEmpty) {
+        byKey[key] = e;
+      }
+    }
+    final deduped = byKey.values.toList()
+      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    return deduped;
   }
 
   void _bindAppointments() {
@@ -1699,74 +1734,86 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     // every setState and would otherwise reset the list to [entries].
     var dayEntries = List<_AttorneyCalendarEntry>.from(entries);
 
+    final dialogMaxH = MediaQuery.sizeOf(context).height * 0.88;
+
     showDialog(
       context: context,
       builder: (dialogContext) => Dialog(
-        child: Container(
-          width: MediaQuery.of(dialogContext).size.width > 600
-              ? 500
-              : double.infinity,
-          padding: const EdgeInsets.all(24),
-          child: StatefulBuilder(
-            builder: (context, setDialogState) {
-              final apptN =
-                  dayEntries.where((e) => e.appointment != null).length;
-              final calN = dayEntries.length - apptN;
-              final aiN = dayEntries.where((e) => e.isAiScheduled).length;
-
-              return Column(
+        insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: MediaQuery.sizeOf(dialogContext).width > 600
+                ? 500
+                : MediaQuery.sizeOf(dialogContext).width * 0.94,
+            maxHeight: dialogMaxH,
+          ),
+          child: Column(
             mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text(
-                    DateFormat('MMMM dd, yyyy').format(date),
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.close),
-                    onPressed: () => Navigator.pop(dialogContext),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '${dayEntries.length} scheduled item${dayEntries.length != 1 ? 's' : ''}',
-                    style: TextStyle(fontSize: 14, color: Colors.grey[700]),
-                  ),
-                  if (apptN > 0 || calN > 0) ...[
-                    const SizedBox(height: 4),
-                    Text(
-                      [
-                        if (apptN > 0)
-                          '$apptN client appointment${apptN != 1 ? 's' : ''}',
-                        if (apptN > 0 && calN > 0) ' · ',
-                        if (calN > 0)
-                          '$calN calendar event${calN != 1 ? 's' : ''}'
-                          '${aiN > 0 ? ' ($aiN AI)' : ''}',
-                      ].join(),
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Colors.grey[600],
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 20, 12, 0),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        DateFormat('MMMM dd, yyyy').format(date),
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
                     ),
+                    IconButton(
+                      icon: const Icon(Icons.close),
+                      onPressed: () => Navigator.pop(dialogContext),
+                    ),
                   ],
-                ],
+                ),
               ),
-              const SizedBox(height: 16),
               Flexible(
-                child: ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: dayEntries.length,
-                  itemBuilder: (context, index) {
+                child: StatefulBuilder(
+                  builder: (context, setDialogState) {
+                    final apptN =
+                        dayEntries.where((e) => e.appointment != null).length;
+                    final calN = dayEntries.length - apptN;
+                    final aiN =
+                        dayEntries.where((e) => e.isAiScheduled).length;
+
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: SingleChildScrollView(
+                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '${dayEntries.length} scheduled item${dayEntries.length != 1 ? 's' : ''}',
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: Colors.grey[700],
+                            ),
+                          ),
+                          if (apptN > 0 || calN > 0) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              [
+                                if (apptN > 0)
+                                  '$apptN client appointment${apptN != 1 ? 's' : ''}',
+                                if (apptN > 0 && calN > 0) ' · ',
+                                if (calN > 0)
+                                  '$calN calendar event${calN != 1 ? 's' : ''}'
+                                  '${aiN > 0 ? ' ($aiN AI)' : ''}',
+                              ].join(),
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey[600],
+                              ),
+                            ),
+                          ],
+                          const SizedBox(height: 16),
+                          ...List.generate(dayEntries.length, (index) {
                     final entry = dayEntries[index];
                     final apt = entry.appointment;
                     if (apt != null) {
@@ -1955,33 +2002,49 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
                         ),
                       ),
                     );
+                          }),
+                        ],
+                      ),
+                    ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(20, 8, 20, 0),
+                          child: SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton.icon(
+                              onPressed: () async {
+                                final created =
+                                    await _createAppointmentForDate(date);
+                                if (created == null || !context.mounted) {
+                                  return;
+                                }
+                                final showDay =
+                                    _calendarDay(created.appointmentDateTime);
+                                final updated = _entriesForDateWithAppointment(
+                                  showDay,
+                                  _getEntriesForDate(showDay),
+                                  created: created,
+                                );
+                                setDialogState(() => dayEntries = updated);
+                                if (mounted) setState(() {});
+                              },
+                              icon: const Icon(Icons.add),
+                              label: const Text('Add Appointment'),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: calendarBlue,
+                                foregroundColor: Colors.white,
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 14),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    );
                   },
                 ),
               ),
-              const SizedBox(height: 16),
-              ElevatedButton.icon(
-                onPressed: () async {
-                  final created = await _createAppointmentForDate(date);
-                  if (created == null || !context.mounted) return;
-                  final showDay = _calendarDay(created.appointmentDateTime);
-                  final updated = _entriesForDateWithAppointment(
-                    showDay,
-                    _getEntriesForDate(showDay),
-                    created: created,
-                  );
-                  setDialogState(() => dayEntries = updated);
-                  if (mounted) setState(() {});
-                },
-                icon: const Icon(Icons.add),
-                label: const Text('Add Appointment'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: calendarBlue,
-                  foregroundColor: Colors.white,
-                ),
-              ),
             ],
-          );
-            },
           ),
         ),
       ),

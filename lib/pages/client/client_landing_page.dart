@@ -3,6 +3,7 @@ import 'package:get/get.dart';
 
 import '../../theme/app_theme.dart';
 import '../../widgets/common/app_button.dart';
+import '../../widgets/common/brand_logo.dart';
 import '../auth/login_page.dart';
 import '../auth/signup_page.dart';
 
@@ -10,16 +11,7 @@ import '../auth/signup_page.dart';
 class ClientLandingPage extends StatelessWidget {
   const ClientLandingPage({super.key});
 
-  static Widget _brandLogo(double size) {
-    return ClipOval(
-      child: Image.asset(
-        'assets/logo.png',
-        width: size,
-        height: size,
-        fit: BoxFit.cover,
-      ),
-    );
-  }
+  static Widget _brandLogo(double size) => BrandLogo(size: size);
 
   @override
   Widget build(BuildContext context) {

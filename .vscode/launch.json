@@ -32,8 +32,8 @@
             "program": "lib/main.dart",
             "deviceId": "windows",
             "toolArgs": [
-                "--dart-define=SUPABASE_URL=REPLACE_WITH_PROJECT_URL",
-                "--dart-define=SUPABASE_ANON_KEY=REPLACE_WITH_PUBLISHABLE_KEY"
+                "--dart-define=SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co",
+                "--dart-define=SUPABASE_ANON_KEY=YOUR_ANON_OR_PUBLISHABLE_KEY"
             ]
         },
         {
@@ -41,21 +41,30 @@
             "request": "launch",
             "type": "dart",
             "program": "lib/main.dart",
-            "deviceId": "web-server"
+            "deviceId": "web-server",
+            "toolArgs": [
+                "--no-web-resources-cdn"
+            ]
         },
         {
             "name": "law_connect4 (Chrome)",
             "request": "launch",
             "type": "dart",
             "program": "lib/main.dart",
-            "deviceId": "chrome"
+            "deviceId": "chrome",
+            "toolArgs": [
+                "--no-web-resources-cdn"
+            ]
         },
         {
             "name": "law_connect4 (Edge)",
             "request": "launch",
             "type": "dart",
             "program": "lib/main.dart",
-            "deviceId": "edge"
+            "deviceId": "edge",
+            "toolArgs": [
+                "--no-web-resources-cdn"
+            ]
         },
         {
             "name": "Attach Camel Debugger after starting the Camel Application using the preLaunchTask specified",

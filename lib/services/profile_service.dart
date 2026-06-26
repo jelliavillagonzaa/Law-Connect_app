@@ -3,6 +3,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'firestore_mirror_helper.dart';
 
 class ProfileService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -37,11 +38,17 @@ class ProfileService {
       await prefs.setString('profile_image_${user.uid}', base64Image);
 
       // Update Firestore to indicate local storage
-      await _firestore.collection('users').doc(user.uid).update({
+      final patch = <String, dynamic>{
         'photoUrl': 'local_storage',
         'hasLocalPhoto': true,
         'profilePictureUpdatedAt': FieldValue.serverTimestamp(),
-      });
+      };
+      final result = await HybridDatastore.update(
+        collection: 'users',
+        id: user.uid,
+        patch: patch,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       return 'local_storage';
     } catch (e) {
@@ -90,7 +97,12 @@ class ProfileService {
       final user = _auth.currentUser;
       if (user == null) throw Exception('No user logged in');
 
-      await _firestore.collection('users').doc(user.uid).update(data);
+      final result = await HybridDatastore.update(
+        collection: 'users',
+        id: user.uid,
+        patch: data,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
     } catch (e) {
       throw Exception('Failed to update profile: $e');
     }

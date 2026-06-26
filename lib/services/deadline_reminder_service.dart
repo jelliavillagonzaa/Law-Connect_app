@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import 'package:intl/intl.dart';
 import 'notification_service.dart';
 import 'fcm_service.dart';
+import 'firestore_mirror_helper.dart';
 
 /// Service to monitor and send early reminders for upcoming important deadlines
 /// Supports reminders at 7 days, 3 days, and 1 day before deadlines
@@ -477,7 +478,7 @@ class DeadlineReminderService {
       }
 
       // Store notification in Firestore
-      await _firestore.collection('notifications').add({
+      final notifData = <String, dynamic>{
         'userId': userId,
         'type': 'deadline_reminder',
         'title': title,
@@ -488,7 +489,8 @@ class DeadlineReminderService {
         'reminderDays': reminderDays,
         'isRead': false,
         'createdAt': FieldValue.serverTimestamp(),
-      });
+      };
+      await HybridDatastore.add(collection: 'notifications', data: notifData);
     } catch (e) {
       if (kDebugMode) {
         debugPrint('Error sending deadline reminder: $e');
@@ -528,12 +530,13 @@ class DeadlineReminderService {
     int reminderDays,
   ) async {
     try {
-      await _firestore.collection('deadline_reminders_sent').add({
+      final row = <String, dynamic>{
         'deadlineId': deadlineId,
         'userId': userId,
         'reminderDays': reminderDays,
         'sentAt': FieldValue.serverTimestamp(),
-      });
+      };
+      await HybridDatastore.add(collection: 'deadline_reminders_sent', data: row);
     } catch (e) {
       if (kDebugMode) {
         debugPrint('Error marking reminder as sent: $e');

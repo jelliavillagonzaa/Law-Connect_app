@@ -5,6 +5,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../config/philsms_config.dart';
 import 'philsms_service.dart';
+import 'firestore_mirror_helper.dart';
 import 'supabase_service.dart';
 
 /// How [SmsService.queueSms] delivered the request.
@@ -334,12 +335,16 @@ class SmsService {
       data['meta'] = meta;
     }
 
-    final ref = await _firestore.collection(_requestsCollection).add(data);
+    final result = await HybridDatastore.add(
+      collection: _requestsCollection,
+      data: data,
+    );
+    if (!result.isSuccess) throw Exception(result.failureMessage);
     if (kDebugMode) {
       debugPrint(
-        '✅ SMS queued to Firestore ($_requestsCollection/${ref.id}) — waiting for server send',
+        '✅ SMS queued to Firestore ($_requestsCollection/${result.id}) — waiting for server send',
       );
     }
-    return ref.id;
+    return result.id!;
   }
 }

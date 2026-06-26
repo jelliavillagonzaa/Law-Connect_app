@@ -5,10 +5,7 @@ import '../../widgets/primary_button.dart';
 import '../../widgets/input_field.dart';
 import '../../services/auth_service.dart';
 import 'signup_screen.dart';
-import 'dashboard_screen.dart';
-import '../../pages/attorney/attorney_dashboard.dart';
-import '../../pages/admin/admin_dashboard.dart';
-import '../../pages/staff/staff_dashboard.dart';
+import '../../routes/portal_navigation.dart';
 import '../../pages/auth/forgot_password_page.dart';
 import '../../pages/auth/otp_verification.dart';
 
@@ -57,14 +54,8 @@ class _LoginScreenState extends State<LoginScreen> {
                 Get.offAll(() => const OtpVerificationPage());
               }
             });
-          } else if (role == 'admin') {
-            Get.offAll(() => const AdminDashboard());
-          } else if (role == 'attorney') {
-            Get.offAll(() => const AttorneyDashboard());
-          } else if (role == 'staff') {
-            Get.offAll(() => const StaffDashboard());
           } else {
-            Get.offAll(() => const DashboardScreen());
+            navigateToPortalDashboard(role);
           }
         } else {
           // Show error message

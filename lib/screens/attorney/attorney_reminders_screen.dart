@@ -6,7 +6,10 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
 import '../../theme/app_theme.dart';
+import '../../models/lightweight_reminder_item.dart';
+import '../../services/lightweight_reminders_inbox_service.dart';
 import '../../services/hearing_notification_fanout_service.dart';
+import '../../widgets/common/lightweight_reminder_tile.dart';
 import '../../utils/hearing_notification_formatter.dart';
 import '../../widgets/common/hearing_notification_detail_panel.dart';
 
@@ -16,6 +19,10 @@ class AttorneyRemindersScreen extends StatefulWidget {
     this.showScaffold = true,
     this.includeGlobalHearingsFallback = true,
     this.hearingsOnly = false,
+    this.skipHeavyWarmOnOpen = false,
+    this.cacheOnlyOnOpen = false,
+    this.parentOwnsRefresh = false,
+    this.isLoading = false,
   });
 
   /// When false, renders only the inbox list (for embedding in staff notifications).
@@ -27,18 +34,86 @@ class AttorneyRemindersScreen extends StatefulWidget {
   /// Client inbox: court hearing/order rows only (no appointment reminders).
   final bool hearingsOnly;
 
+  /// When true, use cached inbox only on open; defer sync/warm (bell tap must stay instant).
+  final bool skipHeavyWarmOnOpen;
+
+  /// When true, never attach live Firestore inbox listeners (embedded lists / mobile).
+  final bool cacheOnlyOnOpen;
+
+  /// When true, parent screen loads inbox data (embedded staff notifications).
+  final bool parentOwnsRefresh;
+
+  /// Parent-driven loading state (embedded staff notifications).
+  final bool isLoading;
+
   @override
   State<AttorneyRemindersScreen> createState() =>
-      _AttorneyRemindersScreenState();
+      AttorneyRemindersScreenState();
 }
 
-class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
+class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   final FirebaseAuth _auth = FirebaseAuth.instance;
   Set<String> _locallyReadRowKeys = <String>{};
   List<HearingInboxRow>? _rows;
   StreamSubscription<List<HearingInboxRow>>? _inboxSub;
   Timer? _inboxStreamDebounce;
+  Timer? _deferredInboxTimer;
   String? _lastInboxSignature;
+  bool _inboxStreamAttached = false;
+  List<Object>? _cachedListItems;
+  String? _cachedListItemsSig;
+  int _embeddedVisibleLimit = kIsWeb ? 6 : 12;
+  bool _loadingMoreHearings = false;
+  bool _loadingLight = true;
+  List<LightweightReminderItem> _lightItems = [];
+
+  bool get _useLightweightInbox =>
+      widget.showScaffold &&
+      widget.includeGlobalHearingsFallback &&
+      !widget.hearingsOnly &&
+      !widget.parentOwnsRefresh;
+
+  /// Called from parent screens after a background sync (avoids rebuilding the whole widget).
+  Future<void> refreshInbox() async {
+    final userId = _auth.currentUser?.uid;
+    if (userId == null) return;
+    if (widget.parentOwnsRefresh) {
+      try {
+        final rows = await HearingNotificationFanoutService.instance
+            .fetchStaffInboxLight(userId, notificationLimit: 40)
+            .timeout(const Duration(seconds: 5));
+        showInboxRows(rows);
+        unawaited(
+          HearingNotificationFanoutService.instance
+              .fetchStaffInboxLight(
+                userId,
+                includeGlobalHearings: true,
+                notificationLimit: 60,
+                hearingsLimit: 40,
+              )
+              .then((full) {
+                if (mounted) showInboxRows(full);
+              })
+              .catchError((_) {}),
+        );
+      } catch (_) {}
+      return;
+    }
+    await _loadInboxOnce(userId, attachListeners: false, reuseCachedHearings: true);
+  }
+
+  void showInboxRows(List<HearingInboxRow> rows) {
+    if (!mounted) return;
+    final sig = _inboxSignature(rows);
+    if (sig == _lastInboxSignature) return;
+    _lastInboxSignature = sig;
+    _cachedListItems = null;
+    final copy = List<HearingInboxRow>.from(rows);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      setState(() => _rows = copy);
+    });
+  }
 
   /// Hot reload on web can leave fields undefined — always read through these.
   List<HearingInboxRow> get _safeRows {
@@ -82,6 +157,13 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
       return;
     }
 
+    if (_useLightweightInbox) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_loadLightweightInbox(userId));
+      });
+      return;
+    }
+
     _inboxSub?.cancel();
     _inboxSub = null;
 
@@ -96,18 +178,64 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
       });
     }
 
-    fanout.warmInbox(
-      userId,
-      includeGlobalHearingsFallback: widget.includeGlobalHearingsFallback,
-      hearingsOnly: widget.hearingsOnly,
-    );
-    unawaited(_loadInboxOnce(userId));
+    if (widget.parentOwnsRefresh) return;
 
-    // Web: live inbox stream + hearings listener caused UI freezes; one-shot load + pull refresh only.
-    if (kIsWeb) {
+    if (!widget.skipHeavyWarmOnOpen) {
+      fanout.warmInbox(
+        userId,
+        includeGlobalHearingsFallback: widget.includeGlobalHearingsFallback,
+        hearingsOnly: widget.hearingsOnly,
+      );
+      unawaited(_loadInboxOnce(userId, attachListeners: true));
+      if (!kIsWeb) {
+        _attachInboxStream(userId);
+      }
       return;
     }
 
+    if (widget.cacheOnlyOnOpen) return;
+
+    // Embedded in a parent scroll view — defer one fetch after paint (parent may also refresh).
+    if (!widget.showScaffold) {
+      _scheduleDeferredInboxRefresh(userId, hadCache: cached != null);
+      return;
+    }
+
+    // Bell tap: show cached rows immediately; defer network + Firestore listeners.
+    _scheduleDeferredInboxRefresh(userId, hadCache: cached != null);
+  }
+
+  void _scheduleDeferredInboxRefresh(String userId, {required bool hadCache}) {
+    if (widget.cacheOnlyOnOpen) return;
+
+    _deferredInboxTimer?.cancel();
+    final delay = kIsWeb
+        ? const Duration(seconds: 6)
+        : hadCache
+            ? const Duration(milliseconds: 2400)
+            : const Duration(milliseconds: 400);
+    _deferredInboxTimer = Timer(delay, () {
+      if (!mounted) return;
+      unawaited(
+        _loadInboxOnce(
+          userId,
+          attachListeners: false,
+          reuseCachedHearings: hadCache,
+        ),
+      );
+    });
+    if (kIsWeb) {
+      Timer(delay + const Duration(seconds: 2), () {
+        if (!mounted || _inboxStreamAttached) return;
+        _attachInboxStream(userId);
+      });
+    }
+  }
+
+  void _attachInboxStream(String userId) {
+    if (_inboxStreamAttached || kIsWeb) return;
+    _inboxStreamAttached = true;
+    final fanout = HearingNotificationFanoutService.instance;
     final clientHearingsOnly =
         widget.hearingsOnly && !widget.includeGlobalHearingsFallback;
     _inboxSub = (clientHearingsOnly
@@ -128,6 +256,7 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
           if (!mounted) return;
           if (sig == _lastInboxSignature) return;
           _lastInboxSignature = sig;
+          _cachedListItems = null;
           setState(() => _rows = List<HearingInboxRow>.from(rows));
         });
       },
@@ -143,12 +272,151 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
     return buf.toString();
   }
 
-  Future<void> _loadInboxOnce(String userId) async {
+  Future<void> _loadLightweightInbox(String userId) async {
+    if (mounted) {
+      setState(() {
+        _loadingLight = true;
+        _loadingMoreHearings = false;
+      });
+    }
+
+    try {
+      final items =
+          await LightweightRemindersInboxService.loadNotificationReminders(
+        userId,
+      );
+      if (!mounted) return;
+
+      await Future<void>.delayed(
+        Duration(milliseconds: kIsWeb ? 800 : 1500),
+      );
+      if (!mounted) return;
+
+      final merged = await LightweightRemindersInboxService.mergeGlobalHearings(
+        userId,
+        items,
+      );
+      if (!mounted) return;
+
+      setState(() {
+        _lightItems = merged;
+        _loadingLight = false;
+        _loadingMoreHearings = false;
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _loadingLight = false;
+          _loadingMoreHearings = false;
+        });
+      }
+    }
+  }
+
+  void _markLightItemRead(LightweightReminderItem item) {
+    final userId = _auth.currentUser?.uid;
+    if (userId == null || item.isRead) return;
+
+    final idx = _lightItems.indexWhere((r) => r.rowKey == item.rowKey);
+    if (idx >= 0 && mounted) {
+      setState(() => _lightItems[idx] = item.markRead());
+    }
+
+    unawaited(
+      HearingNotificationFanoutService.instance.markInboxRowAsRead(
+        userId: userId,
+        notificationDocId: item.notificationDocId,
+        rowData: item.hearingDocId != null
+            ? {
+                'hearingDocId': item.hearingDocId,
+                'type': item.type,
+                'title': item.title,
+              }
+            : null,
+      ),
+    );
+  }
+
+  Widget _buildLightweightBody() {
+    if (_loadingLight) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 32,
+                height: 32,
+                child: CircularProgressIndicator(strokeWidth: 2.5),
+              ),
+              SizedBox(height: 14),
+              Text(
+                'Loading reminders…',
+                style: TextStyle(
+                  fontSize: 14,
+                  color: Colors.grey,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (_lightItems.isEmpty) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(
+          parent: BouncingScrollPhysics(),
+        ),
+        children: [
+          SizedBox(height: MediaQuery.of(context).size.height * 0.2),
+          Icon(Icons.notifications_none, size: 64, color: Colors.grey[400]),
+          const SizedBox(height: 16),
+          Text(
+            'No Reminders',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.w600,
+              color: Colors.grey[600],
+            ),
+          ),
+        ],
+      );
+    }
+
+    return ListView.builder(
+      physics: const AlwaysScrollableScrollPhysics(
+        parent: BouncingScrollPhysics(),
+      ),
+      padding: _listPadding(context),
+      itemCount: _lightItems.length,
+      cacheExtent: 200,
+      addAutomaticKeepAlives: false,
+      addRepaintBoundaries: true,
+      itemBuilder: (context, index) {
+        final item = _lightItems[index];
+        return LightweightReminderTile(
+          key: ValueKey(item.rowKey),
+          item: item,
+          onMarkRead: () => _markLightItemRead(item),
+        );
+      },
+    );
+  }
+
+  Future<void> _loadInboxOnce(
+    String userId, {
+    bool attachListeners = true,
+    bool reuseCachedHearings = false,
+  }) async {
     final fanout = HearingNotificationFanoutService.instance;
     final gh = widget.includeGlobalHearingsFallback;
     final ho = widget.hearingsOnly;
     try {
-      if (ho) {
+      if (ho && !widget.skipHeavyWarmOnOpen) {
         unawaited(fanout.syncClientHearingNotifications());
       }
 
@@ -158,6 +426,9 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
                   userId,
                   includeGlobalHearingsFallback: gh,
                   hearingsOnly: ho,
+                  attachListeners: attachListeners,
+                  fetchGlobalHearings: !reuseCachedHearings,
+                  reuseCachedHearings: reuseCachedHearings,
                 ))
           .timeout(
         const Duration(seconds: 10),
@@ -171,7 +442,30 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
       );
 
       if (!mounted) return;
+      final sig = _inboxSignature(rows);
+      if (sig == _lastInboxSignature) return;
+      _lastInboxSignature = sig;
+      _cachedListItems = null;
       setState(() => _rows = rows);
+
+      if (reuseCachedHearings && gh && !ho) {
+        unawaited(
+          fanout.fetchInboxRowsOnce(
+            userId,
+            includeGlobalHearingsFallback: gh,
+            hearingsOnly: ho,
+            attachListeners: false,
+            fetchGlobalHearings: true,
+          ).then((full) {
+            if (!mounted) return;
+            final fullSig = _inboxSignature(full);
+            if (fullSig == _lastInboxSignature) return;
+            _lastInboxSignature = fullSig;
+            _cachedListItems = null;
+            setState(() => _rows = full);
+          }),
+        );
+      }
 
       // Heavy hearing scan runs in background — never block the reminders UI.
       if (gh && !ho && rows.where((r) => r.isHearingSource).isEmpty) {
@@ -200,6 +494,10 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   Future<void> _refreshInbox() async {
     final userId = _auth.currentUser?.uid;
     if (userId == null) return;
+    if (_useLightweightInbox) {
+      await _loadLightweightInbox(userId);
+      return;
+    }
     await _loadInboxOnce(userId);
   }
 
@@ -208,6 +506,7 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
     _inboxSub?.cancel();
     _inboxSub = null;
     _inboxStreamDebounce?.cancel();
+    _deferredInboxTimer?.cancel();
     super.dispose();
   }
 
@@ -216,19 +515,28 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
     return !row.isUnread;
   }
 
-  int _unreadCount() =>
-      _safeRows.where((row) => !_isRowRead(row)).length;
+  int _unreadCount() {
+    if (_useLightweightInbox) {
+      return _lightItems.where((i) => !i.isRead).length;
+    }
+    return _safeRows.where((row) => !_isRowRead(row)).length;
+  }
 
   Future<void> _markRowAsRead(HearingInboxRow row) async {
     final userId = _auth.currentUser?.uid;
     if (userId == null || _isRowRead(row)) return;
 
-    setState(() => _safeLocallyReadKeys.add(row.rowKey));
+    setState(() {
+      _safeLocallyReadKeys.add(row.rowKey);
+      _cachedListItems = null;
+    });
 
-    await HearingNotificationFanoutService.instance.markInboxRowAsRead(
-      userId: userId,
-      notificationDocId: row.notificationDocId,
-      rowData: row.data,
+    unawaited(
+      HearingNotificationFanoutService.instance.markInboxRowAsRead(
+        userId: userId,
+        notificationDocId: row.notificationDocId,
+        rowData: row.data,
+      ),
     );
   }
 
@@ -236,8 +544,21 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
     final userId = _auth.currentUser?.uid;
     if (userId == null) return;
 
+    if (_useLightweightInbox) {
+      setState(() {
+        _lightItems = _lightItems.map((i) => i.markRead()).toList();
+      });
+      unawaited(
+        HearingNotificationFanoutService.instance.markAllInboxRowsRead(userId),
+      );
+      return;
+    }
+
     final allKeys = _safeRows.map((r) => r.rowKey).toSet();
-    setState(() => _locallyReadRowKeys.addAll(allKeys));
+    setState(() {
+      _locallyReadRowKeys.addAll(allKeys);
+      _cachedListItems = null;
+    });
 
     unawaited(
       HearingNotificationFanoutService.instance.markAllInboxRowsRead(
@@ -285,6 +606,9 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   }
 
   String _listSubtitle(Map<String, dynamic> data) {
+    if (data['_lightweight'] == true) {
+      return (data['summary'] as String?)?.trim() ?? '';
+    }
     final type = (data['type'] as String? ?? '').toLowerCase();
     if (type.contains('hearing') ||
         (data['hearingDocId'] as String?)?.trim().isNotEmpty == true) {
@@ -299,6 +623,9 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   }
 
   bool _hasExpandableBody(Map<String, dynamic> data, String message) {
+    if (data['_lightweight'] == true) {
+      return _isHearingDetail(data) || message.trim().isNotEmpty;
+    }
     if (message.trim().isNotEmpty) return true;
     final type = (data['type'] as String? ?? '').toLowerCase();
     if (type.contains('hearing')) return true;
@@ -328,6 +655,29 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
       default:
         return 'Reminder';
     }
+  }
+
+  List<Object> _buildListItemsForRows() {
+    final hearingRows = _safeRows.where((r) => r.isHearingSource).toList();
+    final appointmentRows = widget.hearingsOnly
+        ? <HearingInboxRow>[]
+        : _safeRows.where((r) => !r.isHearingSource).toList();
+
+    final items = <Object>[];
+    if (hearingRows.isNotEmpty) {
+      items.add(
+        widget.hearingsOnly
+            ? 'New notice court hearings'
+            : 'Court hearings & orders',
+      );
+      items.addAll(hearingRows);
+    }
+    if (appointmentRows.isNotEmpty) {
+      if (hearingRows.isNotEmpty) items.add('__gap__');
+      items.add('Appointments');
+      items.addAll(appointmentRows);
+    }
+    return items;
   }
 
   Widget _sectionHeader(String title) {
@@ -374,12 +724,63 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
 
   Widget _buildBody() {
     if (_safeRows.isEmpty) {
-      return ListView(
-        physics: const AlwaysScrollableScrollPhysics(
-          parent: BouncingScrollPhysics(),
-        ),
+      if (_useLightweightInbox && _loadingMoreHearings) {
+        return const Padding(
+          padding: EdgeInsets.symmetric(vertical: 32, horizontal: 16),
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 32,
+                  height: 32,
+                  child: CircularProgressIndicator(strokeWidth: 2.5),
+                ),
+                SizedBox(height: 14),
+                Text(
+                  'Loading court hearings…',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Colors.grey,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      }
+
+      if (!widget.showScaffold && widget.isLoading) {
+        return const Padding(
+          padding: EdgeInsets.symmetric(vertical: 32, horizontal: 16),
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 32,
+                  height: 32,
+                  child: CircularProgressIndicator(strokeWidth: 2.5),
+                ),
+                SizedBox(height: 14),
+                Text(
+                  'Loading reminders…',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Colors.grey,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      }
+
+      final emptyContent = Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          SizedBox(height: MediaQuery.of(context).size.height * 0.2),
           Icon(
             Icons.notifications_none,
             size: 64,
@@ -408,26 +809,33 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
           ),
         ],
       );
-    }
 
-    final hearingRows = _safeRows.where((r) => r.isHearingSource).toList();
-    final appointmentRows = widget.hearingsOnly
-        ? <HearingInboxRow>[]
-        : _safeRows.where((r) => !r.isHearingSource).toList();
+      if (!widget.showScaffold) {
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+          child: emptyContent,
+        );
+      }
 
-    final items = <Object>[];
-    if (hearingRows.isNotEmpty) {
-      items.add(
-        widget.hearingsOnly
-            ? 'New notice court hearings'
-            : 'Court hearings & orders',
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(
+          parent: BouncingScrollPhysics(),
+        ),
+        children: [
+          SizedBox(height: MediaQuery.of(context).size.height * 0.2),
+          ...emptyContent.children,
+        ],
       );
-      items.addAll(hearingRows);
     }
-    if (appointmentRows.isNotEmpty) {
-      if (hearingRows.isNotEmpty) items.add('__gap__');
-      items.add('Appointments');
-      items.addAll(appointmentRows);
+
+    final sig =
+        '${_inboxSignature(_safeRows)}|${widget.hearingsOnly}|${_safeLocallyReadKeys.length}';
+    final items = _cachedListItems != null && _cachedListItemsSig == sig
+        ? _cachedListItems!
+        : _buildListItemsForRows();
+    if (_cachedListItemsSig != sig) {
+      _cachedListItems = items;
+      _cachedListItemsSig = sig;
     }
 
     Widget buildRow(int index) {
@@ -439,28 +847,47 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
         return _sectionHeader(item);
       }
       final row = item as HearingInboxRow;
-      return _ReminderCardTile(
-        key: ValueKey(row.rowKey),
-        row: row,
-        isRead: _isRowRead(row),
-        onMarkRead: () => _markRowAsRead(row),
-        getReminderTitle: _getReminderTitle,
-        getReminderIcon: _getReminderIcon,
-        getReminderColor: _getReminderColor,
-        listSubtitle: _listSubtitle,
-        hasExpandableBody: _hasExpandableBody,
-        isHearingDetail: _isHearingDetail,
+      return RepaintBoundary(
+        child: _ReminderCardTile(
+          key: ValueKey(row.rowKey),
+          row: row,
+          isRead: _isRowRead(row),
+          onMarkRead: () => _markRowAsRead(row),
+          getReminderTitle: _getReminderTitle,
+          getReminderIcon: _getReminderIcon,
+          getReminderColor: _getReminderColor,
+          listSubtitle: _listSubtitle,
+          hasExpandableBody: _hasExpandableBody,
+          isHearingDetail: _isHearingDetail,
+        ),
       );
     }
 
     if (!widget.showScaffold) {
       if (items.isEmpty) return const SizedBox.shrink();
-      return ListView.builder(
-        shrinkWrap: true,
-        physics: const NeverScrollableScrollPhysics(),
+      final visibleCount = items.length > _embeddedVisibleLimit
+          ? _embeddedVisibleLimit
+          : items.length;
+      return Padding(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-        itemCount: items.length,
-        itemBuilder: (_, index) => buildRow(index),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (var i = 0; i < visibleCount; i++) buildRow(i),
+            if (items.length > _embeddedVisibleLimit)
+              Padding(
+                padding: const EdgeInsets.only(top: 4, bottom: 8),
+                child: TextButton(
+                  onPressed: () {
+                    setState(() => _embeddedVisibleLimit += kIsWeb ? 6 : 12);
+                  },
+                  child: Text(
+                    'Show more (${items.length - _embeddedVisibleLimit} remaining)',
+                  ),
+                ),
+              ),
+          ],
+        ),
       );
     }
 
@@ -469,14 +896,38 @@ class _AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
         parent: BouncingScrollPhysics(),
       ),
       padding: _listPadding(context),
-      itemCount: items.length,
-      itemBuilder: (_, index) => buildRow(index),
+      itemCount: items.length + (_loadingMoreHearings ? 1 : 0),
+      cacheExtent: 320,
+      itemBuilder: (_, index) {
+        if (_loadingMoreHearings && index == 0) {
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Row(
+              children: [
+                const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  'Loading more court hearings…',
+                  style: TextStyle(fontSize: 13, color: Colors.grey[600]),
+                ),
+              ],
+            ),
+          );
+        }
+        final rowIndex = _loadingMoreHearings ? index - 1 : index;
+        return buildRow(rowIndex);
+      },
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    final body = _buildBody();
+    final body =
+        _useLightweightInbox ? _buildLightweightBody() : _buildBody();
     if (!widget.showScaffold) return body;
 
     return Scaffold(
@@ -533,18 +984,57 @@ class _ReminderCardTile extends StatefulWidget {
 
 class _ReminderCardTileState extends State<_ReminderCardTile> {
   bool _expanded = false;
+  bool _detailReady = false;
+  bool _loadingDetail = false;
+  Map<String, dynamic>? _detailData;
 
-  void _onHeaderTap() {
+  bool get _isLightweight => widget.row.data['_lightweight'] == true;
+
+  Future<void> _ensureDetailLoaded() async {
+    if (!_isLightweight || _detailData != null || _loadingDetail) return;
+    setState(() => _loadingDetail = true);
+    try {
+      final fs = FirebaseFirestore.instance;
+      final hid = (widget.row.data['hearingDocId'] as String?)?.trim();
+      final nid = widget.row.notificationDocId?.trim();
+      if (hid != null && hid.isNotEmpty) {
+        _detailData = (await fs.collection('hearings').doc(hid).get()).data();
+      } else if (nid != null && nid.isNotEmpty) {
+        _detailData =
+            (await fs.collection('notifications').doc(nid).get()).data();
+      }
+    } catch (_) {}
+    if (mounted) setState(() => _loadingDetail = false);
+  }
+
+  Future<void> _onHeaderTap() async {
     final willExpand = !_expanded;
-    setState(() => _expanded = willExpand);
-    if (willExpand && !widget.isRead) {
-      widget.onMarkRead();
+    if (willExpand) {
+      setState(() => _expanded = true);
+      if (_isLightweight) {
+        await _ensureDetailLoaded();
+        if (mounted) setState(() => _detailReady = true);
+      } else {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || !_expanded) return;
+          setState(() => _detailReady = true);
+        });
+      }
+      if (!widget.isRead) {
+        widget.onMarkRead();
+      }
+      return;
     }
+    setState(() {
+      _expanded = false;
+      _detailReady = false;
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     final data = widget.row.data;
+    final detailData = _isLightweight ? (_detailData ?? data) : data;
     final type = data['type'] as String? ?? '';
     final title = data['title'] as String? ?? widget.getReminderTitle(type);
     final message = data['message'] as String? ?? '';
@@ -681,38 +1171,65 @@ class _ReminderCardTileState extends State<_ReminderCardTile> {
                       Container(
                         color: Colors.grey.shade50,
                         padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              widget.isHearingDetail(data)
-                                  ? 'Hearing details'
-                                  : 'Full message',
-                              style: TextStyle(
-                                fontSize: 12,
-                                fontWeight: FontWeight.w600,
-                                color: AppTheme.royalBlue,
-                                letterSpacing: 0.3,
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            if (widget.isHearingDetail(data))
-                              HearingNotificationDetailPanel(
-                                data: data,
-                                hearingDocId:
-                                    data['hearingDocId'] as String?,
-                              )
-                            else
-                              SelectableText(
-                                message,
-                                style: TextStyle(
-                                  fontSize: 14,
-                                  height: 1.45,
-                                  color: Colors.grey[800],
+                        child: _detailReady
+                            ? (_loadingDetail
+                                ? const Center(
+                                    child: Padding(
+                                      padding: EdgeInsets.all(12),
+                                      child: SizedBox(
+                                        width: 24,
+                                        height: 24,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      ),
+                                    ),
+                                  )
+                                : Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    widget.isHearingDetail(detailData)
+                                        ? 'Hearing details'
+                                        : 'Full message',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                      color: AppTheme.royalBlue,
+                                      letterSpacing: 0.3,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  if (widget.isHearingDetail(detailData))
+                                    HearingNotificationDetailPanel(
+                                      data: detailData,
+                                      hearingDocId:
+                                          detailData['hearingDocId'] as String?,
+                                    )
+                                  else
+                                    SelectableText(
+                                      (detailData['message'] as String?)?.trim() ??
+                                          message,
+                                      style: TextStyle(
+                                        fontSize: 14,
+                                        height: 1.45,
+                                        color: Colors.grey[800],
+                                      ),
+                                    ),
+                                ],
+                              ))
+                            : const SizedBox(
+                                height: 32,
+                                child: Center(
+                                  child: SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  ),
                                 ),
                               ),
-                          ],
-                        ),
                       ),
                     ],
                   ),

@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import '../models/case_model.dart';
 import 'fcm_service.dart';
 import 'notification_service.dart';
+import 'firestore_mirror_helper.dart';
 
 class CaseService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -28,14 +29,38 @@ class CaseService {
       final data = caseModel.toFirestore();
       data['createdAt'] = FieldValue.serverTimestamp();
       data['updatedAt'] = FieldValue.serverTimestamp();
-      
+
       if (kDebugMode) {
         debugPrint('📤 Sending case data to Firestore...');
         debugPrint('Data keys: ${data.keys.toList()}');
       }
-      
-      final caseRef = await _firestore.collection('cases').add(data);
-      final caseId = caseRef.id;
+
+      final caseId = _firestore.collection('cases').doc().id;
+
+      final result = await HybridDatastore.addCase(
+        data: data,
+        mirrorModel: CaseModel(
+          id: caseId,
+          clientId: caseModel.clientId,
+          attorneyId: caseModel.attorneyId,
+          caseTitle: caseModel.caseTitle,
+          caseType: caseModel.caseType,
+          caseDescription: caseModel.caseDescription,
+          status: caseModel.status,
+          createdAt: DateTime.now(),
+          updatedAt: DateTime.now(),
+          documents: caseModel.documents,
+          progress: caseModel.progress,
+          staffId: caseModel.staffId,
+          staffAssigned: caseModel.staffAssigned,
+          hearingDate: caseModel.hearingDate,
+          isArchived: caseModel.isArchived,
+          archivedAt: caseModel.archivedAt,
+        ),
+      );
+      if (!result.isSuccess) {
+        throw Exception(result.failureMessage);
+      }
 
       if (kDebugMode) {
         debugPrint('✅ Case created: $caseId');
@@ -46,13 +71,19 @@ class CaseService {
       // Draft cases should not notify clients - they need attorney approval first
       if (caseModel.status != 'under_review') {
         try {
-          await _sendCaseCreatedNotification(caseModel.clientId, caseModel.caseTitle, caseId);
+          await _sendCaseCreatedNotification(
+            caseModel.clientId,
+            caseModel.caseTitle,
+            caseId,
+          );
           if (kDebugMode) {
             debugPrint('✅ Client notification sent');
           }
         } catch (e) {
           if (kDebugMode) {
-            debugPrint('⚠️ Failed to send client notification (non-critical): $e');
+            debugPrint(
+              '⚠️ Failed to send client notification (non-critical): $e',
+            );
           }
           // Don't fail the entire operation if notification fails
         }
@@ -73,10 +104,13 @@ class CaseService {
         debugPrint('❌ Error creating case: $e');
         debugPrint('Error type: ${e.runtimeType}');
         final errorString = e.toString();
-        if (errorString.contains('permission-denied') || errorString.contains('Missing or insufficient permissions')) {
+        if (errorString.contains('permission-denied') ||
+            errorString.contains('Missing or insufficient permissions')) {
           debugPrint('⚠️ Permission denied error detected');
           debugPrint('This usually means:');
-          debugPrint('  1. Firestore security rules are blocking the operation');
+          debugPrint(
+            '  1. Firestore security rules are blocking the operation',
+          );
           debugPrint('  2. User role or assigned attorney mismatch');
           debugPrint('  3. Required fields are missing or invalid');
         }
@@ -99,8 +133,14 @@ class CaseService {
         final caseDoc = await _firestore.collection('cases').doc(caseId).get();
         final attorneyId = caseDoc.data()?['attorneyId'] as String?;
         if (attorneyId != null) {
-          final attorneyDoc = await _firestore.collection('users').doc(attorneyId).get();
-          attorneyName = attorneyDoc.data()?['fullName'] ?? attorneyDoc.data()?['name'] ?? 'Your attorney';
+          final attorneyDoc = await _firestore
+              .collection('users')
+              .doc(attorneyId)
+              .get();
+          attorneyName =
+              attorneyDoc.data()?['fullName'] ??
+              attorneyDoc.data()?['name'] ??
+              'Your attorney';
         }
       } catch (e) {
         attorneyName = 'Your attorney';
@@ -110,7 +150,8 @@ class CaseService {
       await _fcmService.sendNotificationToUser(
         userId: clientId,
         title: 'New Case Created',
-        body: 'A new case "$caseTitle" has been created by ${attorneyName ?? "your attorney"}.',
+        body:
+            'A new case "$caseTitle" has been created by ${attorneyName ?? "your attorney"}.',
         data: {
           'type': 'case_created',
           'caseId': caseId,
@@ -119,18 +160,17 @@ class CaseService {
       );
 
       // Create in-app notification
-      await _firestore.collection('notifications').add({
+      final notifData = <String, dynamic>{
         'userId': clientId,
         'type': 'case_created',
         'title': 'New Case Created',
-        'message': 'A new case "$caseTitle" has been created by ${attorneyName ?? "your attorney"}.',
-        'data': {
-          'caseId': caseId,
-          'caseTitle': caseTitle,
-        },
+        'message':
+            'A new case "$caseTitle" has been created by ${attorneyName ?? "your attorney"}.',
+        'data': {'caseId': caseId, 'caseTitle': caseTitle},
         'isRead': false,
         'createdAt': FieldValue.serverTimestamp(),
-      });
+      };
+      await FirestoreMirror.add(collection: 'notifications', data: notifData);
 
       // Show local notification
       await _notificationService.showNotificationWithSound(
@@ -162,9 +202,7 @@ class CaseService {
             .snapshots();
       } else {
         // Admin - get all cases
-        queryStream = _firestore
-            .collection('cases')
-            .snapshots();
+        queryStream = _firestore.collection('cases').snapshots();
       }
 
       return queryStream.map((snapshot) {
@@ -189,14 +227,14 @@ class CaseService {
           .where('status', isEqualTo: status)
           .snapshots()
           .map((snapshot) {
-        final cases = snapshot.docs
-            .map((doc) => CaseModel.fromFirestore(doc))
-            .where((c) => !c.isArchived)
-            .toList();
-        // Sort by updatedAt in memory to avoid index requirement
-        cases.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
-        return cases;
-      });
+            final cases = snapshot.docs
+                .map((doc) => CaseModel.fromFirestore(doc))
+                .where((c) => !c.isArchived)
+                .toList();
+            // Sort by updatedAt in memory to avoid index requirement
+            cases.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+            return cases;
+          });
     } catch (e) {
       throw Exception('Failed to get cases by status: $e');
     }
@@ -210,14 +248,14 @@ class CaseService {
           .where('status', isEqualTo: 'pending')
           .snapshots()
           .map((snapshot) {
-        final cases = snapshot.docs
-            .map((doc) => CaseModel.fromFirestore(doc))
-            .where((c) => !c.isArchived)
-            .toList();
-        // Sort by createdAt in memory to avoid index requirement
-        cases.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-        return cases;
-      });
+            final cases = snapshot.docs
+                .map((doc) => CaseModel.fromFirestore(doc))
+                .where((c) => !c.isArchived)
+                .toList();
+            // Sort by createdAt in memory to avoid index requirement
+            cases.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+            return cases;
+          });
     } catch (e) {
       throw Exception('Failed to get pending cases: $e');
     }
@@ -226,11 +264,15 @@ class CaseService {
   // Accept a case (attorney)
   Future<void> acceptCase(String caseId, String attorneyId) async {
     try {
-      await _firestore.collection('cases').doc(caseId).update({
-        'attorneyId': attorneyId,
-        'status': 'accepted',
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+      final result = await HybridDatastore.updateCase(
+        id: caseId,
+        patch: {
+          'attorneyId': attorneyId,
+          'status': 'accepted',
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
     } catch (e) {
       throw Exception('Failed to accept case: $e');
     }
@@ -239,10 +281,14 @@ class CaseService {
   // Decline a case (attorney)
   Future<void> declineCase(String caseId) async {
     try {
-      await _firestore.collection('cases').doc(caseId).update({
-        'status': 'declined',
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+      final result = await HybridDatastore.updateCase(
+        id: caseId,
+        patch: {
+          'status': 'declined',
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
     } catch (e) {
       throw Exception('Failed to decline case: $e');
     }
@@ -275,15 +321,20 @@ class CaseService {
         updateData['caseType'] = caseType;
       }
 
-      await _firestore.collection('cases').doc(caseId).update(updateData);
-
-      // Send notification to client about case update
+      await HybridDatastore.updateCase(id: caseId, patch: updateData).then((r) {
+        if (!r.isSuccess) throw Exception(r.failureMessage);
+      });
       final caseData = caseDoc.data()!;
       final clientId = caseData['clientId'] as String?;
       final title = caseTitle ?? caseData['caseTitle'] as String? ?? 'Case';
-      
+
       if (clientId != null) {
-        await _sendCaseUpdateNotification(clientId, caseId, title, 'Case details have been updated');
+        await _sendCaseUpdateNotification(
+          clientId,
+          caseId,
+          title,
+          'Case details have been updated',
+        );
       }
     } catch (e) {
       throw Exception('Failed to update case details: $e');
@@ -302,14 +353,21 @@ class CaseService {
       final clientId = caseData['clientId'] as String?;
       final caseTitle = caseData['caseTitle'] as String? ?? 'Case';
 
-      await _firestore.collection('cases').doc(caseId).update({
-        'status': status,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
-
-      // Send notification to client about status update
+      final result = await HybridDatastore.updateCase(
+        id: caseId,
+        patch: {
+          'status': status,
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
       if (clientId != null) {
-        await _sendCaseUpdateNotification(clientId, caseId, caseTitle, 'Status updated to: $status');
+        await _sendCaseUpdateNotification(
+          clientId,
+          caseId,
+          caseTitle,
+          'Status updated to: $status',
+        );
       }
     } catch (e) {
       throw Exception('Failed to update case status: $e');
@@ -324,15 +382,19 @@ class CaseService {
     try {
       final caseRef = _firestore.collection('cases').doc(caseId);
       final caseDoc = await caseRef.get();
-      
+
       if (caseDoc.exists) {
         final currentProgress = caseDoc.data()?['progress'] as Map? ?? {};
         currentProgress.addAll(progressUpdate);
-        
-        await caseRef.update({
-          'progress': currentProgress,
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
+
+        final result = await HybridDatastore.updateCase(
+          id: caseId,
+          patch: {
+            'progress': currentProgress,
+            'updatedAt': FieldValue.serverTimestamp(),
+          },
+        );
+        if (!result.isSuccess) throw Exception(result.failureMessage);
       }
     } catch (e) {
       throw Exception('Failed to update case progress: $e');
@@ -344,25 +406,30 @@ class CaseService {
     try {
       final caseRef = _firestore.collection('cases').doc(caseId);
       final caseDoc = await caseRef.get();
-      
+
       if (caseDoc.exists) {
         final caseData = caseDoc.data()!;
         final clientId = caseData['clientId'] as String?;
         final caseTitle = caseData['caseTitle'] as String? ?? 'Case';
 
-        final documents = List<String>.from(
-          caseData['documents'] ?? [],
-        );
+        final documents = List<String>.from(caseData['documents'] ?? []);
         documents.add(documentUrl);
-        
-        await caseRef.update({
-          'documents': documents,
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
 
-        // Send notification to client about new document
+        final result = await HybridDatastore.updateCase(
+          id: caseId,
+          patch: {
+            'documents': documents,
+            'updatedAt': FieldValue.serverTimestamp(),
+          },
+        );
+        if (!result.isSuccess) throw Exception(result.failureMessage);
         if (clientId != null) {
-          await _sendCaseUpdateNotification(clientId, caseId, caseTitle, 'New document uploaded');
+          await _sendCaseUpdateNotification(
+            clientId,
+            caseId,
+            caseTitle,
+            'New document uploaded',
+          );
         }
       }
     } catch (e) {
@@ -391,18 +458,16 @@ class CaseService {
       );
 
       // Create in-app notification
-      await _firestore.collection('notifications').add({
+      final notifData = <String, dynamic>{
         'userId': clientId,
         'type': 'case_updated',
         'title': 'Case Update: $caseTitle',
         'message': updateMessage,
-        'data': {
-          'caseId': caseId,
-          'caseTitle': caseTitle,
-        },
+        'data': {'caseId': caseId, 'caseTitle': caseTitle},
         'isRead': false,
         'createdAt': FieldValue.serverTimestamp(),
-      });
+      };
+      await FirestoreMirror.add(collection: 'notifications', data: notifData);
     } catch (e) {
       if (kDebugMode) {
         debugPrint('⚠️ Failed to send case update notification: $e');
@@ -480,4 +545,3 @@ class CaseService {
     }
   }
 }
-

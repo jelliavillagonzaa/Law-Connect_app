@@ -1464,6 +1464,110 @@ service cloud.firestore {
     }
     
     // ==============================
+    // INVOICES COLLECTION (legal fee billing per case)
+    // ==============================
+    // An invoice holds the total legal fee and the running amount paid. The
+    // remaining balance is derived (totalLegalFee - amountPaid). Payments are
+    // received physically at the office and recorded by attorneys/staff, who
+    // increment amountPaid and recompute status (unpaid/partially_paid/paid).
+    match /invoices/{invoiceId} {
+      function isInvoiceFirmOwner() {
+        return resource.data.attorneyId == request.auth.uid
+               || (isStaff() && getStaffAttorneyId() != null
+                   && getStaffAttorneyId() == resource.data.attorneyId)
+               || isAdmin();
+      }
+
+      // Allow read:
+      // - Clients can read their own invoices (outstanding balance, history)
+      // - Attorneys can read invoices on their cases
+      // - Staff can read invoices for their assigned attorney
+      // - Admins can read all
+      allow get: if isAuthenticated()
+                 && (resource.data.clientId == request.auth.uid
+                     || resource.data.attorneyId == request.auth.uid
+                     || (isStaff() && getStaffAttorneyId() != null
+                         && getStaffAttorneyId() == resource.data.attorneyId)
+                     || isAdmin());
+      allow list: if isAuthenticated()
+                 && (isClient() || isAttorney() || isStaff() || isAdmin());
+
+      // Allow create: attorneys/staff/admins issue invoices (set the legal fee).
+      // amountPaid must start at 0.
+      allow create: if isAuthenticated()
+                    && (isAttorney() || isStaff() || isAdmin())
+                    && request.resource.data.clientId is string
+                    && request.resource.data.attorneyId is string
+                    && request.resource.data.totalLegalFee is number
+                    && request.resource.data.totalLegalFee >= 0
+                    && request.resource.data.amountPaid == 0
+                    && request.resource.data.status is string
+                    && (isStaff()
+                        ? (getStaffAttorneyId() != null
+                           && getStaffAttorneyId() == request.resource.data.attorneyId)
+                        : true);
+
+      // Allow update: attorneys/staff/admins may adjust the fee, record a
+      // payment (increase amountPaid), or reverse one (decrease amountPaid when
+      // deleting/voiding a receipt). The client/attorney links cannot change
+      // and amountPaid stays non-negative.
+      allow update: if isAuthenticated()
+                    && isInvoiceFirmOwner()
+                    && request.resource.data.clientId == resource.data.clientId
+                    && request.resource.data.attorneyId == resource.data.attorneyId
+                    && request.resource.data.amountPaid is number
+                    && request.resource.data.amountPaid >= 0;
+
+      // Allow delete: the case's attorney, their assigned staff, or an admin
+      // may remove an erroneous/legacy invoice. The app also deletes the
+      // invoice's payment receipts so totals stay consistent.
+      allow delete: if isAuthenticated() && isInvoiceFirmOwner();
+    }
+
+    // ==============================
+    // PAYMENTS COLLECTION (recorded payment receipts)
+    // ==============================
+    // A payment is a receipt for money physically received at the office. The
+    // attorney/staff who handles the case records it; everyone on the case may
+    // read it. Edits/deletes are admin-only to keep the audit trail intact.
+    match /payments/{paymentId} {
+      allow get: if isAuthenticated()
+                 && (resource.data.clientId == request.auth.uid
+                     || resource.data.attorneyId == request.auth.uid
+                     || (isStaff() && getStaffAttorneyId() != null
+                         && getStaffAttorneyId() == resource.data.attorneyId)
+                     || isAdmin());
+      allow list: if isAuthenticated()
+                 && (isClient() || isAttorney() || isStaff() || isAdmin());
+
+      // Allow create: attorneys/staff/admins record a payment they received.
+      allow create: if isAuthenticated()
+                    && (isAttorney() || isStaff() || isAdmin())
+                    && request.resource.data.invoiceId is string
+                    && request.resource.data.clientId is string
+                    && request.resource.data.attorneyId is string
+                    && request.resource.data.amount is number
+                    && request.resource.data.amount > 0
+                    && request.resource.data.method is string
+                    && (isStaff()
+                        ? (getStaffAttorneyId() != null
+                           && getStaffAttorneyId() == request.resource.data.attorneyId)
+                        : (isAdmin()
+                           || request.resource.data.attorneyId == request.auth.uid));
+
+      // Edits are admin-only (preserve receipt content).
+      allow update: if isAdmin();
+
+      // Delete/void: the case's attorney, their assigned staff, or an admin may
+      // remove an erroneous/old receipt. The app reverses the invoice balance.
+      allow delete: if isAuthenticated()
+                    && (isAdmin()
+                        || resource.data.attorneyId == request.auth.uid
+                        || (isStaff() && getStaffAttorneyId() != null
+                            && getStaffAttorneyId() == resource.data.attorneyId));
+    }
+
+    // ==============================
     // DEFAULT RULE
     // ==============================
     // Deny all other access by default

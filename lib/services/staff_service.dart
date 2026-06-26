@@ -2,6 +2,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
 import '../models/case_model.dart';
+import 'firestore_mirror_helper.dart';
 
 class StaffService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -146,18 +147,24 @@ class StaffService {
         return {'success': false, 'message': 'User not authenticated'};
       }
 
-      await _firestore.collection('cases').doc(caseId).update({
-        'notes': FieldValue.arrayUnion([
-          {
-            'note': note,
-            'addedBy': user.uid,
-            'addedByName': user.email,
-            'addedAt': FieldValue.serverTimestamp(),
-            'type': 'staff_note',
-          },
-        ]),
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+      final result = await HybridDatastore.updateCase(
+        id: caseId,
+        patch: {
+          'notes': FieldValue.arrayUnion([
+            {
+              'note': note,
+              'addedBy': user.uid,
+              'addedByName': user.email,
+              'addedAt': FieldValue.serverTimestamp(),
+              'type': 'staff_note',
+            },
+          ]),
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      );
+      if (!result.isSuccess) {
+        return {'success': false, 'message': result.failureMessage};
+      }
 
       // Log activity
       await logActivity(
@@ -205,10 +212,16 @@ class StaffService {
         documentData['folder'] = folder;
       }
 
-      await _firestore.collection('cases').doc(caseId).update({
-        'documents': FieldValue.arrayUnion([documentData]),
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+      final result = await HybridDatastore.updateCase(
+        id: caseId,
+        patch: {
+          'documents': FieldValue.arrayUnion([documentData]),
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      );
+      if (!result.isSuccess) {
+        return {'success': false, 'message': result.failureMessage};
+      }
 
       // Log activity
       await logActivity(
@@ -244,7 +257,12 @@ class StaffService {
       if (email != null) updateData['email'] = email;
       if (address != null) updateData['address'] = address;
 
-      await _firestore.collection('users').doc(clientId).update(updateData);
+      final result = await HybridDatastore.update(
+        collection: 'users',
+        id: clientId,
+        patch: updateData,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       // Log activity
       await logActivity(
@@ -337,9 +355,12 @@ class StaffService {
       if (assignedTo != null) eventData['assignedTo'] = assignedTo;
       if (clientId != null) eventData['clientId'] = clientId;
 
-      final eventRef = await _firestore
-          .collection('calendar_events')
-          .add(eventData);
+      final eventResult = await HybridDatastore.add(
+        collection: 'calendar_events',
+        data: eventData,
+      );
+      if (!eventResult.isSuccess) throw Exception(eventResult.failureMessage);
+      final eventRef = _firestore.collection('calendar_events').doc(eventResult.id!);
 
       // Send immediate reminders if requested
       if (sendNow) {
@@ -387,7 +408,10 @@ class StaffService {
 
         // For hearings, also add to hearing_notifications collection (for backward compatibility)
         if (eventType == 'hearing') {
-          await _firestore.collection('hearing_notifications').add(reminderData);
+          await HybridDatastore.add(
+            collection: 'hearing_notifications',
+            data: reminderData,
+          );
         }
         
         // Add to calendar_event_reminders collection for all event types
@@ -520,15 +544,16 @@ class StaffService {
     String? eventId,
   }) async {
     try {
-      await _firestore.collection('notifications').add({
+      final notifData = <String, dynamic>{
         'userId': userId,
         'type': type,
         'title': title,
         'message': message,
-        'eventId': eventId,
+        if (eventId != null) 'eventId': eventId,
         'isRead': false,
         'createdAt': FieldValue.serverTimestamp(),
-      });
+      };
+      await HybridDatastore.add(collection: 'notifications', data: notifData);
     } catch (e) {
       print('Error creating notification for user $userId: $e');
     }
@@ -544,7 +569,7 @@ class StaffService {
     return DateFormat('hh:mm a').format(date);
   }
 
-  // Get upcoming hearing notifications (2 days before)
+  // Get upcoming hearing notifications (2 days before) — bounded query.
   Stream<List<Map<String, dynamic>>> getUpcomingHearingNotifications(
     String attorneyId,
   ) {
@@ -555,6 +580,7 @@ class StaffService {
         .collection('hearing_notifications')
         .where('attorneyId', isEqualTo: attorneyId)
         .where('status', isEqualTo: 'pending')
+        .limit(40)
         .snapshots()
         .map((snapshot) {
           final notifications = <Map<String, dynamic>>[];
@@ -754,30 +780,46 @@ class StaffService {
     }
   }
 
-  // Get calendar events for staff's attorney
+  /// Shared per-attorney stream so dashboard + calendar tab do not open duplicate listeners.
+  static final Map<String, Stream<List<Map<String, dynamic>>>>
+      _calendarEventsStreamCache = {};
+
+  // Get calendar events for staff's attorney (bounded — not entire collection).
   Stream<List<Map<String, dynamic>>> getCalendarEvents(String attorneyId) {
-    return _firestore
-        .collection('calendar_events')
-        .where('assignedTo', isEqualTo: attorneyId)
-        .snapshots()
-        .map((snapshot) {
-          final events = snapshot.docs.map((doc) {
-            final data = doc.data();
-            return <String, dynamic>{
-              'id': doc.id,
-              ...data,
-              'eventDate': (data['eventDate'] as Timestamp?)?.toDate(),
-              'createdAt': (data['createdAt'] as Timestamp?)?.toDate(),
-            };
-          }).toList();
-          // Sort by eventDate ascending in memory
-          events.sort((a, b) {
-            final aDate = a['eventDate'] as DateTime? ?? DateTime(1970);
-            final bDate = b['eventDate'] as DateTime? ?? DateTime(1970);
-            return aDate.compareTo(bDate);
-          });
-          return events;
-        });
+    final aid = attorneyId.trim();
+    if (aid.isEmpty) {
+      return Stream.value(const []);
+    }
+    return _calendarEventsStreamCache.putIfAbsent(aid, () {
+      return _firestore
+          .collection('calendar_events')
+          .where('assignedTo', isEqualTo: aid)
+          .orderBy('eventDate')
+          .limit(350)
+          .snapshots()
+          .map(_mapCalendarEventDocs)
+          .asBroadcastStream();
+    });
+  }
+
+  static List<Map<String, dynamic>> _mapCalendarEventDocs(
+    QuerySnapshot<Map<String, dynamic>> snapshot,
+  ) {
+    final events = snapshot.docs.map((doc) {
+      final data = doc.data();
+      return <String, dynamic>{
+        'id': doc.id,
+        ...data,
+        'eventDate': (data['eventDate'] as Timestamp?)?.toDate(),
+        'createdAt': (data['createdAt'] as Timestamp?)?.toDate(),
+      };
+    }).toList();
+    events.sort((a, b) {
+      final aDate = a['eventDate'] as DateTime? ?? DateTime(1970);
+      final bDate = b['eventDate'] as DateTime? ?? DateTime(1970);
+      return aDate.compareTo(bDate);
+    });
+    return events;
   }
 
   // Get staff activity logs
@@ -822,15 +864,16 @@ class StaffService {
         userRole = ud.data()?['role'] as String? ?? 'staff';
       } catch (_) {}
 
-      await _firestore.collection('activity_logs').add({
+      final activityData = <String, dynamic>{
         'userId': user.uid,
         'userRole': userRole,
         'action': action,
-        'details': details,
-        'resourceType': resourceType,
-        'resourceId': resourceId,
+        if (details != null) 'details': details,
+        if (resourceType != null) 'resourceType': resourceType,
+        if (resourceId != null) 'resourceId': resourceId,
         'timestamp': FieldValue.serverTimestamp(),
-      });
+      };
+      await HybridDatastore.add(collection: 'activity_logs', data: activityData);
     } catch (e) {
       // Silently fail logging
     }

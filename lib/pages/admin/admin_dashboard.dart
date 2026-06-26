@@ -1,3 +1,5 @@
+import 'dart:async' show unawaited;
+
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -14,6 +16,7 @@ import '../../screens/admin/reports_analytics_screen.dart';
 import '../../screens/admin/system_settings_screen.dart';
 import '../../theme/app_theme.dart';
 import '../client/client_landing_page.dart';
+import '../../utils/quiet_console.dart';
 
 class AdminDashboard extends StatefulWidget {
   const AdminDashboard({super.key});
@@ -38,40 +41,33 @@ class _AdminDashboardState extends State<AdminDashboard> {
   @override
   void initState() {
     super.initState();
-    _loadDashboardData();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_loadDashboardData());
+    });
   }
 
   Future<void> _loadDashboardData() async {
+    if (!mounted) return;
     setState(() => _isLoading = true);
     try {
-      // Get all users count
-      final usersSnapshot = await _firestore.collection('users').get();
-      final totalUsers = usersSnapshot.docs.length;
-      final clients = usersSnapshot.docs
-          .where((u) => u.data()['role'] == 'client')
-          .length;
-      final attorneys = usersSnapshot.docs
-          .where((u) => u.data()['role'] == 'attorney')
-          .length;
-      final staff = usersSnapshot.docs
-          .where((u) => u.data()['role'] == 'staff')
-          .length;
+      // Count queries — never download entire users/cases collections (UI freeze).
+      final countResults = await Future.wait([
+        _firestore.collection('users').count().get(),
+        _firestore.collection('users').where('role', isEqualTo: 'client').count().get(),
+        _firestore.collection('users').where('role', isEqualTo: 'attorney').count().get(),
+        _firestore.collection('users').where('role', isEqualTo: 'staff').count().get(),
+        _firestore.collection('cases').count().get(),
+        _firestore.collection('cases').where('status', isEqualTo: 'pending').count().get(),
+        _firestore.collection('cases').where('status', isEqualTo: 'in_progress').count().get(),
+      ]);
 
-      // Get all cases count (exclude archived)
-      final casesSnapshot = await _firestore.collection('cases').get();
-      final activeCaseDocs = casesSnapshot.docs
-          .where((c) => c.data()['isArchived'] != true);
-      final totalCases = activeCaseDocs.length;
-      final pendingCases = activeCaseDocs
-          .where((c) => c.data()['status'] == 'pending')
-          .length;
-      final activeCases = activeCaseDocs
-          .where(
-            (c) =>
-                c.data()['status'] == 'in_progress' ||
-                c.data()['status'] == 'active',
-          )
-          .length;
+      final totalUsers = countResults[0].count ?? 0;
+      final clients = countResults[1].count ?? 0;
+      final attorneys = countResults[2].count ?? 0;
+      final staff = countResults[3].count ?? 0;
+      final totalCases = countResults[4].count ?? 0;
+      final pendingCases = countResults[5].count ?? 0;
+      final activeCases = countResults[6].count ?? 0;
 
       // Load recent activity (system logs)
       final logsSnapshot = await _firestore
@@ -126,7 +122,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
       });
     } catch (e) {
       setState(() => _isLoading = false);
-      print('Error loading dashboard data: $e');
+      appLog('Error loading dashboard data: $e');
     }
   }
 
@@ -190,16 +186,19 @@ class _AdminDashboardState extends State<AdminDashboard> {
             ? 20.0
             : 16.0;
 
-        return Container(
-          constraints: constraints.maxWidth > 1600
-              ? const BoxConstraints(maxWidth: 1600)
-              : null,
-          margin: constraints.maxWidth > 1600
-              ? EdgeInsets.symmetric(
-                  horizontal: (constraints.maxWidth - 1600) / 2,
-                )
-              : null,
-          child: switch (_activeItem) {
+        return SizedBox(
+          width: constraints.maxWidth,
+          height: constraints.maxHeight,
+          child: Container(
+            constraints: constraints.maxWidth > 1600
+                ? const BoxConstraints(maxWidth: 1600)
+                : null,
+            margin: constraints.maxWidth > 1600
+                ? EdgeInsets.symmetric(
+                    horizontal: (constraints.maxWidth - 1600) / 2,
+                  )
+                : null,
+            child: switch (_activeItem) {
             'users' => UserManagementScreen(
                 inline: true,
                 initialRoleFilter: _userManagementRoleFilter == 'all'
@@ -232,6 +231,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
             'dashboard' => _buildDashboardContent(horizontalPadding),
             _ => _buildDashboardContent(horizontalPadding),
           },
+          ),
         );
       },
     );
@@ -713,13 +713,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
                     ),
 
                   // Content Area - Shows different content based on selected item
-                  Expanded(
-                    child: Container(
-                      width: double.infinity,
-                      constraints: const BoxConstraints(),
-                      child: _buildContent(),
-                    ),
-                  ),
+                  Expanded(child: _buildContent()),
                 ],
               ),
             ),

@@ -58,6 +58,8 @@ supabase/.temp
 .env.*
 functions/.env*
 **/local.properties
+lib/supabase/supabase_local_overrides.dart
+client_export/lib/supabase/supabase_local_overrides.dart
 
 # Node / Firebase cache
 node_modules/

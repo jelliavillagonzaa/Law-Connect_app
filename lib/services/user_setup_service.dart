@@ -1,5 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import 'firestore_mirror_helper.dart';
 
 /// Service to help set up admin and attorney users in Firebase
 /// This ensures users exist in both Firebase Auth and Firestore with correct roles
@@ -10,14 +11,21 @@ class UserSetupService {
   /// Call this after creating the user in Firebase Auth Console
   Future<void> setupAdminUser(String email, String uid) async {
     try {
-      await _firestore.collection('users').doc(uid).set({
+      final data = <String, dynamic>{
         'email': email,
         'name': 'Admin User',
         'fullName': 'Admin User',
         'role': 'admin',
         'isVerified': true, // Admin doesn't need email verification
         'createdAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
+      };
+      final result = await HybridDatastore.set(
+        collection: 'users',
+        id: uid,
+        data: data,
+        options: SetOptions(merge: true),
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       if (kDebugMode) {
         debugPrint('✅ Admin user setup complete: $email');
@@ -37,7 +45,7 @@ class UserSetupService {
     List<String>? specialization,
   }) async {
     try {
-      await _firestore.collection('users').doc(uid).set({
+      final data = <String, dynamic>{
         'email': email,
         'name': name ?? 'Attorney User',
         'fullName': name ?? 'Attorney User',
@@ -47,7 +55,14 @@ class UserSetupService {
         'specialization': specialization ?? [],
         'ratingAverage': 0.0,
         'createdAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
+      };
+      final result = await HybridDatastore.set(
+        collection: 'users',
+        id: uid,
+        data: data,
+        options: SetOptions(merge: true),
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       if (kDebugMode) {
         debugPrint('✅ Attorney user setup complete: $email');
@@ -99,7 +114,12 @@ class UserSetupService {
           userData['isVerified'] = isVerified;
         }
 
-        await _firestore.collection('users').doc(uid).set(userData);
+        final result = await HybridDatastore.set(
+          collection: 'users',
+          id: uid,
+          data: userData,
+        );
+        if (!result.isSuccess) throw Exception(result.failureMessage);
         
         if (kDebugMode) {
           debugPrint('✅ Auto-setup user: $email as $role');

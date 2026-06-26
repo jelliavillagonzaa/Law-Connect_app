@@ -74,7 +74,7 @@ Future<Map<String, dynamic>> _cachedEnrichedHearing(
   );
 }
 
-class HearingNotificationDetailPanel extends StatelessWidget {
+class HearingNotificationDetailPanel extends StatefulWidget {
   const HearingNotificationDetailPanel({
     super.key,
     required this.data,
@@ -92,63 +92,89 @@ class HearingNotificationDetailPanel extends StatelessWidget {
   /// Overlay / inbox rows with the same [caseNo] (avoids broad `hearings` scans).
   final List<Map<String, dynamic>> siblingRows;
 
+  @override
+  State<HearingNotificationDetailPanel> createState() =>
+      _HearingNotificationDetailPanelState();
+}
+
+class _HearingNotificationDetailPanelState
+    extends State<HearingNotificationDetailPanel> {
+  List<MapEntry<String, String>>? _fields;
+  Future<Map<String, dynamic>>? _enrichedFuture;
+
   List<MapEntry<String, String>> _fieldsFrom(Map<String, dynamic> hearing) {
-    return calendarOnly
+    return widget.calendarOnly
         ? HearingNotificationFormatter.fieldsForCalendarHearing(hearing)
         : HearingNotificationFormatter.fieldsForHearingNotificationDetail(
             hearing,
           );
   }
 
+  List<MapEntry<String, String>> _seedFields() {
+    return widget.calendarOnly
+        ? HearingNotificationFormatter.fieldsForCalendarHearing(widget.data)
+        : HearingNotificationFormatter.fieldsFromNotificationData(widget.data);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    if (kIsWeb) {
+      _fields = _seedFields();
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _prepareFields());
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant HearingNotificationDetailPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.data != widget.data ||
+        oldWidget.hearingDocId != widget.hearingDocId) {
+      _fields = null;
+      _enrichedFuture = null;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _prepareFields());
+    }
+  }
+
+  void _prepareFields() {
+    if (!mounted) return;
+    final hid = (widget.hearingDocId ?? widget.data['hearingDocId'] as String?)
+        ?.trim();
+    final seedFields = _seedFields();
+
+    if (hid == null || hid.isEmpty || kIsWeb) {
+      setState(() => _fields = seedFields);
+      return;
+    }
+
+    _enrichedFuture ??=
+        _cachedEnrichedHearing(hid, widget.data, siblingRows: widget.siblingRows);
+    setState(() => _fields = seedFields);
+
+    _enrichedFuture!.then((enriched) {
+      if (!mounted) return;
+      if (enriched.isEmpty) return;
+      setState(() => _fields = _fieldsFrom(enriched));
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
-    final hid = (hearingDocId ?? data['hearingDocId'] as String?)?.trim();
-    final seedFields = calendarOnly
-        ? HearingNotificationFormatter.fieldsForCalendarHearing(data)
-        : HearingNotificationFormatter.fieldsFromNotificationData(data);
-
-    if (hid == null || hid.isEmpty) {
-      return _FieldsList(fields: seedFields);
-    }
-
-    // Web reminders: notification row already has display fields — skip extra Firestore reads.
-    if (kIsWeb && seedFields.isNotEmpty) {
-      return _FieldsList(fields: seedFields);
-    }
-
-    if (seedFields.length >= 3) {
-      return FutureBuilder<Map<String, dynamic>>(
-        future: _cachedEnrichedHearing(hid, data, siblingRows: siblingRows),
-        builder: (context, snap) {
-          final fields = (snap.hasData && snap.data!.isNotEmpty)
-              ? _fieldsFrom(snap.data!)
-              : seedFields;
-          return _FieldsList(fields: fields);
-        },
+    final fields = _fields;
+    if (fields == null) {
+      return const SizedBox(
+        height: 32,
+        child: Center(
+          child: SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
       );
     }
-
-    return FutureBuilder<Map<String, dynamic>>(
-      future: _cachedEnrichedHearing(hid, data, siblingRows: siblingRows),
-      builder: (context, snap) {
-        if (snap.connectionState == ConnectionState.waiting) {
-          return const Padding(
-            padding: EdgeInsets.symmetric(vertical: 12),
-            child: Center(
-              child: SizedBox(
-                width: 24,
-                height: 24,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
-            ),
-          );
-        }
-        if (snap.hasData && snap.data!.isNotEmpty) {
-          return _FieldsList(fields: _fieldsFrom(snap.data!));
-        }
-        return _FieldsList(fields: seedFields);
-      },
-    );
+    return _FieldsList(fields: fields);
   }
 }
 
@@ -203,14 +229,23 @@ class _FieldsList extends StatelessWidget {
             ),
             constraints: const BoxConstraints(maxHeight: 280),
             child: SingleChildScrollView(
-              child: SelectableText(
-                fullText,
-                style: TextStyle(
-                  fontSize: 13,
-                  height: 1.5,
-                  color: Colors.grey[850],
+              child: kIsWeb
+              ? Text(
+                  fullText,
+                  style: TextStyle(
+                    fontSize: 13,
+                    height: 1.5,
+                    color: Colors.grey[850],
+                  ),
+                )
+              : SelectableText(
+                  fullText,
+                  style: TextStyle(
+                    fontSize: 13,
+                    height: 1.5,
+                    color: Colors.grey[850],
+                  ),
                 ),
-              ),
             ),
           ),
         ],
@@ -242,14 +277,23 @@ class _DetailRow extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 4),
-          SelectableText(
-            value,
-            style: TextStyle(
-              fontSize: 14,
-              height: 1.45,
-              color: Colors.grey[900],
-            ),
-          ),
+          kIsWeb
+              ? Text(
+                  value,
+                  style: TextStyle(
+                    fontSize: 14,
+                    height: 1.45,
+                    color: Colors.grey[900],
+                  ),
+                )
+              : SelectableText(
+                  value,
+                  style: TextStyle(
+                    fontSize: 14,
+                    height: 1.45,
+                    color: Colors.grey[900],
+                  ),
+                ),
         ],
       ),
     );

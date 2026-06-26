@@ -24,12 +24,14 @@ import '../../screens/staff/staff_reports_screen.dart';
 import '../../screens/staff/staff_notifications_screen.dart';
 import '../../services/auth_service.dart';
 import '../../screens/staff/staff_create_case_draft_screen.dart';
+import '../../screens/billing/billing_management_screen.dart';
 
 import '../../screens/client/chat_screen.dart';
 import '../../pages/staff/staff_profile_page.dart';
 import '../../widgets/common/lazy_indexed_stack.dart';
 import '../../widgets/common/profile_picture_widget.dart';
 import '../../services/hearing_notification_fanout_service.dart';
+import '../../services/lightweight_reminders_inbox_service.dart';
 import '../auth/login_page.dart';
 
 class StaffDashboard extends StatefulWidget {
@@ -45,14 +47,11 @@ class _StaffDashboardState extends State<StaffDashboard> {
   final GlobalKey<LazyIndexedStackState> _desktopTabStackKey =
       GlobalKey<LazyIndexedStackState>();
   Timer? _tabPrewarmTimer;
-  Timer? _statsDebounce;
   Timer? _fanoutDeferTimer;
   bool _dashboardStreamsAttached = false;
   StreamSubscription<List<TaskModel>>? _tasksSub;
   StreamSubscription<List<CaseModel>>? _assignedCasesSub;
   StreamSubscription<List<CaseModel>>? _attorneyCasesSub;
-  StreamSubscription<List<Map<String, dynamic>>>? _calendarSub;
-  StreamSubscription<List<Map<String, dynamic>>>? _hearingNotifSub;
   int _bellBadgeCount = 0;
 
   final StaffService _staffService = StaffService();
@@ -64,9 +63,10 @@ class _StaffDashboardState extends State<StaffDashboard> {
   String? _assignedAttorneyId;
   String _activeItem = 'dashboard';
   int _selectedBottomNavIndex = 0;
-  int _unreadCount = 0;
   int _messageUnreadCount = 0;
-  bool _isLoading = true;
+  bool _snapshotLoading = false;
+  bool _snapshotRefreshQueued = false;
+  bool _dashboardSnapshotRetried = false;
 
   static const int _bottomNavItemCount = 6;
 
@@ -79,6 +79,19 @@ class _StaffDashboardState extends State<StaffDashboard> {
 
   int get _safeBottomNavIndex =>
       _safeInt(_selectedBottomNavIndex).clamp(0, _bottomNavItemCount - 1);
+
+  Object get _dashboardTabRevision => Object.hash(
+        _myTasks.length,
+        _stats['totalTasks'],
+        _stats['pendingTasks'],
+        _stats['inProgressTasks'],
+        _stats['activeCases'],
+        _stats['completedTasks'],
+        _stats['upcomingDeadlines'],
+        _assignedCases.length,
+        _hearingNotifications.length,
+        _upcomingDeadlines.length,
+      );
 
   Map<String, dynamic> _stats = {};
   List<TaskModel> _myTasks = [];
@@ -96,7 +109,6 @@ class _StaffDashboardState extends State<StaffDashboard> {
   void reassemble() {
     super.reassemble();
     _selectedBottomNavIndex = _safeInt(_selectedBottomNavIndex);
-    _unreadCount = _safeInt(_unreadCount);
     _messageUnreadCount = _safeInt(_messageUnreadCount);
   }
 
@@ -107,68 +119,119 @@ class _StaffDashboardState extends State<StaffDashboard> {
       Get.offAll(() => const LoginPage());
       return;
     }
-    final doc = await FirebaseFirestore.instance
-        .collection('users')
-        .doc(user.uid)
-        .get();
-    if (!doc.exists) {
-      if (!mounted) return;
-      Get.offAll(() => const LoginPage());
-      return;
-    }
-    final data = doc.data()!;
-    if (data['role'] == 'staff' && data['isActive'] == false) {
-      await FirebaseAuth.instance.signOut();
-      if (!mounted) return;
-      setState(() => _isLoading = false);
-      Get.snackbar(
-        'Account not active',
-        'Your staff access is turned off. If you are still waiting on application approval, sign in after an admin approves. Otherwise contact an administrator.',
-        backgroundColor: Colors.orange,
-        colorText: Colors.white,
-        duration: const Duration(seconds: 5),
-      );
-      Get.offAll(() => const LoginPage());
-      return;
-    }
 
-    final email = (data['email'] as String?)?.toString() ?? user.email ?? '';
+    final ok = await _verifyAccountAndBootstrap(user);
+    if (!ok || !mounted) return;
 
+    await _loadUserData();
     if (!mounted) return;
-    setState(() => _isLoading = false);
 
-    unawaited(_runDeferredBootstrap(user.uid, email, data));
+    _loadDashboardData();
+
+    await _refreshDashboardSnapshot();
+    if (!mounted) return;
+
+    await _loadDashboardPreviewData();
+    if (!mounted) return;
+
+    unawaited(_loadMessageUnreadCount());
+    unawaited(_refreshBellBadge());
   }
 
-  /// Non-blocking: auth repair + streams + notification warmup run after UI paints.
+  /// Returns false when the user is signed out or redirected away.
+  Future<bool> _verifyAccountAndBootstrap(User user) async {
+    DocumentSnapshot<Map<String, dynamic>>? doc;
+    try {
+      doc = await FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .get();
+    } catch (_) {
+      doc = null;
+    }
+
+    if (doc != null) {
+      if (!doc.exists) {
+        if (!mounted) return false;
+        Get.offAll(() => const LoginPage());
+        return false;
+      }
+      final data = doc.data()!;
+      if (data['role'] == 'staff' && data['isActive'] == false) {
+        await FirebaseAuth.instance.signOut();
+        if (!mounted) return false;
+        Get.snackbar(
+          'Account not active',
+          'Your staff access is turned off. If you are still waiting on application approval, sign in after an admin approves. Otherwise contact an administrator.',
+          backgroundColor: Colors.orange,
+          colorText: Colors.white,
+          duration: const Duration(seconds: 5),
+        );
+        Get.offAll(() => const LoginPage());
+        return false;
+      }
+
+      final email = (data['email'] as String?)?.toString() ?? user.email ?? '';
+      if (!mounted) return false;
+      await _runDeferredBootstrap(user.uid, email, data);
+      return true;
+    }
+
+    // Transient/offline verify failure — still warm secondary dashboard data.
+    if (!mounted) return false;
+    await _runDeferredBootstrap(user.uid, user.email ?? '', const {});
+    return true;
+  }
+
+  /// Auth repair + deferred warmup (bell badge, tab prewarm).
   Future<void> _runDeferredBootstrap(
     String uid,
     String email,
     Map<String, dynamic> data,
   ) async {
-    unawaited(
-      AuthService().syncStaffRoleFromStaffApplication(uid: uid, email: email),
-    );
-    unawaited(
-      AuthService().repairPortalRoleIfNeeded(
+    try {
+      await AuthService().syncStaffRoleFromStaffApplication(uid: uid, email: email);
+      await AuthService().repairPortalRoleIfNeeded(
         uid: uid,
         email: email,
         firestoreRole: data['role'] as String?,
-      ),
-    );
+      );
+      await FirebaseAuth.instance.currentUser?.getIdToken(true);
+    } catch (_) {}
 
     if (!mounted) return;
-    await _loadUserData();
-    if (!mounted) return;
-    _loadDashboardData();
-    unawaited(_loadUnreadCount());
-    unawaited(_refreshBellBadge());
+    if (kIsWeb) {
+      Timer(const Duration(seconds: 5), () {
+        if (!mounted) return;
+        unawaited(_loadMessageUnreadCount());
+      });
+      Timer(const Duration(seconds: 6), () {
+        if (!mounted) return;
+        unawaited(_refreshBellBadge());
+      });
+    } else {
+      Timer(const Duration(seconds: 2), () {
+        if (!mounted) return;
+        unawaited(_loadMessageUnreadCount());
+        unawaited(_refreshBellBadge());
+      });
+    }
+
+    // Web: defer calendar prewarm — opening it on dashboard load causes jank.
+    if (kIsWeb) {
+      Timer(const Duration(seconds: 12), () {
+        if (!mounted) return;
+        _mobileTabStackKey.currentState?.prewarm(3);
+        _desktopTabStackKey.currentState?.prewarm(4);
+      });
+    }
 
     _fanoutDeferTimer?.cancel();
-    _fanoutDeferTimer = Timer(const Duration(seconds: 8), () {
+    _fanoutDeferTimer = Timer(const Duration(seconds: 3), () {
       if (!mounted) return;
-      HearingNotificationFanoutService.instance.attach();
-      HearingNotificationFanoutService.instance.warmInbox(uid);
+      unawaited(
+        HearingNotificationFanoutService.instance.prepareBellCount(uid),
+      );
     });
   }
 
@@ -176,32 +239,270 @@ class _StaffDashboardState extends State<StaffDashboard> {
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null || !mounted) return;
     try {
-      final n = kIsWeb
-          ? await HearingNotificationFanoutService.instance
-              .refreshInboxBellCountOnce(uid)
-          : HearingNotificationFanoutService.instance.peekInboxBellCount(uid);
-      if (mounted && n != _bellBadgeCount) {
-        setState(() => _bellBadgeCount = n);
+      var count =
+          await LightweightRemindersInboxService.countUnreadReminders(uid);
+
+      try {
+        final snap = await FirebaseFirestore.instance
+            .collection('notifications')
+            .where('userId', isEqualTo: uid)
+            .limit(60)
+            .get();
+        for (final doc in snap.docs) {
+          final data = doc.data();
+          final fsType = (data['type'] as String? ?? '').toLowerCase();
+          if (fsType == 'court_email_ingest' || fsType.startsWith('court_')) {
+            continue;
+          }
+          if (hearingOrAppointmentBellType(fsType)) continue;
+          if (data['isRead'] == true) continue;
+          count++;
+        }
+      } catch (_) {}
+
+      try {
+        final taskSnap = await _firestoreGet(
+          FirebaseFirestore.instance
+              .collection('tasks')
+              .where('assignedTo', isEqualTo: uid),
+          30,
+        );
+        count += taskSnap.docs.where((d) {
+          final status = (d.data()['status'] as String?)?.toLowerCase().trim();
+          return status == 'pending';
+        }).length;
+      } catch (_) {}
+
+      if (mounted && count != _bellBadgeCount) {
+        setState(() => _bellBadgeCount = count);
       }
     } catch (_) {}
   }
 
-  void _scheduleDashboardRebuild() {
-    _statsDebounce?.cancel();
-    _statsDebounce = Timer(const Duration(milliseconds: 250), () {
+  Future<void> _refreshDashboardSnapshot() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+    if (_snapshotLoading) {
+      _snapshotRefreshQueued = true;
+      return;
+    }
+    _snapshotLoading = true;
+
+    var tasks = <TaskModel>[];
+    var cases = <CaseModel>[];
+    var attorneyId = _assignedAttorneyId?.trim() ?? '';
+
+    try {
+      try {
+        await user.getIdToken(true);
+      } catch (_) {}
+
+      if (attorneyId.isEmpty) {
+        try {
+          final userDoc = await _firestoreGetDoc(
+            FirebaseFirestore.instance.collection('users').doc(user.uid),
+          );
+          attorneyId =
+              (userDoc.data()?['assignedAttorneyId'] as String?)?.trim() ?? '';
+          if (attorneyId.isNotEmpty && mounted) {
+            _assignedAttorneyId = attorneyId;
+          }
+        } catch (_) {}
+      }
+
+      try {
+        final taskSnap = await _firestoreGet(
+          FirebaseFirestore.instance
+              .collection('tasks')
+              .where('assignedTo', isEqualTo: user.uid),
+          60,
+        );
+        tasks = taskSnap.docs
+            .map((doc) => TaskModel.fromFirestore(doc))
+            .toList()
+          ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+      } catch (_) {}
+
+      try {
+        final assignedSnap = await _firestoreGet(
+          FirebaseFirestore.instance
+              .collection('cases')
+              .where('staffAssigned', arrayContains: user.uid),
+          60,
+        );
+        cases = assignedSnap.docs
+            .map((doc) => CaseModel.fromFirestore(doc))
+            .toList();
+      } catch (_) {}
+
+      if (cases.isEmpty && attorneyId.isNotEmpty) {
+        try {
+          final attorneySnap = await _firestoreGet(
+            FirebaseFirestore.instance
+                .collection('cases')
+                .where('attorneyId', isEqualTo: attorneyId),
+            60,
+          );
+          cases = attorneySnap.docs
+              .map((doc) => CaseModel.fromFirestore(doc))
+              .toList();
+        } catch (_) {}
+      }
+
       if (!mounted) return;
-      setState(() => _stats = _computeStats());
-    });
+      setState(() {
+        if (tasks.isNotEmpty) {
+          _myTasks = tasks;
+        }
+        if (cases.isNotEmpty) {
+          _assignedCases = cases
+            ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+        }
+        _stats = _computeStats();
+      });
+
+      if (attorneyId.isNotEmpty && _attorneyCasesSub == null) {
+        _subscribeCaseStreams(user.uid);
+      }
+
+      if (tasks.isEmpty &&
+          cases.isEmpty &&
+          !_dashboardSnapshotRetried) {
+        _dashboardSnapshotRetried = true;
+        Timer(const Duration(seconds: 2), () {
+          if (!mounted) return;
+          unawaited(_refreshDashboardSnapshot());
+        });
+      }
+    } finally {
+      _snapshotLoading = false;
+      if (_snapshotRefreshQueued) {
+        _snapshotRefreshQueued = false;
+        unawaited(_refreshDashboardSnapshot());
+      }
+    }
+  }
+
+  Future<void> _handleDashboardRefresh() async {
+    _dashboardSnapshotRetried = false;
+    await _loadUserData();
+    if (!mounted) return;
+    await _refreshDashboardSnapshot();
+    if (!mounted) return;
+    await _loadDashboardPreviewData();
+  }
+
+  Future<QuerySnapshot<Map<String, dynamic>>> _firestoreGet(
+    Query<Map<String, dynamic>> query,
+    int limit,
+  ) async {
+    final q = query.limit(limit);
+    if (kIsWeb) return q.get();
+    try {
+      return await q.get(const GetOptions(source: Source.server));
+    } catch (_) {
+      return q.get();
+    }
+  }
+
+  Future<DocumentSnapshot<Map<String, dynamic>>> _firestoreGetDoc(
+    DocumentReference<Map<String, dynamic>> ref,
+  ) async {
+    if (kIsWeb) return ref.get();
+    try {
+      return await ref.get(const GetOptions(source: Source.server));
+    } catch (_) {
+      return ref.get();
+    }
+  }
+
+  void _subscribeCaseStreams(String staffId) {
+    _assignedCasesSub?.cancel();
+    _assignedCasesSub = _staffService.getAssignedCases(staffId).listen(
+      (cases) {
+        if (!mounted) return;
+        if (cases.isNotEmpty) {
+          setState(() {
+            _assignedCases = cases;
+            _stats = _computeStats();
+          });
+        }
+      },
+      onError: (_) => unawaited(_refreshDashboardSnapshot()),
+    );
+
+    final attorneyId = _assignedAttorneyId?.trim() ?? '';
+    _attorneyCasesSub?.cancel();
+    _attorneyCasesSub = null;
+    if (attorneyId.isEmpty) return;
+
+    _attorneyCasesSub = _staffService.getAttorneyCases(attorneyId).listen(
+      (cases) {
+        if (!mounted) return;
+        setState(() {
+          _assignedCases = cases;
+          _stats = _computeStats();
+        });
+      },
+      onError: (_) {},
+    );
   }
 
   Future<void> _loadUserData() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
     final staff = await _staffAuthService.getCurrentStaff();
-    if (mounted && staff != null) {
+    if (staff != null) {
+      if (!mounted) return;
       setState(() {
         _currentStaff = staff;
         _assignedAttorneyId = staff.assignedAttorneyId;
       });
+      return;
     }
+
+    try {
+      final userDoc = await _firestoreGetDoc(
+        FirebaseFirestore.instance.collection('users').doc(user.uid),
+      );
+      if (!userDoc.exists || !mounted) return;
+      final data = userDoc.data() ?? {};
+      final attorneyId = (data['assignedAttorneyId'] as String?)?.trim() ?? '';
+      final name = (data['name'] as String?)?.trim();
+      setState(() {
+        if (attorneyId.isNotEmpty) _assignedAttorneyId = attorneyId;
+        if (name != null && name.isNotEmpty && _currentStaff == null) {
+          _currentStaff = StaffModel(
+            id: user.uid,
+            name: name,
+            email: (data['email'] as String?) ?? user.email ?? '',
+            assignedAttorneyId: attorneyId,
+            createdAt: DateTime.now(),
+          );
+        }
+      });
+    } catch (_) {}
+  }
+
+  void _openBilling() {
+    final attorneyId = _assignedAttorneyId;
+    if (attorneyId == null || attorneyId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No assigned attorney to view billing for.'),
+        ),
+      );
+      return;
+    }
+    Get.to(
+      () => BillingManagementScreen(
+        attorneyId: attorneyId,
+        title: 'Billing & Payments',
+        recorderRole: 'staff',
+        recorderName: FirebaseAuth.instance.currentUser?.displayName,
+      ),
+    );
   }
 
   Future<void> _openChatWithAttorney() async {
@@ -282,56 +583,49 @@ class _StaffDashboardState extends State<StaffDashboard> {
     }
   }
 
-  Future<void> _loadUnreadCount() async {
+  Future<void> _loadMessageUnreadCount() async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
 
     try {
-      int totalCount = 0;
-
-      // Count unread messages
-      final messageCount = await _chatService.getUnreadCount(user.uid);
-      totalCount += messageCount;
-
-      // Count unread Firestore notifications (include missing isRead)
-      final notificationsSnapshot = await FirebaseFirestore.instance
-          .collection('notifications')
-          .where('userId', isEqualTo: user.uid)
-          .limit(100)
-          .get();
-      totalCount += notificationsSnapshot.docs
-          .where((d) => d.data()['isRead'] != true)
-          .length;
-
-      // Count pending tasks
-      final tasks = await _taskService.getStaffTasks(user.uid).first;
-      final pendingTasks = tasks.where((t) => t.status == 'pending').length;
-      if (pendingTasks > 0)
-        totalCount += 1; // Add 1 for pending tasks notification
-
-      // Count upcoming deadlines (within 7 days)
-      if (_assignedAttorneyId != null) {
-        final now = DateTime.now();
-        final sevenDaysLater = now.add(const Duration(days: 7));
-        final deadlinesSnapshot = await FirebaseFirestore.instance
-            .collection('calendar_events')
-            .where('assignedTo', isEqualTo: _assignedAttorneyId)
-            .where('eventDate', isGreaterThan: Timestamp.fromDate(now))
-            .where('eventDate', isLessThan: Timestamp.fromDate(sevenDaysLater))
-            .get();
-        if (deadlinesSnapshot.docs.isNotEmpty)
-          totalCount += 1; // Add 1 for upcoming deadlines
+      final count = await _chatService.getUnreadCount(user.uid);
+      if (mounted && count != _messageUnreadCount) {
+        setState(() => _messageUnreadCount = count);
       }
+    } catch (_) {}
+  }
 
-      if (mounted) {
-        setState(() {
-          _messageUnreadCount = messageCount;
-          _unreadCount = totalCount;
-        });
-      }
-    } catch (e) {
-      // Handle error silently
-    }
+  Widget _navIconWithBadge(IconData icon, {int badge = 0}) {
+    final safeBadge = _safeInt(badge);
+    if (safeBadge <= 0) return Icon(icon);
+    final label = safeBadge > 99 ? '99+' : safeBadge > 9 ? '9+' : '$safeBadge';
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Icon(icon),
+        Positioned(
+          right: -8,
+          top: -4,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+            decoration: const BoxDecoration(
+              color: Colors.red,
+              shape: BoxShape.circle,
+            ),
+            constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 9,
+                fontWeight: FontWeight.bold,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      ],
+    );
   }
 
   void _loadDashboardData() {
@@ -340,60 +634,102 @@ class _StaffDashboardState extends State<StaffDashboard> {
     if (user == null) return;
     _dashboardStreamsAttached = true;
 
-    _tasksSub = _taskService.getStaffTasks(user.uid).listen((tasks) {
-      if (!mounted) return;
-      _myTasks = tasks;
-      _scheduleDashboardRebuild();
-    });
+    _tasksSub = _taskService.getStaffTasks(user.uid).listen(
+      (tasks) {
+        if (!mounted) return;
+        setState(() {
+          _myTasks = tasks;
+          _stats = _computeStats();
+        });
+      },
+      onError: (_) => unawaited(_refreshDashboardSnapshot()),
+    );
 
-    _assignedCasesSub = _staffService.getAssignedCases(user.uid).listen((cases) {
-      if (!mounted) return;
-      _assignedCases = cases;
-      _scheduleDashboardRebuild();
-    });
+    _subscribeCaseStreams(user.uid);
+  }
 
+  /// One-shot preview for dashboard cards — not a live duplicate of calendar streams.
+  Future<void> _loadDashboardPreviewData() async {
     final attorneyId = _assignedAttorneyId;
-    if (attorneyId != null) {
-      _attorneyCasesSub =
-          _staffService.getAttorneyCases(attorneyId).listen((_) {
-        if (!mounted) return;
-        _scheduleDashboardRebuild();
-      });
+    if (attorneyId == null || !mounted) return;
 
-      _calendarSub =
-          _staffService.getCalendarEvents(attorneyId).listen((events) {
-        if (!mounted) return;
-        final now = DateTime.now();
-        _upcomingDeadlines = events
-            .where(
-              (e) =>
-                  e['eventDate'] != null &&
-                  (e['eventDate'] as DateTime).isAfter(now),
-            )
-            .take(5)
-            .toList();
-        _scheduleDashboardRebuild();
-      });
+    try {
+      final now = DateTime.now();
+      final deadlinesSnap = await FirebaseFirestore.instance
+          .collection('calendar_events')
+          .where('assignedTo', isEqualTo: attorneyId)
+          .where('eventDate', isGreaterThan: Timestamp.fromDate(now))
+          .orderBy('eventDate')
+          .limit(5)
+          .get();
 
-      _hearingNotifSub = _staffService
-          .getUpcomingHearingNotifications(attorneyId)
-          .listen((notifications) {
-        if (!mounted) return;
-        setState(() => _hearingNotifications = notifications);
+      final hearingSnap = await FirebaseFirestore.instance
+          .collection('hearing_notifications')
+          .where('attorneyId', isEqualTo: attorneyId)
+          .where('status', isEqualTo: 'pending')
+          .limit(15)
+          .get();
+
+      final twoDays = now.add(const Duration(days: 2));
+      final hearings = hearingSnap.docs
+          .map((doc) {
+            final data = doc.data();
+            return <String, dynamic>{
+              'id': doc.id,
+              ...data,
+              'hearingDate': (data['hearingDate'] as Timestamp?)?.toDate(),
+              'notificationDate':
+                  (data['notificationDate'] as Timestamp?)?.toDate(),
+            };
+          })
+          .where((n) {
+            final d = n['notificationDate'] as DateTime?;
+            return d != null &&
+                d.isAfter(now.subtract(const Duration(days: 1))) &&
+                d.isBefore(twoDays.add(const Duration(days: 1)));
+          })
+          .toList();
+
+      if (!mounted) return;
+      setState(() {
+        _upcomingDeadlines = deadlinesSnap.docs.map((doc) {
+          final data = doc.data();
+          return <String, dynamic>{
+            'id': doc.id,
+            ...data,
+            'eventDate': (data['eventDate'] as Timestamp?)?.toDate(),
+          };
+        }).toList();
+        _hearingNotifications = hearings;
       });
-    }
+    } catch (_) {}
   }
 
   Map<String, dynamic> _computeStats() {
+    bool isPending(String status) =>
+        status.toLowerCase().trim() == 'pending';
+    bool isInProgress(String status) {
+      final s = status.toLowerCase().trim();
+      return s == 'in_progress' || s == 'in progress';
+    }
+    bool isCompleted(String status) {
+      final s = status.toLowerCase().trim();
+      return s == 'completed' || s == 'done';
+    }
+    bool isActiveCase(String status) {
+      final s = status.toLowerCase().trim();
+      return s == 'in_progress' ||
+          s == 'in progress' ||
+          s == 'accepted' ||
+          s == 'active';
+    }
+
     return {
       'totalTasks': _myTasks.length,
-      'pendingTasks': _myTasks.where((t) => t.status == 'pending').length,
-      'inProgressTasks':
-          _myTasks.where((t) => t.status == 'in_progress').length,
-      'completedTasks': _myTasks.where((t) => t.status == 'completed').length,
-      'activeCases': _assignedCases
-          .where((c) => c.status == 'in_progress' || c.status == 'accepted')
-          .length,
+      'pendingTasks': _myTasks.where((t) => isPending(t.status)).length,
+      'inProgressTasks': _myTasks.where((t) => isInProgress(t.status)).length,
+      'completedTasks': _myTasks.where((t) => isCompleted(t.status)).length,
+      'activeCases': _assignedCases.where((c) => isActiveCase(c.status)).length,
       'upcomingDeadlines': _upcomingDeadlines.length,
     };
   }
@@ -477,14 +813,15 @@ class _StaffDashboardState extends State<StaffDashboard> {
             ),
         ],
       ),
-      onPressed: () async {
-        await Navigator.push(
+      onPressed: () {
+        Navigator.push(
           context,
-          MaterialPageRoute(
+          MaterialPageRoute<void>(
             builder: (context) => const StaffNotificationsScreen(),
           ),
-        );
-        if (mounted) unawaited(_refreshBellBadge());
+        ).then((_) {
+          if (mounted) unawaited(_refreshBellBadge());
+        });
       },
       tooltip: showBadge
           ? 'Notifications ($unreadCount unread)'
@@ -563,26 +900,30 @@ class _StaffDashboardState extends State<StaffDashboard> {
               });
             } else {
               setState(() => _selectedBottomNavIndex = index);
+              if (index == 5) unawaited(_loadMessageUnreadCount());
             }
           },
           type: BottomNavigationBarType.fixed,
-          items: const [
-            BottomNavigationBarItem(
+          items: [
+            const BottomNavigationBarItem(
               icon: Icon(Icons.dashboard),
               label: 'Dashboard',
             ),
-            BottomNavigationBarItem(icon: Icon(Icons.folder), label: 'Cases'),
-            BottomNavigationBarItem(
+            const BottomNavigationBarItem(icon: Icon(Icons.folder), label: 'Cases'),
+            const BottomNavigationBarItem(
               icon: Icon(Icons.edit_document),
               label: 'Draft',
             ),
-            BottomNavigationBarItem(icon: Icon(Icons.task), label: 'Tasks'),
-            BottomNavigationBarItem(
+            const BottomNavigationBarItem(icon: Icon(Icons.task), label: 'Tasks'),
+            const BottomNavigationBarItem(
               icon: Icon(Icons.calendar_today),
               label: 'Calendar',
             ),
             BottomNavigationBarItem(
-              icon: Icon(Icons.message),
+              icon: _navIconWithBadge(
+                Icons.message,
+                badge: _messageUnreadCount,
+              ),
               label: 'Messages',
             ),
           ],
@@ -674,12 +1015,17 @@ class _StaffDashboardState extends State<StaffDashboard> {
                 _buildSidebarItem('tasks', 'Tasks', Icons.task),
                 _buildSidebarItem('clients', 'Clients', Icons.people),
                 _buildSidebarItem('calendar', 'Calendar', Icons.calendar_today),
+                _buildSidebarItem(
+                  'billing',
+                  'Billing & Payments',
+                  Icons.account_balance_wallet,
+                ),
 
                 _buildSidebarItem(
                   'communication',
                   'Messages',
                   Icons.message,
-                  badge: _safeInt(_unreadCount),
+                  badge: _safeInt(_messageUnreadCount),
                 ),
                 _buildSidebarItem(
                   'reports',
@@ -779,7 +1125,7 @@ class _StaffDashboardState extends State<StaffDashboard> {
             leading: Stack(
               children: [
                 const Icon(Icons.message),
-                if (_safeInt(_unreadCount) > 0)
+                if (_safeInt(_messageUnreadCount) > 0)
                   Positioned(
                     right: 0,
                     top: 0,
@@ -796,7 +1142,7 @@ class _StaffDashboardState extends State<StaffDashboard> {
                       child: Text(
 
 
-                        '${_safeInt(_unreadCount) > 9 ? '9+' : _safeInt(_unreadCount)}',
+                        '${_safeInt(_messageUnreadCount) > 9 ? '9+' : _safeInt(_messageUnreadCount)}',
                         style: const TextStyle(
                           color: Colors.white,
                           fontSize: 10,
@@ -888,7 +1234,9 @@ class _StaffDashboardState extends State<StaffDashboard> {
       selected: isActive,
       selectedTileColor: Colors.white.withOpacity(0.1),
       onTap: () {
-        if (item == 'draft_cases') {
+        if (item == 'billing') {
+          _openBilling();
+        } else if (item == 'draft_cases') {
           // Navigate to create draft case screen
           Navigator.push(
             context,
@@ -942,10 +1290,11 @@ class _StaffDashboardState extends State<StaffDashboard> {
       return LazyIndexedStack(
         key: _mobileTabStackKey,
         index: _safeBottomNavIndex,
+        activeTabRevision: _dashboardTabRevision,
         builders: [
           () => _buildDashboardView(),
           () => const StaffCasesScreen(),
-          () => _buildDashboardView(),
+          () => const SizedBox.shrink(),
           () => const StaffTasksScreen(),
           () => const StaffCalendarScreen(),
           () => const StaffCommunicationScreen(),
@@ -956,6 +1305,7 @@ class _StaffDashboardState extends State<StaffDashboard> {
     return LazyIndexedStack(
       key: _desktopTabStackKey,
       index: _desktopTabIndex(),
+      activeTabRevision: _dashboardTabRevision,
       builders: [
         () => _buildDashboardView(),
         () => const StaffCasesScreen(),
@@ -970,15 +1320,14 @@ class _StaffDashboardState extends State<StaffDashboard> {
   }
 
   Widget _buildDashboardView() {
-    if (_isLoading) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
     final isDesktop = MediaQuery.of(context).size.width >= 800;
     final crossAxisCount = isDesktop ? 4 : 2;
 
-    return SingleChildScrollView(
-      child: Column(
+    return RefreshIndicator(
+      onRefresh: _handleDashboardRefresh,
+      child: SingleChildScrollView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // Dark Blue Header Section
@@ -1207,6 +1556,27 @@ class _StaffDashboardState extends State<StaffDashboard> {
                           ],
                         ],
                       ),
+                      if (_assignedAttorneyId != null) ...[
+                        const SizedBox(height: 12),
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton.icon(
+                            onPressed: () => _openBilling(),
+                            icon: const Icon(
+                              Icons.account_balance_wallet_outlined,
+                            ),
+                            label: const Text('Billing & Payments'),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: AppTheme.royalBlue,
+                              side: const BorderSide(color: AppTheme.royalBlue),
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                     ],
                   ),
                 ),
@@ -1248,13 +1618,25 @@ class _StaffDashboardState extends State<StaffDashboard> {
                 ],
 
                 // Stats Grid
-                Text(
-                  'Overview',
-                  style: TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
-                    color: AppTheme.royalBlue,
-                  ),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        'Overview',
+                        style: TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                          color: AppTheme.royalBlue,
+                        ),
+                      ),
+                    ),
+                    if (_snapshotLoading)
+                      const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                  ],
                 ),
                 const SizedBox(height: 12),
                 GridView.count(
@@ -1263,7 +1645,7 @@ class _StaffDashboardState extends State<StaffDashboard> {
                   physics: const NeverScrollableScrollPhysics(),
                   mainAxisSpacing: 16,
                   crossAxisSpacing: 16,
-                  childAspectRatio: 1.1,
+                  childAspectRatio: isDesktop ? 1.1 : 0.92,
                   children: [
                     StatCard(
                       title: 'Total Tasks',
@@ -1324,7 +1706,7 @@ class _StaffDashboardState extends State<StaffDashboard> {
                   ),
                   const SizedBox(height: 12),
                   SizedBox(
-                    height: 120,
+                    height: 132,
                     child: ListView.builder(
                       scrollDirection: Axis.horizontal,
                       itemCount: _assignedCases.take(5).length,
@@ -1334,29 +1716,40 @@ class _StaffDashboardState extends State<StaffDashboard> {
                           width: 200,
                           margin: const EdgeInsets.only(right: 12),
                           child: Card(
+                            clipBehavior: Clip.antiAlias,
                             child: InkWell(
                               onTap: () {
                                 setState(() => _activeItem = 'cases');
                               },
                               child: Padding(
-                                padding: const EdgeInsets.all(12),
+                                padding: const EdgeInsets.all(10),
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    Text(
-                                      caseModel.caseTitle,
-                                      style: TextStyle(
-                                        fontWeight: FontWeight.bold,
-                                        fontSize: 14,
+                                    Expanded(
+                                      child: Text(
+                                        caseModel.caseTitle,
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 14,
+                                        ),
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
                                       ),
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
                                     ),
-                                    const SizedBox(height: 8),
                                     Chip(
                                       label: Text(
                                         caseModel.status.toUpperCase(),
-                                        style: TextStyle(fontSize: 10),
+                                        style: const TextStyle(fontSize: 10),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      visualDensity: VisualDensity.compact,
+                                      materialTapTargetSize:
+                                          MaterialTapTargetSize.shrinkWrap,
+                                      padding: EdgeInsets.zero,
+                                      labelPadding: const EdgeInsets.symmetric(
+                                        horizontal: 6,
                                       ),
                                       backgroundColor: _getCaseStatusColor(
                                         caseModel.status,
@@ -1436,6 +1829,7 @@ class _StaffDashboardState extends State<StaffDashboard> {
           ),
         ],
       ),
+      ),
     );
   }
 
@@ -1490,13 +1884,10 @@ class _StaffDashboardState extends State<StaffDashboard> {
   @override
   void dispose() {
     _tabPrewarmTimer?.cancel();
-    _statsDebounce?.cancel();
     _fanoutDeferTimer?.cancel();
     _tasksSub?.cancel();
     _assignedCasesSub?.cancel();
     _attorneyCasesSub?.cancel();
-    _calendarSub?.cancel();
-    _hearingNotifSub?.cancel();
     HearingNotificationFanoutService.instance.detach();
     super.dispose();
   }

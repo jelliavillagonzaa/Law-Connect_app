@@ -1,14 +1,10 @@
-import 'dart:async' show runZonedGuarded, unawaited;
-
-import 'dart:ui' show PlatformDispatcher;
+import 'dart:async' show TimeoutException, unawaited;
 
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
-import 'package:firebase_core/firebase_core.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 
-import 'firebase_options.dart';
+import 'app/firebase_initializer.dart';
 import 'controllers/auth_controller.dart';
 import 'theme/app_theme.dart';
 import 'pages/client/client_landing_page.dart';
@@ -20,10 +16,7 @@ import 'pages/attorney/attorney_landing_page.dart';
 import 'pages/auth/login_page.dart';
 import 'pages/auth/signup_page.dart';
 import 'pages/auth/otp_verification.dart';
-import 'pages/admin/admin_dashboard.dart';
-import 'pages/attorney/attorney_dashboard.dart';
-import 'pages/staff/staff_dashboard.dart';
-import 'screens/client/dashboard_screen_with_nav.dart';
+import 'routes/deferred_route_loaders.dart';
 import 'services/notification_service.dart';
 import 'services/fcm_service.dart';
 import 'firebase_messaging_handler.dart';
@@ -33,23 +26,12 @@ import 'services/supabase_service.dart';
 import 'utils/app_scroll_behavior.dart';
 import 'utils/quiet_console.dart';
 
-bool _isBenignFirestoreRuntimeError(Object? error) {
-  if (error == null) return false;
-  if (error is FirebaseException) {
-    return error.code == 'permission-denied';
-  }
-  final s = error.toString();
-  if (s.contains('permission-denied') || s.contains('PERMISSION_DENIED')) {
-    return true;
-  }
-  if (s.contains('Timestamp') && s.contains('is not a subtype of type')) {
-    return true;
-  }
-  return false;
-}
-
 Future<void> _initDeferredServices() async {
-  await Future<void>.delayed(const Duration(seconds: 3));
+  try {
+    await initializeSupabase().timeout(const Duration(seconds: 8));
+  } on TimeoutException {
+    // Optional backend — never block UI.
+  } catch (_) {}
 
   if (isSupabaseClientReady) {
     unawaited(
@@ -67,45 +49,22 @@ Future<void> _initDeferredServices() async {
 Future<void> _bootstrap() async {
   WidgetsFlutterBinding.ensureInitialized();
   configureQuietConsole();
-
-  FlutterError.onError = (FlutterErrorDetails details) {
-    if (_isBenignFirestoreRuntimeError(details.exception)) return;
-    if (kShowFrameworkErrors) FlutterError.presentError(details);
-  };
-  PlatformDispatcher.instance.onError = (Object error, StackTrace stack) {
-    if (_isBenignFirestoreRuntimeError(error)) return true;
-    if (kShowFrameworkErrors) {
-      FlutterError.presentError(
-        FlutterErrorDetails(exception: error, stack: stack),
-      );
-    }
-    return false;
-  };
-
-  try {
-    await Firebase.initializeApp(
-      options: DefaultFirebaseOptions.currentPlatform,
-    );
-
-    try {
-      FirebaseFirestore.instance.settings = Settings(
-        persistenceEnabled: !kIsWeb,
-        cacheSizeBytes: 40 * 1024 * 1024,
-      );
-    } catch (_) {}
-  } catch (_) {}
-
-  try {
-    await initializeSupabase();
-  } catch (_) {}
-
+  installQuietErrorHandlers();
   Get.config(enableLog: false);
+
+  // Firebase must be ready before runApp — LoginPage/AuthService use it on first frame.
+  await initializeFirebaseInBackground();
+
   runApp(const LawConnectApp());
   unawaited(_initDeferredServices());
+  if (kIsWeb) {
+    unawaited(DeferredClientDashboard.prefetch());
+    unawaited(DeferredClientNotificationsScreen.prefetch());
+  }
 }
 
 Future<void> main() async {
-  await runQuiet(_bootstrap);
+  await runQuietApp(_bootstrap);
 }
 
 class LawConnectApp extends StatelessWidget {
@@ -122,8 +81,8 @@ class LawConnectApp extends StatelessWidget {
           ? null
           : (text, {bool isError = false}) {},
       initialBinding: BindingsBuilder(() {
-        Get.put(AuthController(), permanent: true);
-        Get.put(SupabaseService.instance, permanent: true);
+        Get.lazyPut<AuthController>(() => AuthController(), fenix: true);
+        Get.lazyPut<SupabaseService>(() => SupabaseService.instance, fenix: true);
       }),
       getPages: [
         GetPage(name: '/', page: () => const ClientLandingPage()),
@@ -149,22 +108,32 @@ class LawConnectApp extends StatelessWidget {
           name: '/OtpVerification',
           page: () => const OtpVerificationPage(),
         ),
-        GetPage(name: '/AdminDashboard', page: () => const AdminDashboard()),
+        GetPage(
+          name: '/AdminDashboard',
+          page: () => const DeferredAdminDashboard(),
+        ),
         GetPage(
           name: '/AttorneyDashboard',
-          page: () => const AttorneyDashboard(),
+          page: () => const DeferredAttorneyDashboard(),
         ),
-        GetPage(name: '/StaffDashboard', page: () => const StaffDashboard()),
+        GetPage(
+          name: '/StaffDashboard',
+          page: () => const DeferredStaffDashboard(),
+        ),
         GetPage(
           name: '/ClientDashboard',
-          page: () => const DashboardScreenWithNav(),
+          page: () => const DeferredClientDashboard(),
+        ),
+        GetPage(
+          name: '/ClientNotifications',
+          page: () => const DeferredClientNotificationsScreen(),
         ),
       ],
       unknownRoute: GetPage(
         name: '/notfound',
         page: () => const ClientLandingPage(),
       ),
-      initialRoute: '/',
+      initialRoute: kIsWeb ? '/' : '/LoginPage',
     );
   }
 }

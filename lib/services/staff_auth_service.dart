@@ -7,6 +7,7 @@ import '../models/user_model.dart';
 import 'email_otp_service.dart';
 import 'sms_service.dart';
 import 'staff_application_service.dart';
+import 'firestore_mirror_helper.dart';
 
 /// Service to handle staff authentication and data retrieval
 /// Staff are stored in 'users' collection with role='staff'
@@ -116,17 +117,25 @@ class StaffAuthService {
       final name = (app['name'] as String? ?? 'Staff').trim();
 
       final otp = EmailOtpService.generateOtp();
-      await _firestore
-          .collection('email_verification_otps')
-          .doc(trimmedEmail)
-          .set({
+      final otpData = <String, dynamic>{
         'email': trimmedEmail,
         'otp': otp,
         'expiresAt': FieldValue.serverTimestamp(),
         'createdAt': FieldValue.serverTimestamp(),
         'used': false,
         'purpose': _staffRegOtpPurpose,
-      });
+      };
+      final result = await HybridDatastore.set(
+        collection: 'email_verification_otps',
+        id: trimmedEmail,
+        data: otpData,
+      );
+      if (!result.isSuccess) {
+        return {
+          'success': false,
+          'message': 'Failed to store verification code.',
+        };
+      }
 
       final emailOtpService = EmailOtpService();
       final sent = await emailOtpService.sendOtp(
@@ -266,7 +275,14 @@ class StaffAuthService {
       if (address != null) updateData['address'] = address;
       if (photoUrl != null) updateData['photoUrl'] = photoUrl;
 
-      await _firestore.collection('users').doc(staffId).update(updateData);
+      final result = await HybridDatastore.update(
+        collection: 'users',
+        id: staffId,
+        patch: updateData,
+      );
+      if (!result.isSuccess) {
+        return {'success': false, 'message': result.failureMessage};
+      }
 
       return {'success': true, 'message': 'Profile updated successfully'};
     } catch (e) {
@@ -318,7 +334,7 @@ class StaffAuthService {
 
       // Create staff document in Firestore (in users collection with role='staff')
       // Same structure as attorney creation - no OTP, direct creation
-      await _firestore.collection('users').doc(staffId).set({
+      final staffData = <String, dynamic>{
         'email': email,
         'name': name,
         'role': 'staff',
@@ -330,7 +346,15 @@ class StaffAuthService {
         if (phone != null) 'phone': phone,
         if (phone != null) 'phoneNumber': phone,
         if (address != null) 'address': address,
-      });
+      };
+      final result = await HybridDatastore.set(
+        collection: 'users',
+        id: staffId,
+        data: staffData,
+      );
+      if (!result.isSuccess) {
+        return {'success': false, 'message': result.failureMessage};
+      }
 
       // No password reset email - password is already set (like attorney creation)
       // Staff can login directly with the provided password
@@ -414,7 +438,7 @@ class StaffAuthService {
       // Application already approved → staff can sign in after OTP. Pending → active only after admin approves.
       final canUseAppNow = !awaitingAppApproval;
 
-      await _firestore.collection('users').doc(staffId).set({
+      final regStaffData = <String, dynamic>{
         'email': trimmedEmail,
         'name': name.isEmpty ? 'Staff' : name,
         'role': 'staff',
@@ -428,7 +452,15 @@ class StaffAuthService {
         if (phone != null && phone.trim().isNotEmpty) 'phone': phone.trim(),
         if (phone != null && phone.trim().isNotEmpty) 'phoneNumber': phone.trim(),
         if (address != null && address.trim().isNotEmpty) 'address': address.trim(),
-      });
+      };
+      final result = await HybridDatastore.set(
+        collection: 'users',
+        id: staffId,
+        data: regStaffData,
+      );
+      if (!result.isSuccess) {
+        return {'success': false, 'message': result.failureMessage};
+      }
 
       if (appStatus == 'approved') {
         await _firestore
@@ -453,13 +485,16 @@ class StaffAuthService {
       }
 
       try {
-        await _firestore
-            .collection('email_verification_otps')
-            .doc(trimmedEmail)
-            .update({
+        final otpUsedPatch = <String, dynamic>{
           'used': true,
           'verifiedAt': FieldValue.serverTimestamp(),
-        });
+        };
+        final otpResult = await HybridDatastore.update(
+          collection: 'email_verification_otps',
+          id: trimmedEmail,
+          patch: otpUsedPatch,
+        );
+        if (!otpResult.isSuccess) throw Exception(otpResult.failureMessage);
       } catch (e) {
         if (kDebugMode) {
           debugPrint('Could not mark staff reg OTP used: $e');

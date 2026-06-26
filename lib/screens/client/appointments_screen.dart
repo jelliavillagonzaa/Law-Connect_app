@@ -1,9 +1,9 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/empty_state.dart';
 import '../../models/appointment_model.dart';
-import '../../services/enhanced_appointment_service.dart';
 import '../../services/auth_service.dart';
 
 class AppointmentsScreen extends StatefulWidget {
@@ -15,22 +15,62 @@ class AppointmentsScreen extends StatefulWidget {
 
 class _AppointmentsScreenState extends State<AppointmentsScreen>
     with SingleTickerProviderStateMixin {
-  final EnhancedAppointmentService _appointmentService =
-      EnhancedAppointmentService();
   final AuthService _authService = AuthService();
 
   late TabController _tabController;
+  List<AppointmentModel> _allAppointments = const [];
+  bool _loading = true;
+  String? _error;
 
   @override
   void initState() {
     super.initState();
     _tabController = TabController(length: 2, vsync: this);
-    // Ensure UI rebuilds when user switches tabs so filtering updates
     _tabController.addListener(() {
-      if (mounted) {
-        setState(() {});
-      }
+      if (mounted) setState(() {});
     });
+    _loadAppointments();
+  }
+
+  Future<void> _loadAppointments() async {
+    final user = _authService.currentUser;
+    if (user == null) {
+      if (mounted) setState(() => _loading = false);
+      return;
+    }
+
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      final snapshot = await FirebaseFirestore.instance
+          .collection('appointments')
+          .where('clientId', isEqualTo: user.uid)
+          .limit(80)
+          .get()
+          .timeout(const Duration(seconds: 12));
+
+      final list = snapshot.docs
+          .map((doc) => AppointmentModel.fromFirestore(doc))
+          .toList()
+        ..sort(
+          (a, b) => a.appointmentDateTime.compareTo(b.appointmentDateTime),
+        );
+
+      if (!mounted) return;
+      setState(() {
+        _allAppointments = list;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _loading = false;
+      });
+    }
   }
 
   @override
@@ -110,61 +150,61 @@ class _AppointmentsScreenState extends State<AppointmentsScreen>
           ],
         ),
       ),
-      body: StreamBuilder<List<AppointmentModel>>(
-        stream: _appointmentService.getClientAppointments(user.uid),
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
-          }
+      body: _buildBody(user.uid, isWeb),
+    );
+  }
 
-          if (snapshot.hasError) {
-            return Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(
-                    Icons.error_outline,
-                    size: 64,
-                    color: AppTheme.error,
-                  ),
-                  const SizedBox(height: 16),
-                  const Text(
-                    'Error loading appointments',
-                    style: TextStyle(fontSize: 16),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    snapshot.error.toString(),
-                    style: AppTheme.bodySmall,
-                    textAlign: TextAlign.center,
-                  ),
-                ],
-              ),
-            );
-          }
+  Widget _buildBody(String userId, bool isWeb) {
+    if (_loading && _allAppointments.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
 
-          final allAppointments = snapshot.data ?? [];
-          final filteredAppointments = _filterAppointments(
-            allAppointments,
-            _tabController.index,
-          );
+    if (_error != null && _allAppointments.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.error_outline, size: 64, color: AppTheme.error),
+              const SizedBox(height: 16),
+              const Text('Error loading appointments', style: TextStyle(fontSize: 16)),
+              const SizedBox(height: 8),
+              Text(_error!, style: AppTheme.bodySmall, textAlign: TextAlign.center),
+              const SizedBox(height: 16),
+              FilledButton(onPressed: _loadAppointments, child: const Text('Retry')),
+            ],
+          ),
+        ),
+      );
+    }
 
-          if (filteredAppointments.isEmpty) {
-            return _buildEmptyState(_tabController.index);
-          }
+    final filteredAppointments = _filterAppointments(
+      _allAppointments,
+      _tabController.index,
+    );
 
-          return RefreshIndicator(
-            onRefresh: () async {
-              // StreamBuilder automatically updates when Firestore data changes
-            },
-            child: ListView.builder(
-              padding: EdgeInsets.all(isWeb ? 24 : 16),
-              itemCount: filteredAppointments.length,
-              itemBuilder: (context, index) {
-                return _buildAppointmentCard(filteredAppointments[index]);
-              },
-            ),
-          );
+    if (filteredAppointments.isEmpty) {
+      return RefreshIndicator(
+        onRefresh: _loadAppointments,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          children: [
+            SizedBox(height: MediaQuery.sizeOf(context).height * 0.15),
+            _buildEmptyState(_tabController.index),
+          ],
+        ),
+      );
+    }
+
+    return RefreshIndicator(
+      onRefresh: _loadAppointments,
+      child: ListView.builder(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: EdgeInsets.all(isWeb ? 24 : 16),
+        itemCount: filteredAppointments.length,
+        itemBuilder: (context, index) {
+          return _buildAppointmentCard(filteredAppointments[index]);
         },
       ),
     );

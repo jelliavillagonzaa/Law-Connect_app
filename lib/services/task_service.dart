@@ -6,6 +6,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, kIsWeb;
 import 'package:file_picker/file_picker.dart';
 import '../models/task_model.dart';
+import 'firestore_mirror_helper.dart';
 import 'local_attachment_service.dart';
 
 class TaskService {
@@ -49,12 +50,15 @@ class TaskService {
       if (dueDate != null) taskData['dueDate'] = Timestamp.fromDate(dueDate);
       if (priority != null) taskData['priority'] = priority;
 
-      final docRef = await _firestore.collection('tasks').add(taskData);
+      final result = await HybridDatastore.add(collection: 'tasks', data: taskData);
+      if (!result.isSuccess) {
+        return {'success': false, 'message': result.failureMessage};
+      }
 
       return {
         'success': true,
         'message': 'Task created successfully',
-        'taskId': docRef.id,
+        'taskId': result.id,
       };
     } catch (e) {
       return {
@@ -126,7 +130,14 @@ class TaskService {
         updateData['dueDate'] = null;
       }
 
-      await _firestore.collection('tasks').doc(taskId).update(updateData);
+      final result = await HybridDatastore.update(
+        collection: 'tasks',
+        id: taskId,
+        patch: updateData,
+      );
+      if (!result.isSuccess) {
+        return {'success': false, 'message': result.failureMessage};
+      }
 
       return {
         'success': true,
@@ -160,7 +171,14 @@ class TaskService {
         updateData['notes'] = notes;
       }
 
-      await _firestore.collection('tasks').doc(taskId).update(updateData);
+      final result = await HybridDatastore.update(
+        collection: 'tasks',
+        id: taskId,
+        patch: updateData,
+      );
+      if (!result.isSuccess) {
+        return {'success': false, 'message': result.failureMessage};
+      }
 
       // If task is completed, create a notification for the attorney
       if (status == 'completed') {
@@ -175,16 +193,19 @@ class TaskService {
             final taskTitle = taskData['title'] as String? ?? 'Task';
 
             if (attorneyId != null) {
-              // Create notification for attorney
-              await _firestore.collection('notifications').add({
+              final notifData = <String, dynamic>{
                 'userId': attorneyId,
                 'type': 'task_completed',
                 'title': 'Task Completed',
                 'message': 'Task "$taskTitle" has been completed by staff',
                 'taskId': taskId,
-                'read': false,
+                'isRead': false,
                 'createdAt': FieldValue.serverTimestamp(),
-              });
+              };
+              await HybridDatastore.add(
+                collection: 'notifications',
+                data: notifData,
+              );
             }
           }
         } catch (e) {
@@ -210,10 +231,17 @@ class TaskService {
     int priority,
   ) async {
     try {
-      await _firestore.collection('tasks').doc(taskId).update({
-        'priority': priority,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+      final result = await HybridDatastore.update(
+        collection: 'tasks',
+        id: taskId,
+        patch: {
+          'priority': priority,
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      );
+      if (!result.isSuccess) {
+        return {'success': false, 'message': result.failureMessage};
+      }
 
       return {'success': true, 'message': 'Task priority updated'};
     } catch (e) {
@@ -370,10 +398,17 @@ class TaskService {
       currentAttachments.add(firestoreRef);
 
       // Update task with new attachment reference
-      await _firestore.collection('tasks').doc(taskId).update({
-        'attachments': currentAttachments,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+      final attachResult = await HybridDatastore.update(
+        collection: 'tasks',
+        id: taskId,
+        patch: {
+          'attachments': currentAttachments,
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      );
+      if (!attachResult.isSuccess) {
+        return {'success': false, 'message': attachResult.failureMessage};
+      }
 
       if (kDebugMode) {
         print('✅ File saved to Firestore: $firestoreRef');
@@ -437,10 +472,17 @@ class TaskService {
       }
 
       // Update task
-      await _firestore.collection('tasks').doc(taskId).update({
-        'attachments': currentAttachments,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+      final result = await HybridDatastore.update(
+        collection: 'tasks',
+        id: taskId,
+        patch: {
+          'attachments': currentAttachments,
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      );
+      if (!result.isSuccess) {
+        return {'success': false, 'message': result.failureMessage};
+      }
 
       return {'success': true, 'message': 'Attachment removed successfully'};
     } catch (e) {

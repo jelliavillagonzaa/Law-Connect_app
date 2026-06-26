@@ -75,6 +75,7 @@ class _ConversationsListScreenState extends State<ConversationsListScreen> {
           }
 
           return ListView.builder(
+            physics: const AlwaysScrollableScrollPhysics(),
             itemCount: conversations.length,
             itemBuilder: (context, index) {
               final conversation = conversations[index];

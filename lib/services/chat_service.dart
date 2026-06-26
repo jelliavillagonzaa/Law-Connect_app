@@ -5,6 +5,7 @@ import 'dart:io';
 import 'dart:async';
 import '../models/message_model.dart';
 import 'notification_service.dart';
+import 'firestore_mirror_helper.dart';
 
 class ChatService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -46,8 +47,11 @@ class ChatService {
         'updatedAt': FieldValue.serverTimestamp(),
       };
 
-      final chatRef = await _firestore.collection('messages').add(chatData);
-      return chatRef.id;
+      final result = await HybridDatastore.addChat(data: chatData);
+      if (!result.isSuccess || result.id == null) {
+        throw Exception(result.failureMessage);
+      }
+      return result.id!;
     } catch (e) {
       throw Exception('Failed to get or create chat with staff: $e');
     }
@@ -219,7 +223,8 @@ class ChatService {
       if (attorneyId != null) {
         // For attorney-client chats: set attorneyId only if there's NO staff
         // For staff-attorney chats: set attorneyId only if there's NO client
-        if ((clientId != null && staffId == null) || (clientId == null && staffId != null)) {
+        if ((clientId != null && staffId == null) ||
+            (clientId == null && staffId != null)) {
           chatData['attorneyId'] = attorneyId;
         }
       }
@@ -227,9 +232,12 @@ class ChatService {
         chatData['staffId'] = staffId;
       }
 
-      final chatRef = await _firestore.collection('messages').add(chatData);
+      final result = await HybridDatastore.addChat(data: chatData);
+      if (!result.isSuccess || result.id == null) {
+        throw Exception(result.failureMessage);
+      }
 
-      return chatRef.id;
+      return result.id!;
     } catch (e) {
       throw Exception('Failed to get or create chat: $e');
     }
@@ -258,24 +266,29 @@ class ChatService {
       }
 
       // Add message to subcollection
-      await _firestore
-          .collection('messages')
-          .doc(chatId)
-          .collection('messages')
-          .add({
-            'chatId': chatId,
-            'senderId': senderId,
-            'text': text,
-            'timestamp': FieldValue.serverTimestamp(),
-            'isSeen': false,
-            if (finalSenderRole != null) 'senderRole': finalSenderRole,
-          });
+      final msgData = <String, dynamic>{
+        'chatId': chatId,
+        'senderId': senderId,
+        'text': text,
+        'timestamp': FieldValue.serverTimestamp(),
+        'isSeen': false,
+        if (finalSenderRole != null) 'senderRole': finalSenderRole,
+      };
+      final msgResult = await HybridDatastore.addChatMessage(
+        chatId: chatId,
+        data: msgData,
+      );
+      if (!msgResult.isSuccess) throw Exception(msgResult.failureMessage);
 
       // Update chat last message
-      await _firestore.collection('messages').doc(chatId).update({
-        'lastMessage': text,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+      final chatResult = await HybridDatastore.updateChat(
+        id: chatId,
+        patch: {
+          'lastMessage': text,
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      );
+      if (!chatResult.isSuccess) throw Exception(chatResult.failureMessage);
     } catch (e) {
       throw Exception('Failed to send message: $e');
     }
@@ -292,33 +305,40 @@ class ChatService {
       // Upload file to Firebase Storage
       final fileName = file.path.split('/').last;
       final timestamp = DateTime.now().millisecondsSinceEpoch;
-      final ref = _storage
-          .ref()
-          .child('chat_attachments/$chatId/${timestamp}_$fileName');
+      final ref = _storage.ref().child(
+        'chat_attachments/$chatId/${timestamp}_$fileName',
+      );
 
       final uploadTask = ref.putFile(file);
       final snapshot = await uploadTask;
       final downloadUrl = await snapshot.ref.getDownloadURL();
 
       // Add message with attachment
-      await _firestore
-          .collection('messages')
-          .doc(chatId)
-          .collection('messages')
-          .add({
-            'chatId': chatId,
-            'senderId': senderId,
-            'text': text,
-            'attachmentUrl': downloadUrl,
-            'timestamp': FieldValue.serverTimestamp(),
-            'isSeen': false,
-          });
+      final msgData = <String, dynamic>{
+        'chatId': chatId,
+        'senderId': senderId,
+        'text': text,
+        'attachmentUrl': downloadUrl,
+        'timestamp': FieldValue.serverTimestamp(),
+        'isSeen': false,
+      };
+      final msgResult = await HybridDatastore.addChatMessage(
+        chatId: chatId,
+        data: msgData,
+      );
+      if (!msgResult.isSuccess) throw Exception(msgResult.failureMessage);
+
+      final lastMessage = text.isEmpty ? 'Attachment' : text;
 
       // Update chat last message
-      await _firestore.collection('messages').doc(chatId).update({
-        'lastMessage': text.isEmpty ? 'Attachment' : text,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+      final chatResult = await HybridDatastore.updateChat(
+        id: chatId,
+        patch: {
+          'lastMessage': lastMessage,
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      );
+      if (!chatResult.isSuccess) throw Exception(chatResult.failureMessage);
     } catch (e) {
       throw Exception('Failed to send message with attachment: $e');
     }
@@ -455,25 +475,29 @@ class ChatService {
           .where('isSeen', isEqualTo: false)
           .get();
 
-      final batch = _firestore.batch();
-      int updateCount = 0;
+      final toMark = <Future<HybridWriteResult>>[];
 
       for (var doc in messagesSnapshot.docs) {
         final data = doc.data();
-        // Only update messages from other users
         if (data['senderId'] != null && data['senderId'] != userId) {
-          batch.update(doc.reference, {'isSeen': true});
-          updateCount++;
+          toMark.add(
+            HybridDatastore.updateChatMessage(
+              chatId: chatId,
+              id: doc.id,
+              patch: {'isSeen': true},
+            ),
+          );
         }
       }
 
-      if (updateCount > 0) {
-        await batch.commit();
+      if (toMark.isNotEmpty) {
+        await Future.wait(toMark);
         // Update parent conversation to trigger listeners
         try {
-          await _firestore.collection('messages').doc(chatId).update({
-            'updatedAt': FieldValue.serverTimestamp(),
-          });
+          await HybridDatastore.updateChat(
+            id: chatId,
+            patch: {'updatedAt': FieldValue.serverTimestamp()},
+          );
         } catch (e) {
           // Ignore errors updating parent - messages are already marked as seen
           print('Warning: Failed to update parent conversation: $e');
@@ -481,28 +505,28 @@ class ChatService {
       }
     } catch (e) {
       throw Exception('Failed to mark messages as seen: $e');
+      }
     }
-  }
 
-  // Get unread message count for a user
-  Future<int> getUnreadCount(String userId) async {
+  // Get unread message count for a user (capped to avoid ANR on large inboxes).
+  Future<int> getUnreadCount(String userId, {int maxChats = 25}) async {
     try {
       final chats = await _firestore
           .collection('messages')
           .where('participants', arrayContains: userId)
+          .limit(maxChats)
           .get();
 
       int totalUnread = 0;
       for (var chatDoc in chats.docs) {
-        // Get all unread messages (filter in memory to avoid index requirement)
         final unreadMessages = await _firestore
             .collection('messages')
             .doc(chatDoc.id)
             .collection('messages')
             .where('isSeen', isEqualTo: false)
+            .limit(40)
             .get();
 
-        // Count only messages from other users
         for (var msgDoc in unreadMessages.docs) {
           final data = msgDoc.data();
           if (data['senderId'] != userId) {
@@ -547,9 +571,11 @@ class ChatService {
 
       if (!deletedFor.contains(userId)) {
         deletedFor.add(userId);
-        await _firestore.collection('messages').doc(conversationId).update({
-          'deletedFor': deletedFor,
-        });
+        final result = await HybridDatastore.updateChat(
+          id: conversationId,
+          patch: {'deletedFor': deletedFor},
+        );
+        if (!result.isSuccess) throw Exception(result.failureMessage);
       }
 
       return true;
@@ -851,7 +877,12 @@ class ChatService {
       }
       // If they had it, we already removed it above - so reaction is now removed (toggle off)
 
-      await messageRef.update({'reactions': reactions});
+      final result = await HybridDatastore.updateChatMessage(
+        chatId: chatId,
+        id: messageId,
+        patch: {'reactions': reactions},
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
     } catch (e) {
       throw Exception('Failed to toggle reaction: $e');
     }
@@ -881,9 +912,11 @@ class ChatService {
         return false;
       }
 
-      await messageRef.delete();
-
-      // Update chat last message if this was the last message
+      final deleteResult = await HybridDatastore.deleteChatMessage(
+        chatId: chatId,
+        id: messageId,
+      );
+      if (!deleteResult.isSuccess) return false;
       final messagesSnapshot = await _firestore
           .collection('messages')
           .doc(chatId)
@@ -898,10 +931,14 @@ class ChatService {
         newLastMessage = lastMsg['text'] ?? 'Attachment';
       }
 
-      await _firestore.collection('messages').doc(chatId).update({
-        'lastMessage': newLastMessage,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+      final chatResult = await HybridDatastore.updateChat(
+        id: chatId,
+        patch: {
+          'lastMessage': newLastMessage,
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      );
+      if (!chatResult.isSuccess) return false;
 
       return true;
     } catch (e) {

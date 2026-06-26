@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart'
     show kDebugMode, debugPrint, kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:firebase_auth/firebase_auth.dart';
 import 'notification_service.dart';
+import 'firestore_mirror_helper.dart';
 import 'web_notification.dart';
 
 /// FCM Service for sending push notifications
@@ -333,10 +334,16 @@ class FCMService {
   Future<void> _saveTokenToFirestore(String token, [String? userId]) async {
     try {
       if (userId != null) {
-        await _firestore.collection('users').doc(userId).update({
+        final patch = <String, dynamic>{
           'fcmToken': token,
           'fcmTokenUpdatedAt': FieldValue.serverTimestamp(),
-        });
+        };
+        final result = await HybridDatastore.update(
+          collection: 'users',
+          id: userId,
+          patch: patch,
+        );
+        if (!result.isSuccess) throw Exception(result.failureMessage);
         if (kDebugMode) {
           debugPrint('✅ FCM token saved to Firestore for user: $userId');
         }
@@ -390,14 +397,19 @@ class FCMService {
       }
 
       // Store notification request in Firestore (Cloud Function will send it)
-      await _firestore.collection('notification_requests').add({
+      final reqData = <String, dynamic>{
         'fcmToken': fcmToken,
         'title': title,
         'body': body,
         'data': data ?? {},
         'createdAt': FieldValue.serverTimestamp(),
         'status': 'pending',
-      });
+      };
+      final result = await HybridDatastore.add(
+        collection: 'notification_requests',
+        data: reqData,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       if (kDebugMode) {
         debugPrint('✅ Notification request queued in Firestore');
@@ -457,7 +469,7 @@ class FCMService {
       // This is a simplified version - in production, use Cloud Functions
 
       // Option 1: Store notification request in Firestore (Cloud Function will send it)
-      await _firestore.collection('notification_requests').add({
+      final reqData = <String, dynamic>{
         'userId': userId,
         'fcmToken': fcmToken,
         'title': title,
@@ -465,7 +477,12 @@ class FCMService {
         'data': data ?? {},
         'createdAt': FieldValue.serverTimestamp(),
         'status': 'pending',
-      });
+      };
+      final result = await HybridDatastore.add(
+        collection: 'notification_requests',
+        data: reqData,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       if (kDebugMode) {
         debugPrint('✅ Notification request queued in Firestore');
@@ -606,16 +623,17 @@ class FCMService {
         }
       }
 
-      await _firestore.collection('notifications').add({
+      final notifData = <String, dynamic>{
         'userId': userId,
-        'clientId': userId, // For client notifications
+        'clientId': userId,
         'title': message.notification?.title ?? 'Notification',
         'message': message.notification?.body ?? '',
         'type': message.data['type'] ?? 'general',
         'data': message.data,
         'isRead': false,
         'createdAt': FieldValue.serverTimestamp(),
-      });
+      };
+      await HybridDatastore.add(collection: 'notifications', data: notifData);
 
       if (kDebugMode) {
         debugPrint('✅ Notification saved to Firestore for user: $userId');

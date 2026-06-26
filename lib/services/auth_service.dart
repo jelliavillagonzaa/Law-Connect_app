@@ -10,6 +10,7 @@ import 'fcm_service.dart';
 import 'admin_service.dart';
 import 'sms_service.dart';
 import 'staff_application_service.dart';
+import 'firestore_mirror_helper.dart';
 
 class AuthService {
   final FirebaseAuth _auth = FirebaseAuth.instance;
@@ -61,11 +62,17 @@ class AuthService {
     if (!['admin', 'attorney', 'staff'].contains(resolved)) return;
 
     try {
-      await _firestore.collection('users').doc(uid).update({
+      final patch = <String, dynamic>{
         'role': resolved,
         'isVerified': true,
         'updatedAt': FieldValue.serverTimestamp(),
-      });
+      };
+      final result = await FirestoreMirror.patch(
+        collection: 'users',
+        id: uid,
+        patch: patch,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
       if (kDebugMode) {
         debugPrint('✅ Repaired users/$uid role: $stored → $resolved');
       }
@@ -79,10 +86,16 @@ class AuthService {
       await user.reload();
       final reloaded = _auth.currentUser;
       if (reloaded != null && reloaded.emailVerified && !wasVerified) {
-        await _firestore.collection('users').doc(reloaded.uid).update({
+        final patch = <String, dynamic>{
           'isVerified': true,
           'updatedAt': FieldValue.serverTimestamp(),
-        });
+        };
+        final result = await FirestoreMirror.patch(
+          collection: 'users',
+          id: reloaded.uid,
+          patch: patch,
+        );
+        if (!result.isSuccess) throw Exception(result.failureMessage);
       }
     } catch (e) {
       if (kDebugMode) debugPrint('⚠️ Verification sync skipped: $e');
@@ -219,7 +232,12 @@ class AuthService {
           if (attorneyMismatch) {
             update['assignedAttorneyId'] = attorneyId;
           }
-          await _firestore.collection('users').doc(uid).update(update);
+          final result = await FirestoreMirror.patch(
+            collection: 'users',
+            id: uid,
+            patch: update,
+          );
+          if (!result.isSuccess) throw Exception(result.failureMessage);
           if (kDebugMode && needsActivation) {
             debugPrint(
               '✅ Activated staff user from approved application: $emailNorm',
@@ -245,7 +263,12 @@ class AuthService {
       };
       if (attorneyId.isNotEmpty) patch['assignedAttorneyId'] = attorneyId;
 
-      await _firestore.collection('users').doc(uid).update(patch);
+      final result = await FirestoreMirror.patch(
+        collection: 'users',
+        id: uid,
+        patch: patch,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       if (kDebugMode) {
         debugPrint(
@@ -449,25 +472,32 @@ class AuthService {
         // Continue without FCM token - email will still be sent
       }
 
-      await _retryFirestoreOperation(
-        () => _firestore.collection('pending_signups').doc(email).set({
+      final pendingSignupData = <String, dynamic>{
           'firstName': firstName.trim(),
           'middleName': middleName.trim(),
           'lastName': lastName.trim(),
           'email': email,
-          // Keep password only to support legacy flows; user is already created in Firebase Auth.
-          // Avoid using this for anything else.
           'password': password,
           'phoneNumber': phoneNumber,
           'address': address,
           'role': 'client',
           'userId': userId,
           'otp': otp,
-          'fcmToken': fcmToken, // Store FCM token for push notifications
+          'fcmToken': fcmToken,
           'expiresAt': FieldValue.serverTimestamp(),
           'createdAt': FieldValue.serverTimestamp(),
           'verified': false,
-        }),
+        };
+      await _retryFirestoreOperation(
+        () async {
+          final result = await FirestoreMirror.doc(
+            collection: 'pending_signups',
+            id: email,
+            data: pendingSignupData,
+          );
+          if (!result.isSuccess) throw Exception(result.failureMessage);
+          return result;
+        },
         operationName: 'Store pending signup',
       );
 
@@ -524,12 +554,21 @@ class AuthService {
           ? name!.trim()
           : UserModel.resolveDisplayName(data);
 
+      final channelPatch = <String, dynamic>{
+        'otpDeliveryChannel': channel,
+        'expiresAt': FieldValue.serverTimestamp(),
+        'verified': false,
+      };
       await _retryFirestoreOperation(
-        () => _firestore.collection('pending_signups').doc(docEmail).update({
-          'otpDeliveryChannel': channel,
-          'expiresAt': FieldValue.serverTimestamp(),
-          'verified': false,
-        }),
+        () async {
+          final result = await FirestoreMirror.patch(
+            collection: 'pending_signups',
+            id: docEmail,
+            patch: channelPatch,
+          );
+          if (!result.isSuccess) throw Exception(result.failureMessage);
+          return result;
+        },
         operationName: 'Update OTP delivery channel',
       );
 
@@ -780,8 +819,7 @@ class AuthService {
             .toList();
       }
 
-      await _retryFirestoreOperation(
-        () => _firestore.collection('pending_signups').doc(email).set({
+      final attorneyPendingData = <String, dynamic>{
           'fullName': fullName,
           'name': fullName, // For compatibility
           'email': email,
@@ -801,7 +839,17 @@ class AuthService {
           'createdAt': FieldValue.serverTimestamp(),
           'verified': false,
           'pendingApproval': true, // Attorney needs admin approval
-        }),
+        };
+      await _retryFirestoreOperation(
+        () async {
+          final result = await FirestoreMirror.doc(
+            collection: 'pending_signups',
+            id: email,
+            data: attorneyPendingData,
+          );
+          if (!result.isSuccess) throw Exception(result.failureMessage);
+          return result;
+        },
         operationName: 'Store pending attorney signup',
       );
 
@@ -981,8 +1029,7 @@ class AuthService {
       }
 
       // Save user to Firestore with isVerified: true (since OTP was verified)
-      await _retryFirestoreOperation(
-        () => _firestore.collection('users').doc(userId).set({
+      final userData = <String, dynamic>{
           'firstName': firstName,
           'middleName': middleName,
           'lastName': lastName,
@@ -991,11 +1038,21 @@ class AuthService {
           'phoneNumber': phoneNumber,
           'address': address,
           'role': 'client',
-          'isVerified': true, // Email verified via OTP
-          'fcmToken': fcmToken, // Save FCM token
+          'isVerified': true,
+          'fcmToken': fcmToken,
           'fcmTokenUpdatedAt': FieldValue.serverTimestamp(),
           'createdAt': FieldValue.serverTimestamp(),
-        }),
+        };
+      await _retryFirestoreOperation(
+        () async {
+          final result = await FirestoreMirror.doc(
+            collection: 'users',
+            id: userId,
+            data: userData,
+          );
+          if (!result.isSuccess) throw Exception(result.failureMessage);
+          return result;
+        },
         operationName: 'Save user to Firestore',
       );
 
@@ -1019,11 +1076,20 @@ class AuthService {
       }
 
       // Mark pending signup as verified
+      final verifiedPatch = <String, dynamic>{
+        'verified': true,
+        'verifiedAt': FieldValue.serverTimestamp(),
+      };
       await _retryFirestoreOperation(
-        () => _firestore.collection('pending_signups').doc(email).update({
-          'verified': true,
-          'verifiedAt': FieldValue.serverTimestamp(),
-        }),
+        () async {
+          final result = await FirestoreMirror.patch(
+            collection: 'pending_signups',
+            id: email,
+            patch: verifiedPatch,
+          );
+          if (!result.isSuccess) throw Exception(result.failureMessage);
+          return result;
+        },
         operationName: 'Mark signup as verified',
       );
 
@@ -1140,9 +1206,6 @@ class AuthService {
         return {'success': false, 'message': 'Login failed'};
       }
 
-      // Wait a bit to ensure Firestore is ready
-      await Future.delayed(const Duration(milliseconds: 200));
-
       // Get user data from Firestore (fewer retries — long loops ANR the UI on mobile).
       DocumentSnapshot? userDoc;
       int retries = 2;
@@ -1220,10 +1283,11 @@ class AuthService {
             if (emailQuery.docs.isNotEmpty) {
               final doc = emailQuery.docs.first;
               // Update the document to use UID as document ID
-              await _firestore
-                  .collection('users')
-                  .doc(user.uid)
-                  .set(doc.data());
+              await FirestoreMirror.doc(
+                collection: 'users',
+                id: user.uid,
+                data: doc.data(),
+              );
               userDoc = await _firestore
                   .collection('users')
                   .doc(user.uid)
@@ -1270,16 +1334,25 @@ class AuthService {
 
           try {
             // Use retry logic for creating user document
+            final loginUserData = <String, dynamic>{
+              'email': email,
+              'name': email.split('@')[0],
+              'role': defaultRole,
+              'isVerified':
+                  defaultRole !=
+                  'client', // Admin/staff/attorney don't need verification
+              'createdAt': FieldValue.serverTimestamp(),
+            };
             await _retryFirestoreOperation(
-              () => _firestore.collection('users').doc(user.uid).set({
-                'email': email,
-                'name': email.split('@')[0],
-                'role': defaultRole,
-                'isVerified':
-                    defaultRole !=
-                    'client', // Admin/staff/attorney don't need verification
-                'createdAt': FieldValue.serverTimestamp(),
-              }),
+              () async {
+                final result = await FirestoreMirror.doc(
+                  collection: 'users',
+                  id: user.uid,
+                  data: loginUserData,
+                );
+                if (!result.isSuccess) throw Exception(result.failureMessage);
+                return result;
+              },
               operationName: 'Create user document',
               maxRetries: 5,
             );
@@ -1342,14 +1415,23 @@ class AuthService {
         }
 
         try {
+          final minimalUserData = <String, dynamic>{
+            'email': email,
+            'name': email.split('@')[0],
+            'role': defaultRole,
+            'isVerified': defaultRole != 'client',
+            'createdAt': FieldValue.serverTimestamp(),
+          };
           await _retryFirestoreOperation(
-            () => _firestore.collection('users').doc(user.uid).set({
-              'email': email,
-              'name': email.split('@')[0],
-              'role': defaultRole,
-              'isVerified': defaultRole != 'client',
-              'createdAt': FieldValue.serverTimestamp(),
-            }),
+            () async {
+              final result = await FirestoreMirror.doc(
+                collection: 'users',
+                id: user.uid,
+                data: minimalUserData,
+              );
+              if (!result.isSuccess) throw Exception(result.failureMessage);
+              return result;
+            },
             operationName: 'Create minimal user document',
             maxRetries: 3,
           );
@@ -1563,7 +1645,14 @@ class AuthService {
           break;
         default:
           final raw = e.message ?? '';
-          if (raw.toLowerCase().contains('api key')) {
+          if (raw.toLowerCase().contains('blocked') &&
+              raw.toLowerCase().contains('android client')) {
+            message =
+                'Android login is blocked: this PC\'s debug certificate is not '
+                'registered in Firebase. Run scripts\\fix_mobile_firebase.ps1 '
+                'from the project folder (use the Gmail that owns jurislink-app), '
+                'then uninstall the app and run flutter clean && flutter run.';
+          } else if (raw.toLowerCase().contains('api key')) {
             message =
                 'Firebase connection error. Ensure the app was rebuilt after the '
                 'latest update, then try again.';
@@ -1690,27 +1779,36 @@ class AuthService {
       }
 
       // Save attorney to Firestore with isVerified: true but isActive: false
+      final attorneyUserData = <String, dynamic>{
+        'fullName': fullName,
+        'name': fullName,
+        'email': email,
+        'phoneNumber': phoneNumber,
+        'address': address,
+        'role': 'attorney',
+        'isVerified': true, // Email verified via OTP
+        'isActive': false, // Needs admin approval
+        'isAvailable': true, // Default to available
+        'pendingApproval': true, // Needs admin approval
+        'specialization': specialization.map((s) => s.toString()).toList(),
+        'barNumber': barNumber,
+        'licenseState': licenseState,
+        'licenseDocumentUrl': licenseDocumentUrl,
+        'ratingAverage': 0.0,
+        'fcmToken': fcmToken,
+        'fcmTokenUpdatedAt': FieldValue.serverTimestamp(),
+        'createdAt': FieldValue.serverTimestamp(),
+      };
       await _retryFirestoreOperation(
-        () => _firestore.collection('users').doc(userId).set({
-          'fullName': fullName,
-          'name': fullName,
-          'email': email,
-          'phoneNumber': phoneNumber,
-          'address': address,
-          'role': 'attorney',
-          'isVerified': true, // Email verified via OTP
-          'isActive': false, // Needs admin approval
-          'isAvailable': true, // Default to available
-          'pendingApproval': true, // Needs admin approval
-          'specialization': specialization.map((s) => s.toString()).toList(),
-          'barNumber': barNumber,
-          'licenseState': licenseState,
-          'licenseDocumentUrl': licenseDocumentUrl,
-          'ratingAverage': 0.0,
-          'fcmToken': fcmToken,
-          'fcmTokenUpdatedAt': FieldValue.serverTimestamp(),
-          'createdAt': FieldValue.serverTimestamp(),
-        }),
+        () async {
+          final result = await FirestoreMirror.doc(
+            collection: 'users',
+            id: userId,
+            data: attorneyUserData,
+          );
+          if (!result.isSuccess) throw Exception(result.failureMessage);
+          return result;
+        },
         operationName: 'Save attorney to Firestore',
       );
 
@@ -1734,11 +1832,20 @@ class AuthService {
       }
 
       // Mark pending signup as verified
+      final attorneyVerifiedPatch = <String, dynamic>{
+        'verified': true,
+        'verifiedAt': FieldValue.serverTimestamp(),
+      };
       await _retryFirestoreOperation(
-        () => _firestore.collection('pending_signups').doc(email).update({
-          'verified': true,
-          'verifiedAt': FieldValue.serverTimestamp(),
-        }),
+        () async {
+          final result = await FirestoreMirror.patch(
+            collection: 'pending_signups',
+            id: email,
+            patch: attorneyVerifiedPatch,
+          );
+          if (!result.isSuccess) throw Exception(result.failureMessage);
+          return result;
+        },
         operationName: 'Mark attorney signup as verified',
       );
 
@@ -1814,7 +1921,7 @@ class AuthService {
           );
 
           // Also create a notification in Firestore
-          await _firestore.collection('notifications').add({
+          final notifData = <String, dynamic>{
             'userId': adminId,
             'title': 'New Attorney Signup',
             'message':
@@ -1827,7 +1934,11 @@ class AuthService {
             },
             'isRead': false,
             'createdAt': FieldValue.serverTimestamp(),
-          });
+          };
+          await FirestoreMirror.add(
+            collection: 'notifications',
+            data: notifData,
+          );
         } catch (e) {
           if (kDebugMode) {
             debugPrint('⚠️ Could not notify admin $adminId: $e');
@@ -1961,23 +2072,33 @@ class AuthService {
       final otp = EmailOtpService.generateOtp();
 
       if (pendingSignup.exists) {
-        await _firestore.collection('pending_signups').doc(docEmail).update({
+        final otpPatch = <String, dynamic>{
           'otp': otp,
           'expiresAt': FieldValue.serverTimestamp(),
           'verified': false,
           if (channel != null) 'otpDeliveryChannel': channel,
-        });
+        };
+        final result = await FirestoreMirror.patch(
+          collection: 'pending_signups',
+          id: docEmail,
+          patch: otpPatch,
+        );
+        if (!result.isSuccess) throw Exception(result.failureMessage);
       } else {
-        await _firestore
-            .collection('email_verification_otps')
-            .doc(docEmail)
-            .set({
-              'email': docEmail,
-              'otp': otp,
-              'expiresAt': FieldValue.serverTimestamp(),
-              'createdAt': FieldValue.serverTimestamp(),
-              'used': false,
-            }, SetOptions(merge: true));
+        final otpData = <String, dynamic>{
+          'email': docEmail,
+          'otp': otp,
+          'expiresAt': FieldValue.serverTimestamp(),
+          'createdAt': FieldValue.serverTimestamp(),
+          'used': false,
+        };
+        final result = await FirestoreMirror.set(
+          collection: 'email_verification_otps',
+          id: docEmail,
+          data: otpData,
+          options: SetOptions(merge: true),
+        );
+        if (!result.isSuccess) throw Exception(result.failureMessage);
       }
 
       final success = await emailOtpService.sendOtp(
@@ -2063,10 +2184,16 @@ class AuthService {
       }
 
       // Mark OTP as used
-      await _firestore.collection('email_verification_otps').doc(email).update({
+      final otpPatch = <String, dynamic>{
         'used': true,
         'verifiedAt': FieldValue.serverTimestamp(),
-      });
+      };
+      final result = await FirestoreMirror.patch(
+        collection: 'email_verification_otps',
+        id: email,
+        patch: otpPatch,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       return {'success': true, 'message': 'Email verified successfully!'};
     } catch (e) {

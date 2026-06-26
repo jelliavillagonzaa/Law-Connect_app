@@ -1,5 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../models/feedback_model.dart';
+import 'firestore_mirror_helper.dart';
 
 class FeedbackService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -90,9 +91,14 @@ class FeedbackService {
 
       final averageRating = totalRating / count;
 
-      await _firestore.collection('users').doc(attorneyId).update({
-        'ratingAverage': averageRating,
-      });
+      final result = await HybridDatastore.update(
+        collection: 'users',
+        id: attorneyId,
+        patch: {'ratingAverage': averageRating},
+      );
+      if (!result.isSuccess) {
+        throw Exception(result.failureMessage);
+      }
     } catch (e) {
       throw Exception('Failed to update attorney rating: $e');
     }

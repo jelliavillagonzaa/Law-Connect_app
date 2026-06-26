@@ -1,5 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../models/user_model.dart';
+import 'firestore_mirror_helper.dart';
 
 class FirestoreService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -7,9 +8,13 @@ class FirestoreService {
   // Update user verification status
   Future<void> updateUserVerification(String userId, bool isVerified) async {
     try {
-      await _firestore.collection('users').doc(userId).update({
-        'isVerified': isVerified,
-      });
+      final patch = {'isVerified': isVerified};
+      final result = await HybridDatastore.update(
+        collection: 'users',
+        id: userId,
+        patch: patch,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
     } catch (e) {
       throw Exception('Failed to update verification status: $e');
     }
@@ -57,7 +62,12 @@ class FirestoreService {
   // Update user profile
   Future<void> updateUserProfile(String userId, Map<String, dynamic> data) async {
     try {
-      await _firestore.collection('users').doc(userId).update(data);
+      final result = await HybridDatastore.update(
+        collection: 'users',
+        id: userId,
+        patch: data,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
     } catch (e) {
       throw Exception('Failed to update profile: $e');
     }

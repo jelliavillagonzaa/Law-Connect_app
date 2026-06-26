@@ -1,8 +1,10 @@
 /**
- * Law Connect — hearing notifications, SMS, email queue, and client sync.
+ * Law Connect — hearing notifications, SMS, email queue, client sync, and
+ * online payments (Xendit).
  */
 import { setGlobalOptions } from "firebase-functions/v2";
 import { onSchedule } from "firebase-functions/v2/scheduler";
+import { onRequest } from "firebase-functions/v2/https";
 import { defineSecret, defineString } from "firebase-functions/params";
 import { onDocumentCreated, onDocumentUpdated } from "firebase-functions/v2/firestore";
 import * as admin from "firebase-admin";
@@ -15,6 +17,11 @@ import {
 } from "./hearingNotifications";
 import { handleSmsRequestCreated } from "./smsRequestProcessor";
 import { syncClientHearingInbox } from "./clientHearingSync";
+import {
+  handlePaymentCheckoutRequest,
+  handleXenditWebhook,
+  XenditConfig,
+} from "./xendit";
 
 /** Optional SMTP for `email_requests` (hearing + other queued mail). */
 const smtpHostParam = defineString("SMTP_HOST", { default: "" });
@@ -42,6 +49,25 @@ const philsmsStaffAlertPhonesParam = defineString("PHILSMS_STAFF_ALERT_PHONES", 
 const philsmsFirmPhonesOnlyParam = defineString("PHILSMS_FIRM_PHONES_ONLY", {
   default: "true",
 });
+
+/** Xendit real payments (GCash, Maya, card, online banking). */
+const xenditSecretKey = defineSecret("XENDIT_SECRET_KEY");
+const xenditWebhookToken = defineSecret("XENDIT_WEBHOOK_TOKEN");
+const xenditSuccessUrlParam = defineString("XENDIT_SUCCESS_URL", {
+  default: "https://jurislink-app.web.app/payment-success.html",
+});
+const xenditCancelUrlParam = defineString("XENDIT_CANCEL_URL", {
+  default: "https://jurislink-app.web.app/payment-cancel.html",
+});
+
+function xenditCfg(): XenditConfig {
+  return {
+    secretKey: xenditSecretKey.value().trim(),
+    webhookToken: xenditWebhookToken.value().trim(),
+    successUrl: xenditSuccessUrlParam.value().trim(),
+    cancelUrl: xenditCancelUrlParam.value().trim(),
+  };
+}
 
 function parsePhoneList(raw: string): string[] {
   return raw
@@ -164,3 +190,35 @@ export const onSmsRequestSend = onDocumentCreated(
 
 /** Client inbox: backfill hearing_inapp notifications + matchedClientIds on hearings. */
 export { syncClientHearingInbox };
+
+/**
+ * Flutter `payment_checkout_requests` queue → create a real Xendit Invoice
+ * and return the hosted GCash/bank payment URL.
+ */
+export const onPaymentCheckoutRequested = onDocumentCreated(
+  {
+    document: "payment_checkout_requests/{docId}",
+    region: "us-central1",
+    memory: "256MiB",
+    secrets: [xenditSecretKey, xenditWebhookToken],
+  },
+  async (event) => {
+    await handlePaymentCheckoutRequest(event, xenditCfg());
+  },
+);
+
+/**
+ * Xendit webhook → confirms a real charge, then updates the invoice balance
+ * and marks the payment successful. Register this URL in the Xendit dashboard
+ * (Settings → Webhooks → Invoices paid).
+ */
+export const xenditWebhook = onRequest(
+  {
+    region: "us-central1",
+    memory: "256MiB",
+    secrets: [xenditSecretKey, xenditWebhookToken],
+  },
+  async (req, res) => {
+    await handleXenditWebhook(req, res, xenditCfg());
+  },
+);

@@ -11,20 +11,6 @@ android {
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
-    // ML Kit OCR ships large model assets; skipping compression avoids
-    // CompressAssetsWorkAction failures on Windows (long paths / large files).
-    androidResources {
-        noCompress += listOf(
-            "tflite",
-            "lite",
-            "pb",
-            "binarypb",
-            "bincfg",
-            "conv_model",
-            "lstm_model",
-        )
-    }
-
     compileOptions {
         isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_17

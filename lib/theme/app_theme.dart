@@ -1,6 +1,5 @@
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 class AppTheme {
   // Primary Colors
@@ -278,13 +277,11 @@ class AppTheme {
       ),
     );
 
-    // Noto Sans covers most scripts (court orders, names, etc.) without bundling
-    // missing system emoji fonts that trigger console warnings on web.
+    // System fonts only — avoids blocking first paint on web/Android while
+    // Google Fonts downloads over the network.
     return theme.copyWith(
-      textTheme: GoogleFonts.notoSansTextTheme(theme.textTheme),
-      primaryTextTheme: GoogleFonts.notoSansTextTheme(theme.primaryTextTheme),
       appBarTheme: theme.appBarTheme.copyWith(
-        titleTextStyle: GoogleFonts.notoSans(
+        titleTextStyle: const TextStyle(
           fontSize: 20,
           fontWeight: FontWeight.bold,
           color: cleanWhite,

@@ -2,6 +2,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import 'notification_service.dart';
+import 'firestore_mirror_helper.dart';
 
 /// Example Appointment Service showing how to integrate scheduled reminders
 /// 
@@ -62,8 +63,19 @@ class AppointmentService {
         'updatedAt': FieldValue.serverTimestamp(),
       };
 
-      final appointmentRef = await _firestore.collection('appointments').add(appointmentData);
-      final appointmentId = appointmentRef.id;
+      final result = await HybridDatastore.add(
+        collection: 'appointments',
+        data: appointmentData,
+      );
+      if (!result.isSuccess || result.id == null) {
+        return {
+          'success': false,
+          'message': result.failureMessage.isNotEmpty
+              ? result.failureMessage
+              : 'Failed to create appointment',
+        };
+      }
+      final appointmentId = result.id!;
 
       if (kDebugMode) {
         debugPrint('✅ Appointment created with ID: $appointmentId');
@@ -114,12 +126,16 @@ class AppointmentService {
         }
       }
 
-      // Update appointment with reminder IDs
-      await appointmentRef.update({
-        'clientReminderId': clientReminderId,
-        if (adminId != null) 'adminReminderId': (-appointmentId.hashCode),
-        'remindersScheduled': clientReminderScheduled && (adminId == null || true),
-      });
+      // Update appointment with reminder IDs (parallel Firestore + Supabase)
+      await HybridDatastore.update(
+        collection: 'appointments',
+        id: appointmentId,
+        patch: {
+          'clientReminderId': clientReminderId,
+          if (adminId != null) 'adminReminderId': (-appointmentId.hashCode),
+          'remindersScheduled': clientReminderScheduled && (adminId == null || true),
+        },
+      );
 
       if (kDebugMode) {
         debugPrint('✅ Appointment creation completed');
@@ -184,7 +200,19 @@ class AppointmentService {
       if (description != null) updateData['description'] = description;
       if (reminderMinutes != null) updateData['reminderMinutes'] = reminderMinutes;
 
-      await appointmentRef.update(updateData);
+      final updateResult = await HybridDatastore.update(
+        collection: 'appointments',
+        id: appointmentId,
+        patch: updateData,
+      );
+      if (!updateResult.isSuccess) {
+        return {
+          'success': false,
+          'message': updateResult.failureMessage.isNotEmpty
+              ? updateResult.failureMessage
+              : 'Failed to update appointment',
+        };
+      }
 
       // Update client reminder
       final clientReminderId = appointmentId.hashCode;
@@ -250,11 +278,22 @@ class AppointmentService {
         };
       }
 
-      // Update appointment status
-      await appointmentRef.update({
-        'status': 'cancelled',
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+      final cancelResult = await HybridDatastore.update(
+        collection: 'appointments',
+        id: appointmentId,
+        patch: {
+          'status': 'cancelled',
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      );
+      if (!cancelResult.isSuccess) {
+        return {
+          'success': false,
+          'message': cancelResult.failureMessage.isNotEmpty
+              ? cancelResult.failureMessage
+              : 'Failed to cancel appointment',
+        };
+      }
 
       // Cancel client reminder
       final clientReminderId = appointmentId.hashCode;

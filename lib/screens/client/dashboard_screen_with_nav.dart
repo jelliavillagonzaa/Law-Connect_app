@@ -8,27 +8,18 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/bottom_navigation_bar_5tabs.dart';
-import '../../services/case_service.dart';
 import '../../services/chat_service.dart';
 import '../../services/profile_service.dart';
 import '../../models/user_model.dart';
-import 'profile_screen.dart';
-import 'conversations_list_screen.dart';
-import 'appointments_screen.dart';
-import 'notifications_screen.dart';
-import 'notary_portal_screen.dart';
-import 'chat_screen.dart';
-import 'cases_list_screen.dart';
-import 'attorney_selection_screen.dart';
-import '../../screens/client/send_request_screen.dart';
 import '../../pages/client/client_landing_page.dart';
-import '../../pages/admin/admin_dashboard.dart';
+import 'dashboard/client_dashboard_tabs.dart' deferred as dashboard_tabs;
+import 'dashboard/client_dashboard_nav.dart' deferred as dashboard_nav;
+import 'dashboard/dashboard_notification_badge.dart';
 import '../../utils/safe_network_image.dart';
+import '../../utils/quiet_console.dart';
+import '../../utils/screen_debug_probe.dart';
 import '../../widgets/common/safe_network_avatar.dart';
-import '../../pages/attorney/attorney_dashboard.dart';
-import '../../pages/staff/staff_dashboard.dart';
 import '../../services/auth_service.dart';
-import '../../services/hearing_notification_fanout_service.dart';
 
 class DashboardScreenWithNav extends StatefulWidget {
   const DashboardScreenWithNav({super.key});
@@ -39,7 +30,6 @@ class DashboardScreenWithNav extends StatefulWidget {
 
 class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-  final CaseService _caseService = CaseService();
   final ChatService _chatService = ChatService();
   final ProfileService _profileService = ProfileService();
 
@@ -47,9 +37,14 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
   StreamSubscription? _appointmentStreamSubscription;
   StreamSubscription? _unreadCountStreamSubscription;
   StreamSubscription? _caseCountStreamSubscription;
-  StreamSubscription? _notificationCountStreamSubscription;
+  final DashboardNotificationBadgeController _notificationBadge =
+      DashboardNotificationBadgeController();
+  final ScreenDebugProbe _probe = ScreenDebugProbe('client_dashboard');
   StreamSubscription<User?>? _authStreamSubscription;
   Timer? _unreadCountRefreshTimer;
+  bool _redirectingToLanding = false;
+  Future<void>? _tabsLibrary;
+  Future<void>? _navLibrary;
 
   int _currentIndex = 0;
   UserModel? _currentUser;
@@ -58,7 +53,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
   int _appointmentCount = 0;
   int _unreadMessageCount = 0;
   int _unreadNotificationCount = 0; // Separate count for notifications
-  bool _isLoading = true;
+  bool _isLoading = false;
 
   // Color palette aligned with AppTheme
   static const Color primaryColor = AppTheme.royalBlue;
@@ -68,6 +63,8 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
   @override
   void initState() {
     super.initState();
+    _probe.attach();
+    _probe.event('initState');
 
     // IMPORTANT: Set loading to false immediately so UI shows right away
     // Don't wait for Firestore data - use Firebase Auth data as fallback
@@ -80,26 +77,55 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
 
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        _loadUserData();
-        _loadCaseCount();
-        _loadAppointmentCount();
-        _loadUnreadCount();
-        _loadNotificationCount();
-        _loadLocalImage();
+        _probe.event('postFrame');
+        _tabsLibrary = _probe
+            .track(
+              'loadTabsLibrary',
+              dashboard_tabs.loadLibrary,
+            )
+            .catchError((Object e, StackTrace st) {
+          // Prevent unhandled async errors from crashing the app.
+          appLog('Failed to load dashboard tabs library: $e\n$st');
+        });
+        unawaited(_loadUserData());
+        if (kIsWeb) {
+          // Web: counts only on pull-to-refresh.
+          return;
+        }
+        // Mobile: instant shell — summary counts load once after a short delay.
+        Future<void>.delayed(const Duration(seconds: 2), () {
+          if (!mounted) return;
+          _probe.event('deferredSummaryCounts');
+          unawaited(
+            _refreshSummaryCounts().catchError((Object e, StackTrace st) {
+              appLog('refreshSummaryCounts crashed: $e\n$st');
+            }),
+          );
+        });
+        Future<void>.delayed(const Duration(seconds: 3), () {
+          if (!mounted) return;
+          _probe.event('deferredLocalImage');
+          unawaited(
+            _loadLocalImage().catchError((Object e, StackTrace st) {
+              appLog('loadLocalImage crashed: $e\n$st');
+            }),
+          );
+        });
       });
     }
 
     _authStreamSubscription = FirebaseAuth.instance.authStateChanges().listen((
       user,
     ) {
-      if (!mounted) return;
+      if (!mounted || _redirectingToLanding) return;
       if (user == null) {
-        Get.offAll(() => const ClientLandingPage());
+        _redirectingToLanding = true;
+        Get.offAllNamed('/');
       }
     });
   }
 
-  Future<void> _loadUserData() async {
+  Future<void> _loadUserData() => _probe.track('loadUserData', () async {
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) {
@@ -108,9 +134,11 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
       }
 
       final email = user.email ?? '';
-      await AuthService().syncStaffRoleFromStaffApplication(
-        uid: user.uid,
-        email: email,
+      unawaited(
+        AuthService().syncStaffRoleFromStaffApplication(
+          uid: user.uid,
+          email: email,
+        ),
       );
       final userDoc = await _firestore.collection('users').doc(user.uid).get();
       if (userDoc.exists && mounted) {
@@ -121,10 +149,12 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
           firestoreRole: storedRole,
         );
 
-        await AuthService().repairPortalRoleIfNeeded(
-          uid: user.uid,
-          email: email.isNotEmpty ? email : (data['email'] as String? ?? ''),
-          firestoreRole: storedRole,
+        unawaited(
+          AuthService().repairPortalRoleIfNeeded(
+            uid: user.uid,
+            email: email.isNotEmpty ? email : (data['email'] as String? ?? ''),
+            firestoreRole: storedRole,
+          ),
         );
 
         if (portalRole != 'client' && mounted) {
@@ -132,13 +162,13 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
             if (!mounted) return;
             switch (portalRole) {
               case 'admin':
-                Get.offAll(() => const AdminDashboard());
+                Get.offAllNamed('/AdminDashboard');
                 break;
               case 'attorney':
-                Get.offAll(() => const AttorneyDashboard());
+                Get.offAllNamed('/AttorneyDashboard');
                 break;
               case 'staff':
-                Get.offAll(() => const StaffDashboard());
+                Get.offAllNamed('/StaffDashboard');
                 break;
             }
           });
@@ -150,9 +180,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
           _currentUser = UserModel.fromFirestore(data, user.uid);
           _isLoading = false;
         });
-        // Always try to load local image - it will check if needed
-        // This ensures we have the image even if photoUrl isn't set yet
-        _loadLocalImage();
+        unawaited(_loadLocalImage());
       } else {
         setState(() => _isLoading = false);
       }
@@ -161,42 +189,39 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
         setState(() => _isLoading = false);
       }
     }
-  }
+  });
 
-  Future<void> _loadLocalImage() async {
+  Future<void> _loadLocalImage() => _probe.track('loadLocalImage', () async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
       return;
     }
 
-    // Always try to load local image - same as ProfileCard does
-    // This ensures dashboard shows the same profile picture as Profile screen
     try {
       final localImage = await _profileService.getLocalProfilePicture(user.uid);
 
       if (mounted) {
         setState(() {
-          // Always update if we got a valid image - don't check photoUrl here
-          // The image provider will decide whether to show it
           if (localImage != null && localImage.isNotEmpty) {
             _localImageBase64 = localImage;
-            print(
-              '✅ Local profile image loaded in dashboard: ${localImage.length} bytes',
-            );
-          } else {
-            print('ℹ️ No local profile image found in dashboard');
-            // Don't clear existing image - keep what we have
           }
         });
       }
     } catch (e, stackTrace) {
-      print('❌ Error loading local profile image in dashboard: $e');
-      print('Stack trace: $stackTrace');
-      // Don't clear existing image on error - keep what we have
+      appLog('Error loading local profile image in dashboard: $e\n$stackTrace');
     }
-  }
+  });
 
-  Future<void> _loadCaseCount() async {
+  Future<void> _refreshSummaryCounts() => _probe.track('refreshSummaryCounts', () async {
+    await Future.wait([
+      _loadCaseCount(),
+      _loadAppointmentCount(),
+      _loadUnreadCount(),
+      if (!kIsWeb) _loadNotificationCount(),
+    ]);
+  });
+
+  Future<void> _loadCaseCount() => _probe.track('loadCaseCount', () async {
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) {
@@ -208,41 +233,36 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
         return;
       }
 
-      // Cancel previous subscription if exists
       await _caseCountStreamSubscription?.cancel();
+      _caseCountStreamSubscription = null;
 
-      // Get case count from stream with proper subscription
-      _caseCountStreamSubscription = _caseService
-          .getCasesForUser(user.uid, 'client')
-          .listen(
-            (cases) {
-              if (mounted) {
-                setState(() {
-                  _caseCount = cases.length;
-                  print('Case count updated: $_caseCount'); // Debug log
-                });
-              }
-            },
-            onError: (error) {
-              print('Error loading case count: $error');
-              if (mounted) {
-                setState(() {
-                  _caseCount = 0;
-                });
-              }
-            },
-          );
+      try {
+        final snapshot = await _firestore
+            .collection('cases')
+            .where('clientId', isEqualTo: user.uid)
+            .limit(60)
+            .get()
+            .timeout(const Duration(seconds: 10));
+        if (!mounted) return;
+        final count = snapshot.docs.where((doc) {
+          final data = doc.data();
+          return data['isArchived'] != true;
+        }).length;
+        setState(() => _caseCount = count);
+      } catch (_) {
+        if (mounted) setState(() => _caseCount = 0);
+      }
     } catch (e) {
-      print('Error in _loadCaseCount: $e');
+      appLog('Error in _loadCaseCount: $e');
       if (mounted) {
         setState(() {
           _caseCount = 0;
         });
       }
     }
-  }
+  });
 
-  Future<void> _loadAppointmentCount() async {
+  Future<void> _loadAppointmentCount() => _probe.track('loadAppointmentCount', () async {
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) {
@@ -256,191 +276,116 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
 
       // Cancel previous subscription if exists
       await _appointmentStreamSubscription?.cancel();
+      _appointmentStreamSubscription = null;
 
-      // Query all appointments for this client
-      _appointmentStreamSubscription = _firestore
-          .collection('appointments')
-          .where('clientId', isEqualTo: user.uid)
-          .snapshots()
-          .listen(
-            (snapshot) {
-              if (mounted) {
-                setState(() {
-                  final now = DateTime.now();
-                  final today = DateTime(now.year, now.month, now.day);
-
-                  // Count only today's appointments that are not completed
-                  // This matches what the "Today" tab shows in appointments screen
-                  _appointmentCount = snapshot.docs.where((doc) {
-                    final data = doc.data() as Map<String, dynamic>?;
-                    if (data == null) return false;
-
-                    final status = data['status'] as String?;
-                    // Skip cancelled or completed appointments
-                    if (status == 'cancelled' || status == 'completed') {
-                      return false;
-                    }
-
-                    // Check if appointment is today
-                    final appointmentDateTime = data['appointmentDateTime'];
-                    if (appointmentDateTime == null) return false;
-
-                    DateTime aptDate;
-                    if (appointmentDateTime is DateTime) {
-                      aptDate = appointmentDateTime;
-                    } else if (appointmentDateTime is Timestamp) {
-                      aptDate = appointmentDateTime.toDate();
-                    } else {
-                      return false;
-                    }
-
-                    final aptDateOnly = DateTime(
-                      aptDate.year,
-                      aptDate.month,
-                      aptDate.day,
-                    );
-
-                    return aptDateOnly == today;
-                  }).length;
-
-                  print(
-                    'Today\'s appointment count updated: $_appointmentCount',
-                  ); // Debug log
-                });
-              }
-            },
-            onError: (error) {
-              print('Error loading appointment count: $error');
-              if (mounted) {
-                setState(() {
-                  _appointmentCount = 0;
-                });
-              }
-            },
+      try {
+        final snapshot = await _firestore
+            .collection('appointments')
+            .where('clientId', isEqualTo: user.uid)
+            .limit(80)
+            .get()
+            .timeout(const Duration(seconds: 10));
+        if (!mounted) return;
+        final now = DateTime.now();
+        final today = DateTime(now.year, now.month, now.day);
+        final count = snapshot.docs.where((doc) {
+          final data = doc.data();
+          final status = data['status'] as String?;
+          if (status == 'cancelled' || status == 'completed') return false;
+          final appointmentDateTime = data['appointmentDateTime'];
+          if (appointmentDateTime == null) return false;
+          final aptDate = appointmentDateTime is Timestamp
+              ? appointmentDateTime.toDate()
+              : appointmentDateTime is DateTime
+              ? appointmentDateTime
+              : null;
+          if (aptDate == null) return false;
+          final aptDateOnly = DateTime(
+            aptDate.year,
+            aptDate.month,
+            aptDate.day,
           );
+          return aptDateOnly == today;
+        }).length;
+        setState(() => _appointmentCount = count);
+      } catch (_) {
+        if (mounted) setState(() => _appointmentCount = 0);
+      }
     } catch (e) {
-      print('Error in _loadAppointmentCount: $e');
+      appLog('Error in _loadAppointmentCount: $e');
       if (mounted) {
         setState(() {
           _appointmentCount = 0;
         });
       }
     }
-  }
+  });
 
-  Future<void> _loadUnreadCount() async {
+  Future<void> _loadUnreadCount() => _probe.track('loadUnreadCount', () async {
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) return;
 
       await _unreadCountStreamSubscription?.cancel();
+      _unreadCountStreamSubscription = null;
       _unreadCountRefreshTimer?.cancel();
       _unreadCountRefreshTimer = null;
 
-      var refreshInFlight = false;
-
-      Future<void> refreshUnreadCount() async {
-        if (refreshInFlight || !mounted) return;
-        refreshInFlight = true;
-        try {
-          final count = await _chatService.getUnreadCount(user.uid);
-          if (!mounted) return;
-          if (count != _unreadMessageCount) {
-            setState(() => _unreadMessageCount = count);
-          }
-        } catch (e) {
-          if (kDebugMode) debugPrint('Error refreshing unread count: $e');
-          if (mounted && _unreadMessageCount != 0) {
-            setState(() => _unreadMessageCount = 0);
-          }
-        } finally {
-          refreshInFlight = false;
+      try {
+        final count = await _chatService
+            .getUnreadCount(user.uid)
+            .timeout(const Duration(seconds: 10));
+        if (!mounted) return;
+        if (count != _unreadMessageCount) {
+          setState(() => _unreadMessageCount = count);
+        }
+      } catch (e) {
+        if (kDebugMode) debugPrint('Error refreshing unread count: $e');
+        if (mounted && _unreadMessageCount != 0) {
+          setState(() => _unreadMessageCount = 0);
         }
       }
-
-      void scheduleUnreadRefresh() {
-        _unreadCountRefreshTimer?.cancel();
-        _unreadCountRefreshTimer = Timer(
-          const Duration(milliseconds: 500),
-          () => unawaited(refreshUnreadCount()),
-        );
-      }
-
-      await refreshUnreadCount();
-
-      _unreadCountStreamSubscription = _firestore
-          .collection('messages')
-          .where('participants', arrayContains: user.uid)
-          .snapshots()
-          .listen(
-            (_) => scheduleUnreadRefresh(),
-            onError: (error) {
-              if (kDebugMode) {
-                debugPrint('Error in unread count stream: $error');
-              }
-              if (mounted && _unreadMessageCount != 0) {
-                setState(() => _unreadMessageCount = 0);
-              }
-            },
-          );
     } catch (e) {
       if (kDebugMode) debugPrint('Error in _loadUnreadCount: $e');
       if (mounted && _unreadMessageCount != 0) {
         setState(() => _unreadMessageCount = 0);
       }
     }
-  }
+  });
 
-  Future<void> _loadNotificationCount() async {
+  Future<void> _loadNotificationCount() => _probe.track('loadNotificationCount', () async {
+    if (kIsWeb) return;
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) return;
 
-      await _notificationCountStreamSubscription?.cancel();
-
-      final fanout = HearingNotificationFanoutService.instance;
-      fanout.attach();
-      fanout.warmInbox(
+      _notificationBadge.stop();
+      await _notificationBadge.start(
         user.uid,
-        includeGlobalHearingsFallback: false,
-        hearingsOnly: true,
+        (count) {
+          if (mounted) setState(() => _unreadNotificationCount = count);
+        },
+        debugProbe: _probe,
       );
-      _notificationCountStreamSubscription = fanout
-          .watchClientNotificationBadgeCount(user.uid)
-          .listen(
-            (count) {
-              if (mounted) {
-                setState(() => _unreadNotificationCount = count);
-              }
-            },
-            onError: (error) {
-              if (kDebugMode) {
-                debugPrint('Client notification badge stream: $error');
-              }
-              if (mounted) setState(() => _unreadNotificationCount = 0);
-            },
-          );
-
-      unawaited(() async {
-        await fanout.purgeClientCourtEmailNotices(user.uid);
-        await fanout.syncClientHearingNotifications(force: true);
-        final count = await fanout.countClientNotificationBadge(user.uid);
-        if (mounted) setState(() => _unreadNotificationCount = count);
-      }());
     } catch (e) {
-      if (kDebugMode) debugPrint('Error in _loadNotificationCount: $e');
+      appLog('Error in _loadNotificationCount: $e');
       if (mounted) setState(() => _unreadNotificationCount = 0);
     }
+  });
+
+  Future<void> _ensureNavLibrary() {
+    return _navLibrary ??= dashboard_nav.loadLibrary();
   }
 
   @override
   void dispose() {
+    _probe.event('dispose');
+    _probe.detach();
     _authStreamSubscription?.cancel();
     _caseCountStreamSubscription?.cancel();
     _appointmentStreamSubscription?.cancel();
     _unreadCountStreamSubscription?.cancel();
-    _notificationCountStreamSubscription?.cancel();
-    HearingNotificationFanoutService.instance.detach();
+    _notificationBadge.stop();
     _unreadCountRefreshTimer?.cancel();
     super.dispose();
   }
@@ -458,12 +403,11 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
       );
 
       // Navigate directly to chat screen (message form)
-      Get.to(
-        () => ChatScreen(
-          conversationId: chatId,
-          otherUserId: 'staff@gmail.com', // Use email as identifier
-          otherUserName: 'Staff',
-        ),
+      await _ensureNavLibrary();
+      await dashboard_nav.openChat(
+        conversationId: chatId,
+        otherUserId: 'staff@gmail.com',
+        otherUserName: 'Staff',
       );
     } catch (e) {
       // On any error, navigate to Messages tab
@@ -471,47 +415,22 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
     }
   }
 
-  Future<void> _refreshData() async {
-    await Future.wait([
-      _loadUserData(),
-      _loadCaseCount(),
-      _loadAppointmentCount(),
-      _loadUnreadCount(),
-      _loadNotificationCount(),
-    ]);
-  }
+  Future<void> _refreshData() => _probe.track('pullToRefresh', () async {
+    await _loadUserData();
+    await _refreshSummaryCounts();
+    if (!kIsWeb) {
+      await _loadLocalImage();
+    }
+  });
 
   void _onTabTapped(int index) {
+    _probe.event('tabTap', detail: 'index=$index');
     setState(() {
       _currentIndex = index;
     });
 
-    // Refresh profile picture when returning to dashboard tab
     if (index == 0) {
-      _loadUserData();
-      // Also reload local image when returning to dashboard
-      _loadLocalImage();
-
-      // Refresh unread counts when returning to dashboard
-      final user = FirebaseAuth.instance.currentUser;
-      if (user != null) {
-        // Refresh unread message count
-        _chatService
-            .getUnreadCount(user.uid)
-            .then((count) {
-              if (mounted) {
-                setState(() {
-                  _unreadMessageCount = count;
-                });
-              }
-            })
-            .catchError((e) {
-              print('Error refreshing unread count: $e');
-            });
-
-        // Refresh notification count
-        _loadNotificationCount();
-      }
+      unawaited(_refreshSummaryCounts());
     }
   }
 
@@ -817,9 +736,9 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
           children: [
             Expanded(
               child: ElevatedButton.icon(
-                onPressed: () {
-                  // Step 1 of appointment flow: select attorney
-                  Get.to(() => const AttorneySelectionScreen());
+                onPressed: () async {
+                  await _ensureNavLibrary();
+                  await dashboard_nav.openAttorneySelection();
                 },
                 style: ElevatedButton.styleFrom(
                   backgroundColor: primaryColor,
@@ -868,8 +787,9 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
           children: [
             Expanded(
               child: ElevatedButton.icon(
-                onPressed: () {
-                  Get.to(() => const SendRequestScreen());
+                onPressed: () async {
+                  await _ensureNavLibrary();
+                  await dashboard_nav.openSendRequest();
                 },
                 style: ElevatedButton.styleFrom(
                   backgroundColor: primaryColor,
@@ -890,8 +810,9 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
             const SizedBox(width: 12),
             Expanded(
               child: ElevatedButton.icon(
-                onPressed: () {
-                  Get.to(() => const NotaryPortalScreen());
+                onPressed: () async {
+                  await _ensureNavLibrary();
+                  await dashboard_nav.openNotaryPortal();
                 },
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.white,
@@ -911,6 +832,31 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
               ),
             ),
           ],
+        ),
+        const SizedBox(height: 12),
+        // Row 3: Billing & Payments (view outstanding balance, pay legal fees)
+        SizedBox(
+          width: double.infinity,
+          child: ElevatedButton.icon(
+            onPressed: () async {
+              await _ensureNavLibrary();
+              await dashboard_nav.openBilling();
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: goldColor,
+              foregroundColor: AppTheme.deepNavy,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              elevation: 2,
+            ),
+            icon: const Icon(Icons.account_balance_wallet_outlined),
+            label: const Text(
+              'Billing & Payments',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+            ),
+          ),
         ),
       ],
     );
@@ -937,77 +883,83 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
             borderRadius: BorderRadius.circular(12),
             border: Border.all(color: color.withOpacity(0.2), width: 1),
           ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            Icon(icon, size: 32, color: color),
-            const SizedBox(height: 12),
-            Text(
-              '$count',
-              style: AppTheme.heading3.copyWith(
-                color: primaryColor,
-                fontWeight: FontWeight.bold,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Icon(icon, size: 32, color: color),
+              const SizedBox(height: 12),
+              Text(
+                '$count',
+                style: AppTheme.heading3.copyWith(
+                  color: primaryColor,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              label,
-              style: AppTheme.bodySmall.copyWith(color: Colors.grey[600]),
-              textAlign: TextAlign.center,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ],
-        ),
+              const SizedBox(height: 4),
+              Text(
+                label,
+                style: AppTheme.bodySmall.copyWith(color: Colors.grey[600]),
+                textAlign: TextAlign.center,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+          ),
         ),
       ),
     );
   }
 
   Widget _buildCurrentScreen() {
-    switch (_currentIndex) {
-      case 0:
-        return _buildHomeScreen();
-      case 1:
-        return const CasesListScreen();
-      case 2:
-        return const AppointmentsScreen();
-      case 3:
-        return const ConversationsListScreen();
-      case 4:
-        return const ProfileScreen();
-      default:
-        return _buildHomeScreen();
+    if (_currentIndex == 0) {
+      return _buildHomeScreen();
     }
+
+    return FutureBuilder<void>(
+      future: _tabsLibrary ??= dashboard_tabs.loadLibrary(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        return dashboard_tabs.buildClientDashboardTab(_currentIndex);
+      },
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    _probe.onBuild(detail: 'tab=$_currentIndex loading=$_isLoading');
+
     if (_isLoading) {
-      return Scaffold(
-        backgroundColor: backgroundColor,
-        body: const Center(child: CircularProgressIndicator()),
+      return _probe.wrap(
+        Scaffold(
+          backgroundColor: backgroundColor,
+          body: const Center(child: CircularProgressIndicator()),
+        ),
       );
     }
 
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
-      return Scaffold(
-        backgroundColor: backgroundColor,
-        body: EmptyState(
-          icon: Icons.person_off_outlined,
-          title: 'Not Logged In',
-          message: 'Please log in to access your dashboard',
-          actionLabel: 'Go to Login',
-          onAction: () {
-            Get.offAll(() => const ClientLandingPage());
-          },
+      return _probe.wrap(
+        Scaffold(
+          backgroundColor: backgroundColor,
+          body: EmptyState(
+            icon: Icons.person_off_outlined,
+            title: 'Not Logged In',
+            message: 'Please log in to access your dashboard',
+            actionLabel: 'Go to Login',
+            onAction: () {
+              Get.offAll(() => const ClientLandingPage());
+            },
+          ),
         ),
       );
     }
 
-    return Scaffold(
+    return _probe.wrap(
+      Scaffold(
       backgroundColor: backgroundColor,
       // Only show AppBar for Home screen, other screens have their own
       appBar: _currentIndex == 0
@@ -1051,7 +1003,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
                     ],
                   ),
                   onPressed: () {
-                    Get.to(() => const NotificationsScreen());
+                    Get.toNamed('/ClientNotifications');
                   },
                 ),
               ],
@@ -1062,6 +1014,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
         currentIndex: _currentIndex,
         onTap: _onTabTapped,
       ),
+      ),
     );
   }
 
@@ -1071,10 +1024,9 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
     if (_localImageBase64 != null && _localImageBase64!.isNotEmpty) {
       try {
         final decodedImage = base64Decode(_localImageBase64!);
-        print('✅ Displaying local profile image in dashboard');
         return MemoryImage(decodedImage);
       } catch (e) {
-        print('❌ Error decoding local image in dashboard: $e');
+        appLog('Error decoding local image in dashboard: $e');
       }
     }
 

@@ -10,6 +10,7 @@ import '../utils/hearing_notification_formatter.dart';
 import 'hearing_calendar_fields.dart';
 import 'hearing_sms_alert_service.dart';
 import 'staff_application_service.dart';
+import 'firestore_mirror_helper.dart';
 
 /// Inbox / fan-out must not spam the console when switching attorney tabs.
 void _fanoutLog(String message) {}
@@ -75,6 +76,9 @@ class HearingNotificationFanoutService {
   static final Map<String, DateTime> _lastInboxSyncAt = <String, DateTime>{};
   static const _inboxSyncMinInterval = Duration(minutes: 15);
   static final Set<String> _inboxSyncInFlight = <String>{};
+  static final Set<String> _sessionWarmInboxKeys = <String>{};
+  static final Map<String, Timer> _inboxRefreshDebounceByUser =
+      <String, Timer>{};
 
   /// Bump when matching logic changes so older hearings can fan out again (doc IDs are stable; merge avoids dup spam).
   static const _prefsKey = 'hearing_inapp_fanout_ids_v8';
@@ -162,6 +166,14 @@ class HearingNotificationFanoutService {
     bool hearingsOnly = false,
   }) {
     if (userId.isEmpty) return;
+    final warmKey = _inboxStreamCacheKey(
+      userId,
+      allNotificationTypes,
+      includeGlobalHearingsFallback: includeGlobalHearingsFallback,
+      hearingsOnly: hearingsOnly,
+    );
+    if (_sessionWarmInboxKeys.contains(warmKey)) return;
+    _sessionWarmInboxKeys.add(warmKey);
     unawaited(_loadBellCountFromPrefs(userId));
     unawaited(_ensureReadHearingIdsLoaded(userId));
     // Web: no live inbox listeners on dashboard — they caused permission-denied loops + UI freeze.
@@ -186,6 +198,7 @@ class HearingNotificationFanoutService {
         userId,
         includeGlobalHearingsFallback: includeGlobalHearingsFallback,
         hearingsOnly: hearingsOnly,
+        attachListeners: false,
       );
       return rows.where((r) => r.isUnread).length;
     } catch (_) {
@@ -215,6 +228,18 @@ class HearingNotificationFanoutService {
         unawaited(bundle.emit());
       }
     }
+  }
+
+  void _scheduleInboxRefreshForUser(String userId) {
+    if (userId.isEmpty) return;
+    _inboxRefreshDebounceByUser[userId]?.cancel();
+    _inboxRefreshDebounceByUser[userId] = Timer(
+      const Duration(milliseconds: 450),
+      () {
+        _inboxRefreshDebounceByUser.remove(userId);
+        _refreshInboxStreamsForUser(userId);
+      },
+    );
   }
 
   Future<void> _ensureReadHearingIdsLoaded(String userId) async {
@@ -1756,9 +1781,11 @@ class HearingNotificationFanoutService {
       payload['createdAt'] = Timestamp.now();
     }
 
-    await _db.collection('notifications').doc(nid).set(
-      payload,
-      SetOptions(merge: true),
+    await HybridDatastore.set(
+      collection: 'notifications',
+      id: nid,
+      data: payload,
+      options: SetOptions(merge: true),
     );
   }
 
@@ -2351,21 +2378,19 @@ class HearingNotificationFanoutService {
 
     var wroteAny = false;
     for (var i = 0; i < recipientList.length; i += 400) {
-      final chunk = recipientList.skip(i).take(400);
-      final batch = _db.batch();
-      for (final uid in chunk) {
-        final nid = 'hearing_inapp_${doc.id}_$uid';
-        batch.set(
-          _db.collection('notifications').doc(nid),
-          payloadFor(uid),
-          SetOptions(merge: true),
-        );
-      }
+      final chunk = recipientList.skip(i).take(400).toList();
+      final docs = <String, Map<String, dynamic>>{
+        for (final uid in chunk)
+          'hearing_inapp_${doc.id}_$uid': payloadFor(uid),
+      };
       try {
-        await batch.commit();
-        wroteAny = true;
-      } catch (e) {
-        if (_isPermissionDenied(e)) {
+        final result = await HybridDatastore.setManyMerge(
+          collection: 'notifications',
+          docs: docs,
+        );
+        if (result.isSuccess) {
+          wroteAny = true;
+        } else if (_isPermissionDenied(result.firestoreError ?? '')) {
           if (kDebugMode) {
             _fanoutLog(
               'HearingNotificationFanout: batch permission-denied; '
@@ -2374,16 +2399,21 @@ class HearingNotificationFanoutService {
           }
         } else {
           if (kDebugMode) {
-            _fanoutLog('HearingNotificationFanout batch commit failed: $e');
+            _fanoutLog(
+              'HearingNotificationFanout batch write failed: '
+              '${result.failureMessage}',
+            );
           }
           for (final uid in chunk) {
             try {
               final nid = 'hearing_inapp_${doc.id}_$uid';
-              await _db
-                  .collection('notifications')
-                  .doc(nid)
-                  .set(payloadFor(uid), SetOptions(merge: true));
-              wroteAny = true;
+              final single = await HybridDatastore.set(
+                collection: 'notifications',
+                id: nid,
+                data: payloadFor(uid),
+                options: SetOptions(merge: true),
+              );
+              if (single.isSuccess) wroteAny = true;
             } catch (inner) {
               if (_isPermissionDenied(inner)) continue;
               if (kDebugMode) {
@@ -2393,6 +2423,17 @@ class HearingNotificationFanoutService {
               }
             }
           }
+        }
+      } catch (e) {
+        if (_isPermissionDenied(e)) {
+          if (kDebugMode) {
+            _fanoutLog(
+              'HearingNotificationFanout: batch permission-denied; '
+              'will still attempt PhilSMS.',
+            );
+          }
+        } else if (kDebugMode) {
+          _fanoutLog('HearingNotificationFanout batch write failed: $e');
         }
       }
     }
@@ -2623,13 +2664,19 @@ class HearingNotificationFanoutService {
     Map<String, dynamic>? rowData,
   }) async {
     if (notificationDocId != null && notificationDocId.isNotEmpty) {
-      try {
-        await _db.collection('notifications').doc(notificationDocId).update({
-          'isRead': true,
-          'readAt': FieldValue.serverTimestamp(),
-        });
-      } catch (e) {
-        if (kDebugMode) _fanoutLog('markInboxRowAsRead notification: $e');
+      final readPatch = <String, dynamic>{
+        'isRead': true,
+        'readAt': FieldValue.serverTimestamp(),
+      };
+      final result = await HybridDatastore.update(
+        collection: 'notifications',
+        id: notificationDocId,
+        patch: readPatch,
+      );
+      if (!result.isSuccess && kDebugMode) {
+        _fanoutLog(
+          'markInboxRowAsRead notification: ${result.failureMessage}',
+        );
       }
       return;
     }
@@ -2642,7 +2689,7 @@ class HearingNotificationFanoutService {
 
     final nid = 'hearing_inapp_${hearingDocId}_$userId';
     try {
-      await _db.collection('notifications').doc(nid).set({
+      final readPayload = <String, dynamic>{
         'userId': userId,
         'type': data['type'] ?? 'hearing_activity',
         'title': data['title'] ?? 'Court hearing / order',
@@ -2655,7 +2702,13 @@ class HearingNotificationFanoutService {
         if (data['caseNo'] != null) 'caseNo': data['caseNo'],
         if (data['clientName'] != null) 'clientName': data['clientName'],
         if (data['courtBranch'] != null) 'courtBranch': data['courtBranch'],
-      }, SetOptions(merge: true));
+      };
+      await HybridDatastore.set(
+        collection: 'notifications',
+        id: nid,
+        data: readPayload,
+        options: SetOptions(merge: true),
+      );
     } catch (e) {
       if (kDebugMode) _fanoutLog('markInboxRowAsRead hearing notif: $e');
     }
@@ -2744,7 +2797,7 @@ class HearingNotificationFanoutService {
     } catch (e) {
       if (kDebugMode) _fanoutLog('markAllInboxRowsRead: $e');
     }
-    _refreshInboxStreamsForUser(userId);
+    _scheduleInboxRefreshForUser(userId);
   }
 
   Future<int> countInboxBellItems(
@@ -3095,16 +3148,33 @@ class HearingNotificationFanoutService {
     bool allNotificationTypes = false,
     bool includeGlobalHearingsFallback = true,
     bool hearingsOnly = false,
+    bool attachListeners = false,
+    bool fetchGlobalHearings = true,
+    bool reuseCachedHearings = false,
   }) async {
     await _ensureReadHearingIdsLoaded(userId);
+    final bundle = _inboxBundle(
+      userId,
+      allNotificationTypes: allNotificationTypes,
+      includeGlobalHearingsFallback: includeGlobalHearingsFallback,
+      hearingsOnly: hearingsOnly,
+    );
+
     final notifDocs = await _notificationDocsForInbox(
       userId,
       hearingsOnly: hearingsOnly,
     );
-    final hearings = includeGlobalHearingsFallback &&
-            await _canUseGlobalHearingsInbox(userId)
-        ? await _hearingsSnapshotForInbox(forUserId: userId)
-        : null;
+    await Future<void>.delayed(Duration.zero);
+
+    QuerySnapshot<Map<String, dynamic>>? hearings;
+    if (includeGlobalHearingsFallback &&
+        await _canUseGlobalHearingsInbox(userId)) {
+      if (fetchGlobalHearings) {
+        hearings = await _hearingsSnapshotForInbox(forUserId: userId);
+      } else if (reuseCachedHearings) {
+        hearings = bundle.lastHearingsSnapshot;
+      }
+    }
 
     final rows = buildInboxRowsFromSnapshots(
       notifDocs,
@@ -3114,12 +3184,11 @@ class HearingNotificationFanoutService {
       readHearingIds: _readHearingIdsMem[userId] ?? const {},
     );
 
-    _inboxBundle(
-      userId,
-      allNotificationTypes: allNotificationTypes,
-      includeGlobalHearingsFallback: includeGlobalHearingsFallback,
-      hearingsOnly: hearingsOnly,
-    ).seedRows(rows, hearingsSnapshot: hearings, attachListeners: !kIsWeb);
+    bundle.seedRows(
+      rows,
+      hearingsSnapshot: hearings,
+      attachListeners: attachListeners && !kIsWeb,
+    );
 
     return rows;
   }
@@ -3144,8 +3213,149 @@ class HearingNotificationFanoutService {
       userId,
       includeGlobalHearingsFallback: false,
       hearingsOnly: true,
-    ).seedRows(rows, hearingsSnapshot: null, attachListeners: !kIsWeb);
-    if (!kIsWeb) _refreshInboxStreamsForUser(userId);
+    ).seedRows(rows, hearingsSnapshot: null, attachListeners: false);
+    return rows;
+  }
+
+  /// Staff inbox: lightweight notifications query; optional capped hearings scan.
+  Future<List<HearingInboxRow>> fetchStaffInboxLight(
+    String userId, {
+    bool includeGlobalHearings = false,
+    int notificationLimit = 60,
+    int hearingsLimit = 50,
+  }) async {
+    if (userId.isEmpty) return const [];
+
+    final readIdsFuture = _ensureReadHearingIdsLoaded(userId);
+    final authOk = FirebaseAuth.instance.currentUser?.uid == userId
+        ? true
+        : await _waitForInboxAuth(userId);
+    if (!authOk) {
+      await readIdsFuture;
+      return peekInboxRows(userId) ?? const [];
+    }
+
+    final notifFuture = _db
+        .collection('notifications')
+        .where('userId', isEqualTo: userId)
+        .limit(notificationLimit)
+        .get();
+
+    Future<QuerySnapshot<Map<String, dynamic>>?>? hearingsFuture;
+    if (includeGlobalHearings && hearingsLimit > 0) {
+      hearingsFuture = _db
+          .collection('hearings')
+          .limit(hearingsLimit)
+          .get()
+          .then<QuerySnapshot<Map<String, dynamic>>?>((s) => s)
+          .catchError((_) => null);
+    }
+
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> docs;
+    try {
+      final snap = await notifFuture;
+      docs = snap.docs;
+    } catch (_) {
+      await readIdsFuture;
+      return peekInboxRows(userId) ?? const [];
+    }
+
+    final hearings =
+        hearingsFuture != null ? await hearingsFuture : null;
+    await readIdsFuture;
+
+    // Yield so the UI can paint between network and heavy row building.
+    await Future<void>.delayed(Duration.zero);
+
+    final rows = buildInboxRowsFromSnapshots(
+      docs,
+      hearings?.docs ?? const [],
+      readHearingIds: _readHearingIdsMem[userId] ?? const {},
+    );
+
+    _inboxBundle(userId).seedRows(
+      rows,
+      hearingsSnapshot: hearings,
+      attachListeners: false,
+    );
+    _cacheBellCount(userId, rows);
+    return rows;
+  }
+
+  /// Read-hearing ids for staff global hearing rows (lightweight).
+  Future<Set<String>> staffReadHearingIds(String userId) async {
+    await _ensureReadHearingIdsLoaded(userId);
+    return Set<String>.from(_readHearingIdsMem[userId] ?? const {});
+  }
+
+  /// Extra global hearings for staff inbox — no notification re-fetch, no sibling merge.
+  Future<List<HearingInboxRow>> fetchStaffExtraHearingRows(
+    String userId, {
+    Set<String> coveredHearingIds = const {},
+    int hearingsLimit = 25,
+  }) async {
+    if (userId.isEmpty || hearingsLimit <= 0) return const [];
+
+    final readFuture = _ensureReadHearingIdsLoaded(userId);
+    QuerySnapshot<Map<String, dynamic>> snap;
+    try {
+      snap = await _db.collection('hearings').limit(hearingsLimit).get();
+    } catch (_) {
+      await readFuture;
+      return const [];
+    }
+    await readFuture;
+    await Future<void>.delayed(Duration.zero);
+
+    final readIds = _readHearingIdsMem[userId] ?? const {};
+    return buildGlobalHearingRowsLight(
+      snap.docs,
+      coveredHearingIds: coveredHearingIds,
+      readHearingIds: readIds,
+    );
+  }
+
+  /// Lightweight hearing rows (single doc each — skips pool-wide sibling merge).
+  static List<HearingInboxRow> buildGlobalHearingRowsLight(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> hearingDocs, {
+    Set<String> coveredHearingIds = const {},
+    Set<String> readHearingIds = const {},
+  }) {
+    final rows = <HearingInboxRow>[];
+    for (final hDoc in hearingDocs) {
+      if (coveredHearingIds.contains(hDoc.id)) continue;
+      final hd = hDoc.data();
+      if (!isDisplayableHearingRow(hd)) continue;
+
+      final caseNo = (hd['caseNo'] as String?)?.trim() ?? '';
+      final ts = _sortTimeForHearing(hd);
+      final summary = (hd['summary'] as String?)?.trim() ??
+          (hd['activityType'] as String?)?.trim() ??
+          '';
+
+      rows.add(
+        HearingInboxRow(
+          rowKey: 'hearing_${hDoc.id}',
+          notificationDocId: null,
+          data: {
+            'type': 'hearing_activity',
+            'title': caseNo.isNotEmpty
+                ? 'Court hearing — $caseNo'
+                : 'Court hearing / order',
+            'summary': summary,
+            'message': '',
+            'hearingDocId': hDoc.id,
+            if (caseNo.isNotEmpty) 'caseNo': caseNo,
+            if (hd['clientName'] != null) 'clientName': hd['clientName'],
+            if (hd['courtBranch'] != null) 'courtBranch': hd['courtBranch'],
+            'createdAt': Timestamp.fromDate(ts),
+            'isRead': readHearingIds.contains(hDoc.id),
+          },
+          sortTime: ts,
+        ),
+      );
+    }
+    rows.sort((a, b) => b.sortTime.compareTo(a.sortTime));
     return rows;
   }
 
@@ -3254,12 +3464,21 @@ class HearingNotificationFanoutService {
     }
 
     try {
-      await _db
-          .collection('notifications')
-          .doc(nid)
-          .set(payload, SetOptions(merge: true));
+      final result = await HybridDatastore.set(
+        collection: 'notifications',
+        id: nid,
+        data: payload,
+        options: SetOptions(merge: true),
+      );
+      if (!result.isSuccess) {
+        if (_isPermissionDenied(result.firestoreError ?? '')) return;
+        if (kDebugMode) {
+          _fanoutLog(
+            'ensureStaffHearingNotificationForUser: ${result.failureMessage}',
+          );
+        }
+      }
     } catch (e) {
-      if (_isPermissionDenied(e)) return;
       if (kDebugMode) {
         _fanoutLog('ensureStaffHearingNotificationForUser: $e');
       }
@@ -3331,38 +3550,44 @@ class HearingNotificationFanoutService {
   }
 
   /// Backfill court hearing notifications for the signed-in staff user.
-  Future<void> syncStaffHearingNotifications({bool force = false}) async {
+  Future<int> syncStaffHearingNotifications({
+    bool force = false,
+    int maxDocs = 8,
+  }) async {
     final uid = FirebaseAuth.instance.currentUser?.uid;
-    if (uid == null) return;
+    if (uid == null) return 0;
     try {
-      if (!await _isStaffAccount(uid)) return;
+      if (!await _isStaffAccount(uid)) return 0;
+      if (!await _canUseGlobalHearingsInbox(uid)) return 0;
 
-      if (!await _canUseGlobalHearingsInbox(uid)) return;
+      final snap = await _db
+          .collection('hearings')
+          .limit(maxDocs * 4)
+          .get();
 
-      final snap = await _db.collection('hearings').limit(100).get();
-
-      var forcedProcessed = 0;
-      const maxForcedPerRun = 8;
+      var synced = 0;
       for (final doc in snap.docs) {
         if (!isDisplayableHearingRow(doc.data())) continue;
         await ensureStaffHearingNotificationForUser(doc, uid);
-        if (force) {
-          if (forcedProcessed >= maxForcedPerRun) break;
-          await processDocumentIfNeeded(doc, ignoreProcessedDigest: true);
-          forcedProcessed++;
-          await Future<void>.delayed(Duration.zero);
-        }
+        synced++;
+        if (synced >= maxDocs) break;
+        await Future<void>.delayed(Duration.zero);
       }
+      return synced;
     } catch (e) {
       if (kDebugMode) {
         _fanoutLog('HearingNotificationFanout.syncStaffHearingNotifications: $e');
       }
+      return 0;
     }
   }
 
   /// One-shot scan (e.g. when opening Appointment Reminders) so new `hearings` are
   /// fan-out even if the real-time listener missed the first write.
-  Future<void> syncRecentHearingsForInbox({bool force = false}) async {
+  Future<void> syncRecentHearingsForInbox({
+    bool force = false,
+    int maxDocs = 15,
+  }) async {
     if (kIsWeb) return;
 
     final uid = FirebaseAuth.instance.currentUser?.uid;
@@ -3386,7 +3611,7 @@ class HearingNotificationFanoutService {
         if (!isDisplayableHearingRow(doc.data())) continue;
         await processDocumentIfNeeded(doc);
         processed++;
-        if (processed >= (kIsWeb ? 8 : 15)) break;
+        if (processed >= maxDocs) break;
         await Future<void>.delayed(Duration.zero);
       }
       _lastInboxSyncAt[uid] = DateTime.now();
@@ -3478,6 +3703,9 @@ class _InboxStreamBundle {
   List<HearingInboxRow>? _lastRows;
 
   List<HearingInboxRow>? get lastRows => _lastRows;
+
+  QuerySnapshot<Map<String, dynamic>>? get lastHearingsSnapshot =>
+      _lastHearings;
 
   Stream<List<HearingInboxRow>> get rowsStream => _rowsController.stream;
   late final Stream<int> countStream;

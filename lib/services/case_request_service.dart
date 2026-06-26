@@ -2,6 +2,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import '../models/case_request_model.dart';
 import 'fcm_service.dart';
+import 'firestore_mirror_helper.dart';
 
 class CaseRequestService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -50,8 +51,14 @@ class CaseRequestService {
         'updatedAt': FieldValue.serverTimestamp(),
       };
 
-      final requestRef = await _firestore.collection('case_requests').add(requestData);
-      final requestId = requestRef.id;
+      final requestResult = await HybridDatastore.add(
+        collection: 'case_requests',
+        data: requestData,
+      );
+      if (!requestResult.isSuccess) {
+        return {'success': false, 'message': requestResult.failureMessage};
+      }
+      final requestId = requestResult.id!;
 
       if (kDebugMode) {
         debugPrint('✅ Case request created: $requestId');
@@ -69,8 +76,8 @@ class CaseRequestService {
       }
 
       // Also create in-app notification
-      await _firestore.collection('notifications').add({
-        'userId': attorneyId ?? 'all_attorneys', // Use 'all_attorneys' if no specific attorney
+      final notifData = <String, dynamic>{
+        'userId': attorneyId ?? 'all_attorneys',
         'type': 'case_request',
         'title': 'New Case Request',
         'message': '$clientName: $subject',
@@ -81,7 +88,8 @@ class CaseRequestService {
         },
         'isRead': false,
         'createdAt': FieldValue.serverTimestamp(),
-      });
+      };
+      await HybridDatastore.add(collection: 'notifications', data: notifData);
 
       if (kDebugMode) {
         debugPrint('✅ Notifications sent');
@@ -233,10 +241,16 @@ class CaseRequestService {
   /// Mark request as reviewed
   Future<void> markRequestAsReviewed(String requestId) async {
     try {
-      await _firestore.collection('case_requests').doc(requestId).update({
+      final patch = <String, dynamic>{
         'status': 'reviewed',
         'updatedAt': FieldValue.serverTimestamp(),
-      });
+      };
+      final result = await HybridDatastore.update(
+        collection: 'case_requests',
+        id: requestId,
+        patch: patch,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
     } catch (e) {
       throw Exception('Failed to mark request as reviewed: $e');
     }
@@ -245,11 +259,17 @@ class CaseRequestService {
   /// Mark request as converted to case
   Future<void> markRequestAsConverted(String requestId, String caseId) async {
     try {
-      await _firestore.collection('case_requests').doc(requestId).update({
+      final patch = <String, dynamic>{
         'status': 'converted',
         'convertedToCaseId': caseId,
         'updatedAt': FieldValue.serverTimestamp(),
-      });
+      };
+      final result = await HybridDatastore.update(
+        collection: 'case_requests',
+        id: requestId,
+        patch: patch,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
     } catch (e) {
       throw Exception('Failed to mark request as converted: $e');
     }
@@ -276,11 +296,17 @@ class CaseRequestService {
       final subject = requestData['subject'] as String;
 
       // Update request status to accepted
-      await _firestore.collection('case_requests').doc(requestId).update({
+      final acceptPatch = <String, dynamic>{
         'status': 'accepted',
         'attorneyId': attorneyId,
         'updatedAt': FieldValue.serverTimestamp(),
-      });
+      };
+      final result = await HybridDatastore.update(
+        collection: 'case_requests',
+        id: requestId,
+        patch: acceptPatch,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
 
       if (kDebugMode) {
         debugPrint('✅ Request accepted: $requestId');
@@ -290,7 +316,7 @@ class CaseRequestService {
       await _sendAcceptanceNotificationToClient(clientId, clientName, subject);
 
       // Create in-app notification for client
-      await _firestore.collection('notifications').add({
+      final notifData = <String, dynamic>{
         'userId': clientId,
         'type': 'inquiry_accepted',
         'title': 'Inquiry Accepted',
@@ -301,7 +327,8 @@ class CaseRequestService {
         },
         'isRead': false,
         'createdAt': FieldValue.serverTimestamp(),
-      });
+      };
+      await HybridDatastore.add(collection: 'notifications', data: notifData);
 
       if (kDebugMode) {
         debugPrint('✅ Client notified');
@@ -342,10 +369,16 @@ class CaseRequestService {
   /// Dismiss a request
   Future<void> dismissRequest(String requestId) async {
     try {
-      await _firestore.collection('case_requests').doc(requestId).update({
+      final patch = <String, dynamic>{
         'status': 'dismissed',
         'updatedAt': FieldValue.serverTimestamp(),
-      });
+      };
+      final result = await HybridDatastore.update(
+        collection: 'case_requests',
+        id: requestId,
+        patch: patch,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
     } catch (e) {
       throw Exception('Failed to dismiss request: $e');
     }

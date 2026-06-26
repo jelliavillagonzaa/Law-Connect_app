@@ -6,10 +6,7 @@ import '../../services/firestore_service.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/common/app_button.dart';
 import '../../widgets/otp_input_field.dart';
-import '../attorney/attorney_dashboard.dart';
-import '../admin/admin_dashboard.dart';
-import '../staff/staff_dashboard.dart';
-import '../../screens/client/dashboard_screen_with_nav.dart';
+import '../../routes/portal_navigation.dart';
 
 class OtpVerificationPage extends StatefulWidget {
   const OtpVerificationPage({super.key});
@@ -49,19 +46,19 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
         // Redirect immediately without delay
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) {
-            Get.offAll(() => const StaffDashboard());
+            navigateToPortalDashboard('staff');
           }
         });
       } else if (role == 'admin') {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) {
-            Get.offAll(() => const AdminDashboard());
+            navigateToPortalDashboard('admin');
           }
         });
       } else if (role == 'attorney') {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) {
-            Get.offAll(() => const AttorneyDashboard());
+            navigateToPortalDashboard('attorney');
           }
         });
       }
@@ -182,15 +179,7 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
   }
 
   void _goToDashboardForRole(String? role) {
-    if (role == 'admin') {
-      Get.offAll(() => const AdminDashboard());
-    } else if (role == 'attorney') {
-      Get.offAll(() => const AttorneyDashboard());
-    } else if (role == 'staff') {
-      Get.offAll(() => const StaffDashboard());
-    } else {
-      Get.offAll(() => const DashboardScreenWithNav());
-    }
+    navigateToPortalDashboard(role ?? 'client');
   }
   
   Future<String?> _getUserRole() async {
@@ -592,11 +581,11 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
                           TextButton(
                             onPressed: () {
                               if (role == 'staff') {
-                                Get.offAll(() => const StaffDashboard());
+                                navigateToPortalDashboard('staff');
                               } else if (role == 'admin') {
-                                Get.offAll(() => const AdminDashboard());
+                                navigateToPortalDashboard('admin');
                               } else if (role == 'attorney') {
-                                Get.offAll(() => const AttorneyDashboard());
+                                navigateToPortalDashboard('attorney');
                               }
                             },
                             style: TextButton.styleFrom(

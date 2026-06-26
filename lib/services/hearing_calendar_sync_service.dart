@@ -185,7 +185,6 @@ class HearingCalendarSyncService {
     final firmViewer = _isFirmViewerForAttorney(aid);
 
     QuerySnapshot<Map<String, dynamic>>? lastGlobalHearings;
-    QuerySnapshot<Map<String, dynamic>>? lastAttorneyUidHearings;
     List<QueryDocumentSnapshot<Map<String, dynamic>>> scopedDocs = [];
     var scopedReady = false;
 
@@ -193,17 +192,15 @@ class HearingCalendarSyncService {
       try {
         final merged =
             <String, QueryDocumentSnapshot<Map<String, dynamic>>>{};
-        final attorneyUidSnap = lastAttorneyUidHearings;
-        if (attorneyUidSnap != null) {
-          for (final d in attorneyUidSnap.docs) {
-            merged[d.id] = d;
-          }
-        }
         for (final d in scopedDocs) {
           merged[d.id] = d;
         }
+        // Staff (firm viewer) and attorney both consume the full `hearings`
+        // read when permitted, so the staff calendar mirrors the attorney
+        // exactly. Scoped docs above remain as a fallback if a full read is
+        // denied by security rules.
         final globalSnap = lastGlobalHearings;
-        if (!firmViewer && globalSnap != null) {
+        if (globalSnap != null) {
           for (final d in globalSnap.docs) {
             merged[d.id] = d;
           }
@@ -244,9 +241,8 @@ class HearingCalendarSyncService {
       if (_isPermissionDenied(e)) {
         if (casesStream) {
           caseMaps = [];
-        } else if (firmViewer) {
-          lastAttorneyUidHearings = null;
         } else {
+          // Full `hearings` read denied — fall back to scoped queries.
           lastGlobalHearings = null;
         }
         unawaited(refreshScoped());
@@ -269,35 +265,28 @@ class HearingCalendarSyncService {
       onError: (e) => handleOverlayStreamError(e, casesStream: true),
     );
 
+    // Both staff and attorney listen to the full `hearings` collection so the
+    // staff calendar shows the same hearings as the attorney. Only the attorney
+    // persists the calendar_events sync copies. If the full read is denied, the
+    // error handler falls back to the scoped queries.
     late final StreamSubscription<dynamic> hearingsSub;
+    hearingsSub = _db.collection('hearings').limit(500).snapshots().listen(
+      (snap) {
+        lastGlobalHearings = snap;
+        unawaited(emit());
+        if (!firmViewer &&
+            !_syncWritesBlocked &&
+            canWriteCalendarSync(aid)) {
+          unawaited(_syncFromSnapshots(aid, caseMaps, hearings: snap.docs));
+        }
+      },
+      onError: (e) => handleOverlayStreamError(e, casesStream: false),
+    );
     if (firmViewer) {
-      hearingsSub = _db
-          .collection('hearings')
-          .where('attorneyUid', isEqualTo: aid)
-          .limit(300)
-          .snapshots()
-          .listen(
-        (snap) {
-          lastAttorneyUidHearings = snap;
-          unawaited(emit());
-        },
-        onError: (e) => handleOverlayStreamError(e, casesStream: false),
-      );
+      // Seed the scoped fallback immediately in case the full read is denied.
       unawaited(refreshScoped());
-    } else {
-      hearingsSub = _db.collection('hearings').limit(500).snapshots().listen(
-        (snap) {
-          lastGlobalHearings = snap;
-          unawaited(emit());
-          if (!_syncWritesBlocked && canWriteCalendarSync(aid)) {
-            unawaited(_syncFromSnapshots(aid, caseMaps, hearings: snap.docs));
-          }
-        },
-        onError: (e) => handleOverlayStreamError(e, casesStream: false),
-      );
-      if (!_syncWritesBlocked && canWriteCalendarSync(aid)) {
-        unawaited(syncAllForAttorney(aid));
-      }
+    } else if (!_syncWritesBlocked && canWriteCalendarSync(aid)) {
+      unawaited(syncAllForAttorney(aid));
     }
 
     _overlaySubs[aid] = _CombinedSubscription([casesSub, hearingsSub]);

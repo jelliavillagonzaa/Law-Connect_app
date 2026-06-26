@@ -7,6 +7,8 @@ import '../../services/staff_auth_service.dart';
 import '../../services/notification_service.dart';
 import '../../services/hearing_calendar_fields.dart';
 import '../../services/hearing_calendar_sync_service.dart';
+import '../../services/enhanced_appointment_service.dart';
+import '../../models/appointment_model.dart';
 import '../../models/case_model.dart';
 import '../../models/user_model.dart';
 import '../../widgets/common/hearing_calendar_event_body.dart';
@@ -23,22 +25,24 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
   final StaffService _staffService = StaffService();
   final StaffAuthService _staffAuthService = StaffAuthService();
   final NotificationService _notificationService = NotificationService();
+  final EnhancedAppointmentService _appointmentService =
+      EnhancedAppointmentService();
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   String? _assignedAttorneyId;
   DateTime _viewDate = DateTime.now();
   String _viewMode = 'month'; // 'month' or 'week'
   List<Map<String, dynamic>> _calendarEvents = [];
   List<Map<String, dynamic>> _hearingOverlay = [];
+  List<AppointmentModel> _appointments = [];
   List<CaseModel> _attorneyCases = [];
-  bool _isLoading = true;
+  bool _isLoading = false;
   bool _didAutoFocusHearingMonth = false;
-  String? _syncAttachedAttorneyId;
 
   // Stream subscriptions
   StreamSubscription<List<CaseModel>>? _casesSubscription;
   StreamSubscription<List<Map<String, dynamic>>>? _eventsSubscription;
-  StreamSubscription<List<Map<String, dynamic>>>? _hearingOverlaySub;
   StreamSubscription<List<Map<String, dynamic>>>? _notificationsSubscription;
+  StreamSubscription<List<AppointmentModel>>? _appointmentsSubscription;
 
   // Calendar color theme (match attorney calendar)
   static const Color calendarBlue = Color.fromARGB(255, 46, 109, 192);
@@ -46,42 +50,23 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
   static const Color sundayRed = Color(0xFFE53935);
   static const Color hearingEventColor = Color(0xFF5E35B1);
 
+  Timer? _reminderPeriodicTimer;
+  // Hearing overlay disabled on mobile to avoid ANR.
+
   @override
   void initState() {
     super.initState();
     _notificationService.initialize();
     _loadAttorneyId();
-    _checkScheduledReminders();
-  }
-
-  Future<void> _checkScheduledReminders() async {
-    // Defer the initial check to avoid issues during initState
-    Future.microtask(() async {
-      if (mounted) {
-        await _staffService.checkAndSendScheduledReminders();
-      }
-    });
-
-    // Also check periodically (every hour)
-    Timer.periodic(const Duration(hours: 1), (timer) {
-      if (mounted) {
-        Future.microtask(() async {
-          if (mounted) {
-            await _staffService.checkAndSendScheduledReminders();
-          }
-        });
-      } else {
-        timer.cancel();
-      }
-    });
   }
 
   @override
   void dispose() {
+    _reminderPeriodicTimer?.cancel();
     _casesSubscription?.cancel();
     _eventsSubscription?.cancel();
-    _hearingOverlaySub?.cancel();
     _notificationsSubscription?.cancel();
+    _appointmentsSubscription?.cancel();
     super.dispose();
   }
 
@@ -101,10 +86,10 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
       });
       _loadAttorneyCases();
       _loadCalendarEvents();
-      _subscribeHearingOverlay(staff.assignedAttorneyId);
-      Future.microtask(
-        () => _loadHearingsFromFirestoreFallback(staff.assignedAttorneyId),
-      );
+      // NOTE: Avoid heavy `hearings` listeners / bulk reads on open; these can
+      // trigger ANR a few seconds after login on some devices. Staff still sees
+      // the mirrored `calendar_events` stream (manual + synced).
+      _subscribeAppointments(staff.assignedAttorneyId);
       _checkHearingNotifications();
     } else {
       Future.microtask(() {
@@ -142,12 +127,6 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
       return;
     }
 
-    Future.microtask(() {
-      if (mounted) {
-        setState(() => _isLoading = true);
-      }
-    });
-
     _eventsSubscription?.cancel();
     _eventsSubscription = _staffService
         .getCalendarEvents(_assignedAttorneyId!)
@@ -157,68 +136,80 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
               setState(() {
                 _calendarEvents = events;
                 _isLoading = false;
+                _maybeFocusFirstHearingMonth();
               });
             }
           });
         });
   }
 
-  void _subscribeHearingOverlay(String? attorneyId) {
+  /// Same client appointments the attorney sees, so the calendars are identical.
+  void _subscribeAppointments(String? attorneyId) {
     final aid = attorneyId?.trim() ?? '';
     if (aid.isEmpty) return;
 
-    _syncAttachedAttorneyId = aid;
-    _hearingOverlaySub?.cancel();
-    _hearingOverlaySub = HearingCalendarSyncService.instance
-        .watchHearingEntriesForAttorney(aid)
-        .listen(
-      (rows) {
-        if (mounted) {
-          setState(() {
-            _hearingOverlay = rows;
-            _maybeFocusFirstHearingMonth(rows);
-          });
-        }
+    _appointmentsSubscription?.cancel();
+    _appointmentsSubscription =
+        _appointmentService.getAttorneyAppointments(aid).listen(
+      (appointments) {
+        if (!mounted) return;
+        setState(() {
+          _appointments = appointments;
+        });
       },
       onError: (e) {
-        debugPrint('Staff calendar hearings stream: $e');
+        debugPrint('Staff calendar appointments stream: $e');
       },
     );
   }
 
-  Future<void> _loadHearingsFromFirestoreFallback(String? attorneyId) async {
-    final aid = attorneyId?.trim() ?? '';
-    if (aid.isEmpty) return;
-    try {
-      final casesSnap = await _firestore
-          .collection('cases')
-          .where('attorneyId', isEqualTo: aid)
-          .get();
-      final caseMaps = casesSnap.docs
-          .map((d) => <String, dynamic>{'id': d.id, ...d.data()})
-          .toList();
+  /// Adapts an attorney client appointment into the calendar event shape used
+  /// by the day cells / dialogs (rendered as a non-hearing blue chip).
+  Map<String, dynamic> _appointmentAsEvent(AppointmentModel a) {
+    final title = a.clientName.trim().isNotEmpty
+        ? a.clientName.trim()
+        : (a.caseTitle?.trim().isNotEmpty == true
+            ? a.caseTitle!.trim()
+            : 'Appointment');
+    return <String, dynamic>{
+      'id': 'appt_${a.id}',
+      'appointmentId': a.id,
+      'eventType': 'appointment',
+      'eventDate': a.appointmentDateTime,
+      'title': title,
+      'description': a.notes,
+      'clientName': a.clientName,
+      'caseTitle': a.caseTitle,
+      'appointmentType': a.appointmentType,
+      'status': a.status,
+      'source': 'attorney_appointment',
+    };
+  }
 
-      final hearingsSnap =
-          await _firestore.collection('hearings').limit(500).get();
-      final rows = HearingCalendarSyncService.instance.projectHearingsFromDocs(
-        aid,
-        caseMaps,
-        hearingsSnap.docs,
-      );
-      if (!mounted || rows.isEmpty) return;
-      setState(() {
-        _hearingOverlay = rows;
-        _maybeFocusFirstHearingMonth(rows);
-      });
-    } catch (e) {
-      debugPrint('Staff calendar hearings fallback: $e');
+  /// All automated hearing entries for navigation: live overlay + the synced
+  /// `calendar_events` the attorney mirrored (deduped by hearingDocId).
+  List<Map<String, dynamic>> _allHearingNavEvents() {
+    final out = <Map<String, dynamic>>[];
+    final seenHearingIds = <String>{};
+    void add(Map<String, dynamic> ev) {
+      final hid = (ev['hearingDocId'] as String?)?.trim() ?? '';
+      if (hid.isNotEmpty && !seenHearingIds.add(hid)) return;
+      out.add(ev);
     }
+
+    for (final ev in _hearingOverlay) {
+      add(ev);
+    }
+    for (final ev in _calendarEvents) {
+      if (_isHearingCalendarEvent(ev)) add(ev);
+    }
+    return out;
   }
 
   List<DateTime> _hearingMonthsOutsideView() {
     final seen = <String>{};
     final out = <DateTime>[];
-    for (final ev in _hearingOverlay) {
+    for (final ev in _allHearingNavEvents()) {
       final d = _dateTimeFromField(ev['eventDate']);
       if (d == null) continue;
       if (d.year == _viewDate.year && d.month == _viewDate.month) continue;
@@ -238,7 +229,7 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     final months = _hearingMonthsOutsideView();
     if (months.isEmpty) return const SizedBox.shrink();
     return Material(
-      color: calendarGold.withValues(alpha: 0.35),
+      color: calendarGold.withOpacity(0.35),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         child: Wrap(
@@ -286,10 +277,10 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     return null;
   }
 
-  void _maybeFocusFirstHearingMonth(List<Map<String, dynamic>> rows) {
-    if (_didAutoFocusHearingMonth || rows.isEmpty) return;
+  void _maybeFocusFirstHearingMonth() {
+    if (_didAutoFocusHearingMonth) return;
     final dates = <DateTime>[];
-    for (final row in rows) {
+    for (final row in _allHearingNavEvents()) {
       final d = _dateTimeFromField(row['eventDate']);
       if (d != null) dates.add(d);
     }
@@ -300,8 +291,12 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     );
     if (hasInViewMonth) return;
     _didAutoFocusHearingMonth = true;
-    final first = dates.first;
-    _viewDate = DateTime(first.year, first.month);
+    // Prefer the nearest upcoming hearing month; fall back to the earliest.
+    final now = DateTime.now();
+    final monthStart = DateTime(now.year, now.month);
+    final upcoming = dates.where((d) => !d.isBefore(monthStart)).toList();
+    final target = upcoming.isNotEmpty ? upcoming.first : dates.first;
+    _viewDate = DateTime(target.year, target.month);
   }
 
   bool _isHearingCalendarEvent(Map<String, dynamic> ev) {
@@ -381,6 +376,7 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     final day = DateTime(date.year, date.month, date.day);
     final out = <Map<String, dynamic>>[];
     final syncedHearingIds = <String>{};
+    final appointmentIds = <String>{};
 
     void addEvent(Map<String, dynamic> ev) {
       final eventDate = _dateTimeFromField(ev['eventDate']);
@@ -396,16 +392,28 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
         if (syncedHearingIds.contains(hid)) return;
         syncedHearingIds.add(hid);
       }
+      final aptId = (ev['appointmentId'] as String?)?.trim() ?? '';
+      if (aptId.isNotEmpty) {
+        if (appointmentIds.contains(aptId)) return;
+        appointmentIds.add(aptId);
+      }
       out.add(Map<String, dynamic>.from(ev));
     }
 
     for (final ev in _hearingOverlay) {
       addEvent(ev);
     }
+    // Mirror exactly what the attorney sees: include hearing `calendar_events`
+    // the attorney synced. The live overlay is added first, so the
+    // `hearingDocId` dedup in addEvent() drops any duplicate synced copy.
     for (final ev in _calendarEvents) {
-      if (isFirestoreSyncedHearingCalendarRow(ev)) continue;
-      if (ev['eventType'] == 'hearing') continue;
       addEvent(ev);
+    }
+    // Same client appointments the attorney shows (dedup by appointmentId
+    // against any mirrored calendar_events row).
+    for (final apt in _appointments) {
+      if (apt.appointmentType == 'hearing_court') continue;
+      addEvent(_appointmentAsEvent(apt));
     }
 
     out.sort((a, b) {
@@ -429,6 +437,8 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
         return Colors.green;
       case 'reminder':
         return Colors.purple;
+      case 'appointment':
+        return calendarBlue;
       default:
         return calendarBlue;
     }
@@ -655,7 +665,8 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     final isWeb = screenWidth > 200;
     final gridPadding = EdgeInsets.all(isWeb ? 8 : 16);
     final spacing = isWeb ? 4.0 : 8.0;
-    final aspectRatio = isWeb ? 0.9 : 1.2;
+    // Match the attorney calendar grid so staff/attorney cells look identical.
+    final aspectRatio = isWeb ? 0.82 : 1.05;
 
     return GridView.builder(
       padding: gridPadding,
@@ -826,7 +837,7 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
                 ? () => _showEventsForDate(day, events)
                 : () => _showAddEventDialogForDate(day),
             child: Padding(
-              padding: const EdgeInsets.all(8),
+              padding: const EdgeInsets.all(6),
               child: Row(
                 children: [
                   Text(
@@ -871,11 +882,26 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
           Expanded(
             child: ListView.builder(
               padding: const EdgeInsets.symmetric(horizontal: 4),
-              itemCount: events.length > 3 ? 3 : events.length,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: (events.length > 3 ? 3 : events.length) +
+                  (events.length > 3 ? 1 : 0),
               itemBuilder: (context, index) {
+                final shownCount = events.length > 3 ? 3 : events.length;
+                if (index >= shownCount) {
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 4,
+                      vertical: 2,
+                    ),
+                    child: Text(
+                      '+${events.length - 3} more',
+                      style: TextStyle(fontSize: 9, color: Colors.grey[600]),
+                    ),
+                  );
+                }
                 final event = events[index];
-                final when = _dateTimeFromField(event['eventDate']);
                 final isHearing = _isHearingCalendarEvent(event);
+                final when = _dateTimeFromField(event['eventDate']);
                 return InkWell(
                   onTap: () => _showEventDetails(event),
                   child: Container(
@@ -893,15 +919,41 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        if (when != null)
-                          Text(
-                            DateFormat('hh:mm a').format(when),
-                            style: const TextStyle(
-                              fontSize: 8,
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold,
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                when != null
+                                    ? DateFormat('hh:mm a').format(when)
+                                    : '',
+                                style: const TextStyle(
+                                  fontSize: 8,
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
                             ),
-                          ),
+                            if (isAiSyncedCalendarEvent(event))
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 3,
+                                  vertical: 1,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: calendarGold,
+                                  borderRadius: BorderRadius.circular(3),
+                                ),
+                                child: const Text(
+                                  'AI',
+                                  style: TextStyle(
+                                    fontSize: 6,
+                                    color: Colors.black87,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
                         Text(
                           isHearing
                               ? _hearingDisplayTitle(event)
@@ -921,14 +973,6 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
               },
             ),
           ),
-          if (events.length > 3)
-            Padding(
-              padding: const EdgeInsets.all(4),
-              child: Text(
-                '+${events.length - 3} more',
-                style: TextStyle(fontSize: 10, color: Colors.grey[600]),
-              ),
-            ),
         ],
       ),
     );

@@ -3,12 +3,10 @@ import 'package:get/get.dart';
 
 import '../../services/auth_service.dart';
 import '../../widgets/common/app_button.dart';
+import '../../widgets/common/brand_logo.dart';
 import '../../widgets/common/app_text_field.dart';
 import '../../theme/app_theme.dart';
-import '../../screens/client/dashboard_screen_with_nav.dart';
-import '../attorney/attorney_dashboard.dart';
-import '../admin/admin_dashboard.dart';
-import '../staff/staff_dashboard.dart';
+import '../../routes/portal_navigation.dart';
 import 'signup_page.dart';
 import 'otp_verification.dart';
 import 'forgot_password_page.dart';
@@ -28,19 +26,18 @@ class _LoginPageState extends State<LoginPage> {
   bool _isLoading = false;
   bool _obscurePassword = true;
 
+  @override
+  void initState() {
+    super.initState();
+    // Keep login lightweight; portal navigation already prefetches the
+    // resolved role dashboard on successful login.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      prefetchPortalDashboard('client');
+    });
+  }
+
   void _navigateToPortal(String portalRole) {
-    final Widget destination = switch (portalRole) {
-      'admin' => const AdminDashboard(),
-      'attorney' => const AttorneyDashboard(),
-      'staff' => const StaffDashboard(),
-      _ => const DashboardScreenWithNav(),
-    };
-    // Navigate immediately — snackbar + delay was freezing the UI on mobile.
-    Get.offAll(
-      () => destination,
-      transition: Transition.fadeIn,
-      duration: const Duration(milliseconds: 200),
-    );
+    navigateToPortalDashboard(portalRole);
   }
 
   Future<void> _login() async {
@@ -136,15 +133,7 @@ class _LoginPageState extends State<LoginPage> {
                 mainAxisAlignment: MainAxisAlignment.center,
                 crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
-                  // Logo
-                  ClipOval(
-                    child: Image.asset(
-                      'assets/logo.png',
-                      width: 150,
-                      height: 150,
-                      fit: BoxFit.cover,
-                    ),
-                  ),
+                  const BrandLogo(size: 150),
                   const SizedBox(height: 12),
                   // Title
                   Text(

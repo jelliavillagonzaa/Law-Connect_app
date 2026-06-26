@@ -34,6 +34,7 @@ import '../../screens/attorney/attorney_create_case_screen.dart';
 import '../../screens/attorney/attorney_client_chat_screen.dart';
 import '../../screens/attorney/attorney_tasks_screen.dart';
 import '../../screens/attorney/attorney_create_task_screen.dart';
+import '../../screens/billing/billing_management_screen.dart';
 
 class AttorneyDashboard extends StatefulWidget {
   const AttorneyDashboard({super.key});
@@ -64,6 +65,8 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
   StreamSubscription<List<AppointmentModel>>? _appointmentsSub;
   StreamSubscription? _chatsSub;
   Stream<List<AppointmentModel>>? _sharedAppointmentsStream;
+  Stream<List<CaseModel>>? _sharedCasesStream;
+  bool _dashboardStreamsAttached = false;
   Timer? _unreadDebounce;
   Timer? _dashboardDebounce;
   Timer? _calendarPrewarmTimer;
@@ -77,6 +80,17 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
   int _unreadCount = 0;
   String _casesSearchQuery = '';
 
+  Object get _dashboardTabRevision => Object.hash(
+        _stats['totalCases'],
+        _stats['activeCases'],
+        _stats['completedCases'],
+        _stats['pendingCases'],
+        _stats['upcomingAppointments'],
+        _myCases.length,
+        _pendingRequests.length,
+        _upcomingAppointments.length,
+      );
+
   @override
   void initState() {
     super.initState();
@@ -89,15 +103,31 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       if (!mounted) return;
       unawaited(_loadUserData());
       _loadDashboardData();
-      unawaited(_loadUnreadCount());
       final uid = FirebaseAuth.instance.currentUser?.uid;
-      if (uid != null && uid.isNotEmpty && !kIsWeb) {
-        _calendarPrewarmTimer = Timer(const Duration(seconds: 6), () {
+      if (uid == null || uid.isEmpty) return;
+
+      if (kIsWeb) {
+        Timer(const Duration(seconds: 8), () {
           if (!mounted) return;
-          final fanout = HearingNotificationFanoutService.instance;
-          fanout.attach();
-          unawaited(fanout.prepareBellCount(uid));
-          fanout.warmInbox(uid);
+          unawaited(_loadUnreadCount());
+        });
+        _calendarPrewarmTimer = Timer(const Duration(seconds: 25), () {
+          if (!mounted) return;
+          _mobileTabStackKey.currentState?.prewarm(4);
+        });
+        Timer(const Duration(seconds: 3), () {
+          if (!mounted) return;
+          unawaited(
+            HearingNotificationFanoutService.instance.prepareBellCount(uid),
+          );
+        });
+      } else {
+        Timer(const Duration(seconds: 8), () {
+          if (!mounted) return;
+          unawaited(_loadUnreadCount());
+          unawaited(
+            HearingNotificationFanoutService.instance.prepareBellCount(uid),
+          );
         });
       }
     });
@@ -107,12 +137,10 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
   void dispose() {
     _casesSub?.cancel();
     _appointmentsSub?.cancel();
+    _chatsSub?.cancel();
     _unreadDebounce?.cancel();
     _dashboardDebounce?.cancel();
     _calendarPrewarmTimer?.cancel();
-    if (!kIsWeb) {
-      HearingNotificationFanoutService.instance.detach();
-    }
     super.dispose();
   }
 
@@ -133,7 +161,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     );
   }
 
-  Widget _buildRemindersBellIcon({bool includeMessageCount = false}) {
+  Widget _buildRemindersBellIcon() {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
       return Icon(
@@ -142,19 +170,18 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       );
     }
 
-    return RemindersBellButton(
-      userId: user.uid,
-      messageUnreadCount: _unreadCount,
-      includeMessageCount: includeMessageCount,
-    );
+    return RemindersBellButton(userId: user.uid);
   }
 
   Widget _buildMessageIcon() {
     return AppIconButton.appBar(
       icon: Icons.message_outlined,
-      tooltip: 'Messages',
+      tooltip: _unreadCount > 0 ? 'Messages ($_unreadCount unread)' : 'Messages',
       badgeCount: _unreadCount,
-      onPressed: () => Get.to(() => const ChatListPage()),
+      onPressed: () async {
+        await Get.to(() => const ChatListPage());
+        if (mounted) unawaited(_loadUnreadCount());
+      },
     );
   }
 
@@ -166,10 +193,13 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       final count = await _chatService.getUnreadCount(user.uid);
       _applyUnreadCount(count);
 
-      await _chatsSub?.cancel();
-      _chatsSub = _chatService.getUserChats(user.uid).listen((_) {
-        _scheduleUnreadCountRefresh(user.uid);
-      });
+      // Live chat stream on dashboard caused post-login freezes (web especially).
+      if (!kIsWeb) {
+        await _chatsSub?.cancel();
+        _chatsSub = _chatService.getUserChats(user.uid).listen((_) {
+          _scheduleUnreadCountRefresh(user.uid);
+        });
+      }
     } catch (_) {
       // Non-critical; avoid console noise on tab switches.
     }
@@ -206,14 +236,16 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
   }
 
   Future<void> _loadDashboardData() async {
+    if (_dashboardStreamsAttached) return;
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
       return;
     }
+    _dashboardStreamsAttached = true;
 
     try {
-      // Load cases and appointments
-      final casesStream = _caseService.getCasesForUser(user.uid, 'attorney');
+      final casesStream = _sharedCasesStream ??=
+          _caseService.getCasesForUser(user.uid, 'attorney');
       _sharedAppointmentsStream ??= _appointmentService.getAttorneyAppointments(
         user.uid,
       );
@@ -546,7 +578,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                         ),
                         Row(
                           children: [
-                            _buildRemindersBellIcon(includeMessageCount: true),
+                            _buildRemindersBellIcon(),
                             const SizedBox(width: 8),
                             _buildMessageIcon(),
                           ],
@@ -607,6 +639,9 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       return LazyIndexedStack(
         key: _mobileTabStackKey,
         index: _selectedBottomNavIndex,
+        activeTabRevision: _selectedBottomNavIndex == 0
+            ? _dashboardTabRevision
+            : 'mobile_tab_$_selectedBottomNavIndex',
         builders: [
           () => _buildDashboardView(),
           () => _buildCasesView(isMobile: true),
@@ -629,6 +664,9 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     return LazyIndexedStack(
       key: _desktopTabStackKey,
       index: _desktopTabIndex(),
+      activeTabRevision: _desktopTabIndex() == 0
+          ? _dashboardTabRevision
+          : 'desktop_tab_${_desktopTabIndex()}',
       builders: [
         () => _buildDashboardView(),
         () => _buildCasesView(isMobile: false),
@@ -646,6 +684,19 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
         ),
         () => const AttorneyProfilePage(embedded: true),
       ],
+    );
+  }
+
+  void _openBilling() {
+    final attorneyId = FirebaseAuth.instance.currentUser?.uid;
+    if (attorneyId == null) return;
+    Get.to(
+      () => BillingManagementScreen(
+        attorneyId: attorneyId,
+        title: 'Billing & Payments',
+        recorderRole: 'attorney',
+        recorderName: FirebaseAuth.instance.currentUser?.displayName,
+      ),
     );
   }
 
@@ -956,6 +1007,25 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                       },
                       icon: const Icon(Icons.task_outlined, size: 20),
                       label: const Text('View All Tasks'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: AppTheme.royalBlue,
+                        side: const BorderSide(color: AppTheme.royalBlue),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 20,
+                          vertical: 12,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                      ),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _openBilling,
+                      icon: const Icon(
+                        Icons.account_balance_wallet_outlined,
+                        size: 20,
+                      ),
+                      label: const Text('Billing & Payments'),
                       style: OutlinedButton.styleFrom(
                         foregroundColor: AppTheme.royalBlue,
                         side: const BorderSide(color: AppTheme.royalBlue),
@@ -1418,21 +1488,18 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
             : List<AppointmentModel>.from(_pendingRequests);
 
         if (displayPending.isEmpty) {
-          return ListView(
-            physics: const AlwaysScrollableScrollPhysics(
-              parent: BouncingScrollPhysics(),
-            ),
-            children: [
-              SizedBox(height: MediaQuery.of(context).size.height * 0.25),
-              const Icon(Icons.pending_actions, size: 64, color: Colors.grey),
-              const SizedBox(height: 16),
-              const Center(
-                child: Text(
+          return const Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.pending_actions, size: 64, color: Colors.grey),
+                SizedBox(height: 16),
+                Text(
                   'No pending requests',
                   style: TextStyle(fontSize: 18, color: Colors.grey),
                 ),
-              ),
-            ],
+              ],
+            ),
           );
         }
 

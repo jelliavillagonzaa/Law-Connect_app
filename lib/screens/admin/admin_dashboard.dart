@@ -1,3 +1,5 @@
+import 'dart:async' show unawaited;
+
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -36,37 +38,31 @@ class _AdminDashboardState extends State<AdminDashboard> {
   @override
   void initState() {
     super.initState();
-    _loadDashboardData();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_loadDashboardData());
+    });
   }
 
   Future<void> _loadDashboardData() async {
+    if (!mounted) return;
     setState(() => _isLoading = true);
     try {
-      // Get all users count
-      final usersSnapshot = await _firestore.collection('users').get();
-      final totalUsers = usersSnapshot.docs.length;
-      final clients = usersSnapshot.docs
-          .where((u) => u.data()['role'] == 'client')
-          .length;
-      final attorneys = usersSnapshot.docs
-          .where((u) => u.data()['role'] == 'attorney')
-          .length;
+      final countResults = await Future.wait([
+        _firestore.collection('users').count().get(),
+        _firestore.collection('users').where('role', isEqualTo: 'client').count().get(),
+        _firestore.collection('users').where('role', isEqualTo: 'attorney').count().get(),
+        _firestore.collection('cases').count().get(),
+        _firestore.collection('cases').where('status', isEqualTo: 'pending').count().get(),
+        _firestore.collection('cases').where('status', isEqualTo: 'in_progress').count().get(),
+      ]);
 
-      // Get all cases count
-      final casesSnapshot = await _firestore.collection('cases').get();
-      final totalCases = casesSnapshot.docs.length;
-      final pendingCases = casesSnapshot.docs
-          .where((c) => c.data()['status'] == 'pending')
-          .length;
-      final activeCases = casesSnapshot.docs
-          .where(
-            (c) =>
-                c.data()['status'] == 'in_progress' ||
-                c.data()['status'] == 'active',
-          )
-          .length;
+      final totalUsers = countResults[0].count ?? 0;
+      final clients = countResults[1].count ?? 0;
+      final attorneys = countResults[2].count ?? 0;
+      final totalCases = countResults[3].count ?? 0;
+      final pendingCases = countResults[4].count ?? 0;
+      final activeCases = countResults[5].count ?? 0;
 
-      // Load recent activity (system logs)
       final logsSnapshot = await _firestore
           .collection('system_logs')
           .orderBy('timestamp', descending: true)
@@ -170,39 +166,47 @@ class _AdminDashboardState extends State<AdminDashboard> {
   }
 
   Widget _buildContent() {
-    return switch (_activeItem) {
-      'users' => UserManagementScreen(
-          inline: true,
-          initialRoleFilter: _userManagementRoleFilter == 'all'
-              ? null
-              : _userManagementRoleFilter,
-        ),
-      'cases' => CaseOversightScreen(
-          inline: true,
-          initialStatusFilter: _caseOversightStatusFilter == 'all'
-              ? null
-              : _caseOversightStatusFilter,
-          onOpenArchiveStorage: () {
-            Get.to(
-              () => ArchiveStorageScreen(
-                onOpenBackup: () =>
-                    Get.to(() => const BackupSettingsScreen()),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return SizedBox(
+          width: constraints.maxWidth,
+          height: constraints.maxHeight,
+          child: switch (_activeItem) {
+            'users' => UserManagementScreen(
+                inline: true,
+                initialRoleFilter: _userManagementRoleFilter == 'all'
+                    ? null
+                    : _userManagementRoleFilter,
               ),
-            );
+            'cases' => CaseOversightScreen(
+                inline: true,
+                initialStatusFilter: _caseOversightStatusFilter == 'all'
+                    ? null
+                    : _caseOversightStatusFilter,
+                onOpenArchiveStorage: () {
+                  Get.to(
+                    () => ArchiveStorageScreen(
+                      onOpenBackup: () =>
+                          Get.to(() => const BackupSettingsScreen()),
+                    ),
+                  );
+                },
+              ),
+            'logs' => const SystemLogsScreen(inline: true),
+            'reports' => ReportsAnalyticsScreen(
+                inline: true,
+                onNavigateToUsers: ({String role = 'all'}) =>
+                    _openUsersFiltered(role),
+                onNavigateToCases: ({String status = 'all'}) =>
+                    _openCasesFiltered(status),
+              ),
+            'settings' => const SystemSettingsScreen(inline: true),
+            'dashboard' => _buildDashboardContent(),
+            _ => _buildDashboardContent(),
           },
-        ),
-      'logs' => const SystemLogsScreen(inline: true),
-      'reports' => ReportsAnalyticsScreen(
-          inline: true,
-          onNavigateToUsers: ({String role = 'all'}) =>
-              _openUsersFiltered(role),
-          onNavigateToCases: ({String status = 'all'}) =>
-              _openCasesFiltered(status),
-        ),
-      'settings' => const SystemSettingsScreen(inline: true),
-      'dashboard' => _buildDashboardContent(),
-      _ => _buildDashboardContent(),
-    };
+        );
+      },
+    );
   }
 
   Widget _buildDashboardContent() {
