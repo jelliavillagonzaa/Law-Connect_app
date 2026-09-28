@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
@@ -29,9 +28,9 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
   List<Map<String, dynamic>> _extraAlerts = [];
   List<Map<String, dynamic>> _notifications = [];
   bool _extrasLoaded = false;
-  bool _loadingExtras = true;
+  bool _loadingExtras = false;
   bool _refreshInFlight = false;
-  bool _loadingReminders = true;
+  bool _loadingReminders = false;
   bool _loadingInbox = false;
   List<LightweightReminderItem> _reminderItems = [];
   List<Map<String, dynamic>> _mergedNotificationsCache = [];
@@ -44,9 +43,8 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
     return value.toString();
   }
 
-  static bool _isCourtEmailSpam(String fsType) {
-    final t = fsType.toLowerCase();
-    return t == 'court_email_ingest' || t.startsWith('court_');
+  static bool _isCourtEmailSpam(Map<String, dynamic> data) {
+    return clientCourtEmailSpamNotification(data);
   }
 
   /// First paragraph / first line / short excerpt for the collapsed row (full body expands on tap).
@@ -55,15 +53,15 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
     Map<String, dynamic>? data,
   }) {
     if (data != null) {
-      final type = (data['type'] as String? ?? '').toLowerCase();
+      final type = _stringFrom(data['type']).toLowerCase();
       if (type.contains('hearing') ||
-          (data['hearingDocId'] as String?)?.trim().isNotEmpty == true) {
+          _stringFrom(data['hearingDocId']).isNotEmpty) {
         final line = HearingNotificationFormatter.buildSummary(data);
         if (line.isNotEmpty) return line;
       }
     }
 
-    final summary = (data?['summary'] as String?)?.trim();
+    final summary = _stringFrom(data?['summary']).trim();
     if (summary != null && summary.isNotEmpty) return summary;
     final t = message.trim();
     if (t.isEmpty) return null;
@@ -97,9 +95,6 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
   Future<void> _loadRemindersInbox(String staffId, {bool force = false}) async {
     if (_loadingInbox && !force) return;
     _loadingInbox = true;
-    if (mounted) {
-      setState(() => _loadingReminders = true);
-    }
 
     try {
       Query<Map<String, dynamic>> query = _firestore
@@ -111,24 +106,23 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
         snap = await query
             .orderBy('createdAt', descending: true)
             .limit(_inboxQueryLimit)
-            .get();
+            .get()
+            .timeout(const Duration(seconds: 4));
       } catch (_) {
-        snap = await query.limit(_inboxQueryLimit).get();
+        snap = await query
+            .limit(_inboxQueryLimit)
+            .get()
+            .timeout(const Duration(seconds: 4));
       }
       if (!mounted) return;
 
       final parsed = _parseInboxDocs(snap.docs);
       var reminders = parsed.reminders;
 
-      await Future<void>.delayed(
-        Duration(milliseconds: kIsWeb ? 800 : 1500),
-      );
-      if (!mounted) return;
-
       reminders = await LightweightRemindersInboxService.mergeGlobalHearings(
         staffId,
         reminders,
-      );
+      ).timeout(const Duration(seconds: 4), onTimeout: () => reminders);
       if (!mounted) return;
 
       setState(() {
@@ -157,7 +151,7 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
       final data = doc.data();
       final ts = (data['createdAt'] as Timestamp?)?.toDate();
       final fsType = _stringFrom(data['type']).toLowerCase();
-      if (_isCourtEmailSpam(fsType)) continue;
+      if (_isCourtEmailSpam(data)) continue;
 
       if (hearingOrAppointmentBellType(fsType)) {
         final item = LightweightReminderItem.fromNotificationDoc(doc.id, data);
@@ -167,15 +161,17 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
           'id': doc.id,
           'type': 'notification',
           'firestoreType': fsType,
-          'title': data['title'] ?? 'Notification',
+          'title': _stringFrom(data['title'], 'Notification'),
           'message': LightweightReminderItem.truncate(
-            data['summary'] as String? ?? data['message'] as String?,
+            _stringFrom(data['summary']).isNotEmpty
+                ? _stringFrom(data['summary'])
+                : _stringFrom(data['message']),
             200,
           ),
-          'summary': LightweightReminderItem.truncate(data['summary'] as String?),
-          'caseNo': data['caseNo'],
-          'clientName': data['clientName'],
-          'courtBranch': data['courtBranch'],
+          'summary': LightweightReminderItem.truncate(_stringFrom(data['summary'])),
+          'caseNo': _stringFrom(data['caseNo']),
+          'clientName': _stringFrom(data['clientName']),
+          'courtBranch': _stringFrom(data['courtBranch']),
           'isRead': data['isRead'] == true,
           'timestamp': ts,
           'icon': Icons.notifications,
@@ -198,24 +194,39 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null || item.isRead) return;
 
-    final idx = _reminderItems.indexWhere((r) => r.rowKey == item.rowKey);
-    if (idx >= 0 && mounted) {
-      setState(() => _reminderItems[idx] = item.markRead());
+    final twins = _reminderItems.where((row) {
+      if (row.isRead) return false;
+      if (row.rowKey == item.rowKey) return true;
+      final key = item.duplicateCaseKey;
+      if (key == null || row.duplicateCaseKey != key) return false;
+      return row.sortTime.difference(item.sortTime).abs() <=
+          LightweightReminderItem.duplicateWindow;
+    }).toList();
+    if (mounted && twins.isNotEmpty) {
+      setState(() {
+        for (final twin in twins) {
+          final idx = _reminderItems.indexWhere((r) => r.rowKey == twin.rowKey);
+          if (idx >= 0) _reminderItems[idx] = twin.markRead();
+        }
+        _rebuildNotificationCaches();
+      });
     }
 
-    unawaited(
-      HearingNotificationFanoutService.instance.markInboxRowAsRead(
-        userId: uid,
-        notificationDocId: item.notificationDocId,
-        rowData: item.hearingDocId != null
-            ? {
-                'hearingDocId': item.hearingDocId,
-                'type': item.type,
-                'title': item.title,
-              }
-            : null,
-      ),
-    );
+    for (final twin in twins) {
+      unawaited(
+        HearingNotificationFanoutService.instance.markInboxRowAsRead(
+          userId: uid,
+          notificationDocId: twin.notificationDocId,
+          rowData: twin.hearingDocId != null
+              ? {
+                  'hearingDocId': twin.hearingDocId,
+                  'type': twin.type,
+                  'title': twin.title,
+                }
+              : null,
+        ),
+      );
+    }
   }
 
   Future<void> _handlePullRefresh(String uid) async {
@@ -261,9 +272,6 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
     } catch (_) {}
   }
 
-  static bool _isPendingTaskStatus(String? status) =>
-      (status ?? '').toLowerCase().trim() == 'pending';
-
   Future<String?> _resolveAssignedAttorneyId() async {
     final cached = _assignedAttorneyId?.trim();
     if (cached != null && cached.isNotEmpty) return cached;
@@ -292,33 +300,7 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
 
   Future<void> _loadExtraAlertsOnce(String staffId, {bool force = false}) async {
     if (_extrasLoaded && !force) return;
-    if (mounted) setState(() => _loadingExtras = true);
     final extras = <Map<String, dynamic>>[];
-
-    // Tasks only need staffId — fetch first so the alert is not blocked on attorney lookup.
-    try {
-      final taskSnap = await _firestore
-          .collection('tasks')
-          .where('assignedTo', isEqualTo: staffId)
-          .limit(20)
-          .get();
-      final pendingCount = taskSnap.docs
-          .where((d) => _isPendingTaskStatus(d.data()['status'] as String?))
-          .length;
-      if (pendingCount > 0) {
-        extras.add({
-          'id': 'tasks_$staffId',
-          'type': 'task',
-          'title': 'Pending Tasks',
-          'message':
-              'You have $pendingCount pending task${pendingCount > 1 ? 's' : ''}',
-          'isRead': false,
-          'timestamp': DateTime.now(),
-          'icon': Icons.task,
-          'color': Colors.red,
-        });
-      }
-    } catch (_) {}
 
     final attorneyId = await _resolveAssignedAttorneyId();
     if (attorneyId != null) {
@@ -329,7 +311,8 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
             .where('eventDate', isGreaterThan: Timestamp.now())
             .orderBy('eventDate')
             .limit(5)
-            .get();
+            .get()
+            .timeout(const Duration(seconds: 4));
         for (final doc in events.docs) {
           final data = doc.data();
           final eventDate = (data['eventDate'] as Timestamp?)?.toDate();
@@ -372,21 +355,41 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
       return bTime.compareTo(aTime);
     });
     _mergedNotificationsCache = merged;
-    _flatRowsCache = _buildAlertRows(merged);
+    _flatRowsCache = _buildNewestFirstFeed(merged);
   }
 
-  List<_StaffAlertRow> _buildAlertRows(List<Map<String, dynamic>> notifications) {
+  /// One list: newest notify time on top (hearings + other alerts together).
+  List<_StaffAlertRow> _buildNewestFirstFeed(
+    List<Map<String, dynamic>> notifications,
+  ) {
+    final usedIds = <String>{};
+    final timed = <({DateTime t, _StaffAlertRow row})>[];
+
+    for (final r in LightweightReminderItem.collapseSameCase(_reminderItems)) {
+      usedIds.add(r.rowKey);
+      if (r.notificationDocId != null) usedIds.add(r.notificationDocId!);
+      timed.add((t: r.sortTime, row: _StaffAlertRow.reminder(r)));
+    }
+    for (final n in notifications) {
+      final id = (n['id'] as String?) ?? '';
+      if (id.isNotEmpty && usedIds.contains(id)) continue;
+      timed.add((
+        t: n['timestamp'] as DateTime? ?? DateTime(1970),
+        row: _StaffAlertRow.notification(n),
+      ));
+    }
+    timed.sort((a, b) => b.t.compareTo(a.t));
+
     final rows = <_StaffAlertRow>[];
     DateTime? lastDay;
-    for (final n in notifications) {
-      final ts = n['timestamp'] as DateTime?;
-      final d = ts ?? DateTime.fromMillisecondsSinceEpoch(0);
+    for (final item in timed) {
+      final d = item.t;
       final day = DateTime(d.year, d.month, d.day);
       if (lastDay == null || day != lastDay) {
         rows.add(_StaffAlertRow.date(DateFormat('MMMM dd, yyyy').format(d)));
         lastDay = day;
       }
-      rows.add(_StaffAlertRow.notification(n));
+      rows.add(item.row);
     }
     return rows;
   }
@@ -405,6 +408,7 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
         setState(() {
           _reminderItems =
               _reminderItems.map((row) => row.markRead()).toList();
+          _rebuildNotificationCaches();
         });
       }
 
@@ -418,7 +422,7 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
       for (final doc in query.docs) {
         if (doc.data()['isRead'] == true) continue;
         final fsType = _stringFrom(doc.data()['type']).toLowerCase();
-        if (_isCourtEmailSpam(fsType) ||
+        if (_isCourtEmailSpam(doc.data()) ||
             hearingOrAppointmentBellType(fsType)) {
           continue;
         }
@@ -494,127 +498,28 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
   }
 
   Widget _buildNotificationList(User user) {
-    final notifications = _mergedNotificationsCache;
     final flatRows = _flatRowsCache;
+    final loading = _loadingReminders || _loadingExtras;
+    final empty = !loading && flatRows.isEmpty;
 
     return CustomScrollView(
       cacheExtent: 400,
       physics: const AlwaysScrollableScrollPhysics(),
       slivers: [
-        SliverPadding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-          sliver: SliverToBoxAdapter(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Reminders',
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w700,
-                    color: Colors.grey[700],
-                    letterSpacing: 0.2,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-        if (_loadingReminders)
-          const SliverToBoxAdapter(
-            child: Padding(
-              padding: EdgeInsets.symmetric(vertical: 28, horizontal: 16),
-              child: Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    SizedBox(
-                      width: 28,
-                      height: 28,
-                      child: CircularProgressIndicator(strokeWidth: 2.5),
-                    ),
-                    SizedBox(height: 12),
-                    Text(
-                      'Loading reminders…',
-                      style: TextStyle(
-                        fontSize: 14,
-                        color: Colors.grey,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        if (!_loadingReminders && _reminderItems.isEmpty)
+        if (empty)
           SliverToBoxAdapter(
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+              padding: const EdgeInsets.fromLTRB(16, 24, 16, 24),
               child: Text(
-                'No reminders yet. Pull down to refresh.',
+                'No notifications yet. Pull down to refresh.',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 14, color: Colors.grey[600]),
               ),
             ),
           ),
-        if (!_loadingReminders && _reminderItems.isNotEmpty)
+        if (flatRows.isNotEmpty)
           SliverPadding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-            sliver: SliverList(
-              delegate: SliverChildBuilderDelegate(
-                (context, index) => LightweightReminderTile(
-                  key: ValueKey(_reminderItems[index].rowKey),
-                  item: _reminderItems[index],
-                  onMarkRead: () => _markReminderRead(_reminderItems[index]),
-                ),
-                childCount: _reminderItems.length,
-                addAutomaticKeepAlives: false,
-                addRepaintBoundaries: true,
-              ),
-            ),
-          ),
-        if (!_loadingReminders && _loadingExtras)
-          const SliverToBoxAdapter(
-            child: Padding(
-              padding: EdgeInsets.all(24),
-              child: Center(
-                child: SizedBox(
-                  width: 28,
-                  height: 28,
-                  child: CircularProgressIndicator(strokeWidth: 2.5),
-                ),
-              ),
-            ),
-          ),
-        if (!_loadingReminders && !_loadingExtras && notifications.isEmpty)
-          SliverToBoxAdapter(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-              child: Text(
-                'No other alerts yet. Pull down to refresh.',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 14, color: Colors.grey[600]),
-              ),
-            ),
-          ),
-        if (notifications.isNotEmpty) ...[
-          SliverPadding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-            sliver: SliverToBoxAdapter(
-              child: Text(
-                'Other alerts',
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
-                  color: Colors.grey[700],
-                  letterSpacing: 0.2,
-                ),
-              ),
-            ),
-          ),
-          SliverPadding(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
             sliver: SliverList(
               delegate: SliverChildBuilderDelegate(
                 (context, index) =>
@@ -625,7 +530,6 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
               ),
             ),
           ),
-        ],
       ],
     );
   }
@@ -633,7 +537,7 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
   Widget _buildAlertListItem(_StaffAlertRow row, String staffId) {
     if (row.isDate) {
       return Padding(
-        padding: const EdgeInsets.only(bottom: 12, top: 24),
+        padding: const EdgeInsets.only(bottom: 12, top: 12),
         child: Text(
           row.label!,
           style: const TextStyle(
@@ -641,6 +545,16 @@ class _StaffNotificationsScreenState extends State<StaffNotificationsScreen> {
             fontWeight: FontWeight.bold,
             color: AppTheme.royalBlue,
           ),
+        ),
+      );
+    }
+    if (row.reminder != null) {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: LightweightReminderTile(
+          key: ValueKey(row.reminder!.rowKey),
+          item: row.reminder!,
+          onMarkRead: () => _markReminderRead(row.reminder!),
         ),
       );
     }
@@ -697,7 +611,7 @@ class _StaffNotificationCardState extends State<_StaffNotificationCard> {
     final type = widget.stringFrom(notification['type'], 'notification');
     final notificationId = widget.stringFrom(notification['id']);
     final isHearing = type.contains('hearing') ||
-        (notification['hearingDocId'] as String?)?.trim().isNotEmpty == true;
+        widget.stringFrom(notification['hearingDocId']).isNotEmpty;
     final isExpandable =
         (type == 'notification' || isHearing) &&
         (message.trim().isNotEmpty || isHearing);
@@ -856,8 +770,11 @@ class _StaffNotificationCardState extends State<_StaffNotificationCard> {
                         if (isHearing)
                           HearingNotificationDetailPanel(
                             data: notification,
-                            hearingDocId:
-                                notification['hearingDocId'] as String?,
+                            hearingDocId: () {
+                              final hid =
+                                  widget.stringFrom(notification['hearingDocId']);
+                              return hid.isEmpty ? null : hid;
+                            }(),
                           )
                         else
                           SelectableText(
@@ -889,13 +806,20 @@ class _StaffNotificationCardState extends State<_StaffNotificationCard> {
 class _StaffAlertRow {
   const _StaffAlertRow.date(this.label)
       : isDate = true,
-        notification = null;
+        notification = null,
+        reminder = null;
   const _StaffAlertRow.notification(this.notification)
       : isDate = false,
-        label = null;
+        label = null,
+        reminder = null;
+  const _StaffAlertRow.reminder(this.reminder)
+      : isDate = false,
+        label = null,
+        notification = null;
 
   final bool isDate;
   final String? label;
   final Map<String, dynamic>? notification;
+  final LightweightReminderItem? reminder;
 }
 

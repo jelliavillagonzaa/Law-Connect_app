@@ -6,6 +6,7 @@ import '../../services/enhanced_appointment_service.dart';
 import '../../services/staff_auth_service.dart';
 import '../../models/user_model.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/common/schedule_full_dialog.dart';
 
 class StaffClientsScreen extends StatefulWidget {
   const StaffClientsScreen({super.key});
@@ -99,8 +100,9 @@ class _StaffClientsScreenState extends State<StaffClientsScreen> {
             .where('attorneyId', isEqualTo: _assignedAttorneyId)
             .snapshots(),
         builder: (context, casesSnapshot) {
-          if (casesSnapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
+          if (casesSnapshot.connectionState == ConnectionState.waiting &&
+              !casesSnapshot.hasData) {
+            return const SizedBox.shrink();
           }
 
           if (casesSnapshot.hasError) {
@@ -218,14 +220,9 @@ class _StaffClientsScreenState extends State<StaffClientsScreen> {
               return StreamBuilder<DocumentSnapshot>(
                 stream: _firestore.collection('users').doc(clientId).snapshots(),
                 builder: (context, snapshot) {
-                        if (snapshot.connectionState == ConnectionState.waiting) {
-                          return Card(
-                            margin: const EdgeInsets.only(bottom: 12),
-                            child: ListTile(
-                              leading: const CircularProgressIndicator(),
-                              title: const Text('Loading client...'),
-                            ),
-                          );
+                        if (snapshot.connectionState == ConnectionState.waiting &&
+                            !snapshot.hasData) {
+                          return const SizedBox.shrink();
                         }
 
                   if (!snapshot.hasData || !snapshot.data!.exists) {
@@ -881,6 +878,11 @@ class _StaffClientsScreenState extends State<StaffClientsScreen> {
                       SnackBar(content: Text('Meeting scheduled for ${client.name}')),
                     );
                   }
+                } else if (EnhancedAppointmentService.isScheduleFull(result)) {
+                  await showScheduleFullDialog(
+                    context,
+                    date: appointmentDateTime,
+                  );
                 } else {
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(content: Text(result['message'] ?? 'Failed to schedule meeting')),

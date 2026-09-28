@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
-import 'package:latlong2/latlong.dart';
+import 'package:latlong2/latlong.dart' as latlong;
 
 /// A map viewer widget that displays a location on a map
 /// Uses OpenStreetMap tiles (no API key required)
@@ -51,7 +51,7 @@ class _OroquietaMapViewerState extends State<OroquietaMapViewer> {
     // Use provided coordinates or default to Oroquieta City
     final lat = widget.latitude ?? _oroquietaLat;
     final lng = widget.longitude ?? _oroquietaLng;
-    final center = LatLng(lat, lng);
+    final center = latlong.LatLng(lat, lng);
 
     return Scaffold(
       appBar: AppBar(
@@ -100,7 +100,7 @@ class _OroquietaMapViewerState extends State<OroquietaMapViewer> {
                       height: 50,
                       child: const Icon(
                         Icons.location_on,
-                        color: Color(0xFF1A4D8F), // Royal Blue
+                        color: Color(0xFF1A3A6C),
                         size: 50,
                       ),
                     ),

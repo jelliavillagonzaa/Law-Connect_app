@@ -49,11 +49,7 @@ class _LoginScreenState extends State<LoginScreen> {
               colorText: AppTheme.deepNavy,
               duration: const Duration(seconds: 3),
             );
-            Future.delayed(const Duration(milliseconds: 400), () {
-              if (mounted) {
-                Get.offAll(() => const OtpVerificationPage());
-              }
-            });
+            Get.offAll(() => const OtpVerificationPage());
           } else {
             navigateToPortalDashboard(role);
           }
@@ -70,11 +66,7 @@ class _LoginScreenState extends State<LoginScreen> {
               colorText: AppTheme.deepNavy,
               duration: const Duration(seconds: 4),
             );
-            Future.delayed(const Duration(milliseconds: 400), () {
-              if (mounted) {
-                Get.offAll(() => const OtpVerificationPage());
-              }
-            });
+            Get.offAll(() => const OtpVerificationPage());
           } else {
             Get.snackbar(
               'Login Failed',

@@ -8,6 +8,8 @@ import '../../services/admin_service.dart';
 import '../../theme/app_theme.dart';
 import '../../utils/report_exporter/report_exporter.dart';
 import '../../widgets/admin/admin_cases_by_type_panel.dart';
+import '../../widgets/admin/admin_page_header.dart';
+import '../../widgets/admin/admin_ui_theme.dart';
 
 /// Admin-only navigation from summary tiles (wired by [AdminDashboard]).
 typedef ReportsNavigateToUsers = void Function({String role});
@@ -96,7 +98,7 @@ class _ReportsAnalyticsScreenState extends State<ReportsAnalyticsScreen> {
                   Card(
                     elevation: 2,
                     shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16),
+                      borderRadius: BorderRadius.circular(AdminUi.radius),
                     ),
                     child: Padding(
                       padding: const EdgeInsets.all(20),
@@ -161,7 +163,7 @@ class _ReportsAnalyticsScreenState extends State<ReportsAnalyticsScreen> {
                   Card(
                     elevation: 2,
                     shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16),
+                      borderRadius: BorderRadius.circular(AdminUi.radius),
                     ),
                     child: Padding(
                       padding: const EdgeInsets.all(20),
@@ -254,7 +256,7 @@ class _ReportsAnalyticsScreenState extends State<ReportsAnalyticsScreen> {
                   Card(
                     elevation: 2,
                     shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16),
+                      borderRadius: BorderRadius.circular(AdminUi.radius),
                     ),
                     child: Padding(
                       padding: const EdgeInsets.all(20),
@@ -295,37 +297,23 @@ class _ReportsAnalyticsScreenState extends State<ReportsAnalyticsScreen> {
     final body = _buildBody();
 
     if (widget.inline) {
-      return Column(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.05),
-                  blurRadius: 5,
-                  offset: const Offset(0, 2),
-                ),
-              ],
-            ),
-            child: Row(
-              children: [
-                const Text(
-                  'Reports & Analytics',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                ),
-                const Spacer(),
+      return ColoredBox(
+        color: AdminUi.background,
+        child: Column(
+          children: [
+            AdminPageHeader(
+              title: 'Reports & Analytics',
+              actions: [
                 IconButton(
-                  icon: const Icon(Icons.download),
+                  icon: const Icon(Icons.download_rounded, color: AdminUi.primary),
                   onPressed: () => _exportReport(),
                   tooltip: 'Export Report',
                 ),
               ],
             ),
-          ),
-          Expanded(child: body),
-        ],
+            Expanded(child: body),
+          ],
+        ),
       );
     }
 

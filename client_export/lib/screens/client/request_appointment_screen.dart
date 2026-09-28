@@ -228,17 +228,19 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
                       const SizedBox(height: 8),
                       Text(
                         'Choose a preferred date, time, and type of meeting. '
-                        'Your attorney will review and confirm the appointment.',
+                        'This request is sent to ${widget.attorneyName}, '
+                        'who will review and confirm it.',
                         style: AppTheme.bodySmall.copyWith(
                           color: AppTheme.textSecondary,
                         ),
                       ),
                       const SizedBox(height: 24),
-                      // Attorney Additional Details
-                      if (_attorneyProfileData != null && !_isLoadingProfile)
+                      _buildAttorneyHeader(),
+                      if (_attorneyProfileData != null && !_isLoadingProfile) ...[
+                        const SizedBox(height: 12),
                         _buildAttorneyAdditionalDetails(),
-                      if (_attorneyProfileData != null && !_isLoadingProfile)
-                        const SizedBox(height: 24),
+                      ],
+                      const SizedBox(height: 24),
 
                       // Date field
                       Text(
@@ -388,7 +390,7 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
 
                       // Notes
                       Text(
-                        'Notes (optional)',
+                        'Notes',
                         style: AppTheme.bodyMedium.copyWith(
                           fontWeight: FontWeight.w600,
                         ),
@@ -453,6 +455,53 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildAttorneyHeader() {
+    final name = widget.attorneyName.trim().isEmpty
+        ? 'Attorney'
+        : widget.attorneyName.trim();
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppTheme.borderGray),
+      ),
+      child: Row(
+        children: [
+          CircleAvatar(
+            backgroundColor: AppTheme.royalBlue.withOpacity(0.1),
+            child: Text(
+              name.substring(0, 1).toUpperCase(),
+              style: const TextStyle(
+                color: AppTheme.royalBlue,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  name,
+                  style: AppTheme.bodyLarge.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  'Your request goes to this attorney.',
+                  style: AppTheme.caption,
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }

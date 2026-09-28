@@ -3,6 +3,8 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 
+import 'utils/out_of_system_notice.dart';
+
 /// Top-level function for handling background messages
 /// This must be a top-level function, not a class method
 /// 
@@ -23,6 +25,21 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
     debugPrint('═══════════════════════════════════════');
   }
   
+  final incomingTitle = message.notification?.title ?? '';
+  final incomingBody = message.notification?.body ?? '';
+  if (isOutOfSystemCourtNoticeTitle(incomingTitle) ||
+      isOutOfSystemPumpedNoticeText('$incomingTitle\n$incomingBody')) {
+    if (kDebugMode) {
+      debugPrint('⏭️ Skipping out-of-system court notice in background');
+    }
+    return;
+  }
+
+  final incomingType = (message.data['type'] as String? ?? '').toLowerCase();
+  if (incomingType == 'new_message') {
+    return;
+  }
+
   // Save notification to Firestore
   try {
     final firestore = FirebaseFirestore.instance;

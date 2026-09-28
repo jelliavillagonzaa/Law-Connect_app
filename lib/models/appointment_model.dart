@@ -12,6 +12,32 @@ class AppointmentModel {
   final String appointmentType; // 'in_office', 'phone_call', 'online_meeting'
   final String? notes;
   final String status; // 'pending', 'confirmed', 'completed', 'cancelled', etc.
+
+  /// Client requests stay off the calendar until the attorney accepts them.
+  bool get appearsOnAttorneyCalendar {
+    switch (status.toLowerCase().trim()) {
+      case 'pending':
+      case 'declined':
+      case 'cancelled':
+      case 'accepted':
+        return false;
+      default:
+        return true;
+    }
+  }
+
+  /// Confirmed/scheduled times that block a new booking at the same minute.
+  bool get occupiesTimeSlot {
+    switch (status.toLowerCase().trim()) {
+      case 'upcoming':
+      case 'confirmed':
+      case 'scheduled':
+      case 'rescheduled':
+        return true;
+      default:
+        return false;
+    }
+  }
   final DateTime createdAt;
   final DateTime updatedAt;
 

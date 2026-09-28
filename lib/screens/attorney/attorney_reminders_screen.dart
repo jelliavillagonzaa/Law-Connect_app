@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show debugPrint, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -8,9 +8,12 @@ import 'package:intl/intl.dart';
 import '../../theme/app_theme.dart';
 import '../../models/lightweight_reminder_item.dart';
 import '../../services/lightweight_reminders_inbox_service.dart';
+import '../../services/attorney_inbox_read_store.dart';
 import '../../services/hearing_notification_fanout_service.dart';
 import '../../widgets/common/lightweight_reminder_tile.dart';
 import '../../utils/hearing_notification_formatter.dart';
+import '../../utils/hearing_order_detail.dart';
+import '../../services/hearing_calendar_fields.dart';
 import '../../widgets/common/hearing_notification_detail_panel.dart';
 
 class AttorneyRemindersScreen extends StatefulWidget {
@@ -55,9 +58,12 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   final FirebaseAuth _auth = FirebaseAuth.instance;
   Set<String> _locallyReadRowKeys = <String>{};
   List<HearingInboxRow>? _rows;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _hearingsLiveSub;
   StreamSubscription<List<HearingInboxRow>>? _inboxSub;
   Timer? _inboxStreamDebounce;
   Timer? _deferredInboxTimer;
+  Timer? _loadWatchdog;
+  int _loadGen = 0;
   String? _lastInboxSignature;
   bool _inboxStreamAttached = false;
   List<Object>? _cachedListItems;
@@ -67,7 +73,11 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   bool _loadingLight = true;
   List<LightweightReminderItem> _lightItems = [];
 
-  bool get _useLightweightInbox =>
+  /// Attorney Reminders must use the fanout inbox (notifications + hearings).
+  /// The lightweight path hid court/appointment rows and showed an empty list.
+  bool get _useLightweightInbox => false;
+
+  bool get _isAttorneyStandalone =>
       widget.showScaffold &&
       widget.includeGlobalHearingsFallback &&
       !widget.hearingsOnly &&
@@ -108,7 +118,9 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
     if (sig == _lastInboxSignature) return;
     _lastInboxSignature = sig;
     _cachedListItems = null;
-    final copy = List<HearingInboxRow>.from(rows);
+    final copy = rows
+        .where((r) => !isHearingRecordUpdateNotification(r.data))
+        .toList();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       setState(() => _rows = copy);
@@ -150,10 +162,49 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   }
 
   void _startInboxListener() {
+    if (_isAttorneyStandalone) {
+      final fanout = HearingNotificationFanoutService.instance;
+      final uid = _auth.currentUser?.uid;
+      List<HearingInboxRow> initial = const [];
+      if (uid != null && uid.isNotEmpty) {
+        final cached = fanout.peekInboxRows(
+          uid,
+          includeGlobalHearingsFallback: true,
+        );
+        if (cached != null) {
+          initial = cached
+              .where(
+                (r) {
+                  final slim = _slimAttorneyInboxData(r.data);
+                  return !isHearingRecordUpdateNotification(slim) &&
+                      !HearingCalendarFields.isNonCourtHearingSpam(slim);
+                },
+              )
+              .toList();
+        }
+      }
+      // Never leave _rows null — that is the infinite "Loading reminders…" spinner.
+      _rows = initial;
+      _loadingMoreHearings = true;
+      _loadWatchdog?.cancel();
+      _loadWatchdog = Timer(const Duration(seconds: 8), () {
+        if (!mounted) return;
+        setState(() {
+          _rows ??= const [];
+          _loadingMoreHearings = false;
+        });
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_loadAttorneyRemindersDirect());
+      });
+      return;
+    }
+
     final userId = _auth.currentUser?.uid;
     final fanout = HearingNotificationFanoutService.instance;
 
     if (userId == null) {
+      _rows = const [];
       return;
     }
 
@@ -172,11 +223,14 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
       includeGlobalHearingsFallback: widget.includeGlobalHearingsFallback,
       hearingsOnly: widget.hearingsOnly,
     );
-    if (cached != null) {
-      setState(() {
-        _rows = List<HearingInboxRow>.from(cached);
-      });
-    }
+    _rows = cached != null
+        ? List<HearingInboxRow>.from(cached)
+        : const <HearingInboxRow>[];
+    _loadWatchdog?.cancel();
+    _loadWatchdog = Timer(const Duration(milliseconds: 700), () {
+      if (!mounted || _rows != null) return;
+      setState(() => _rows = const []);
+    });
 
     if (widget.parentOwnsRefresh) return;
 
@@ -210,10 +264,10 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
 
     _deferredInboxTimer?.cancel();
     final delay = kIsWeb
-        ? const Duration(seconds: 6)
+        ? const Duration(milliseconds: 80)
         : hadCache
-            ? const Duration(milliseconds: 2400)
-            : const Duration(milliseconds: 400);
+            ? const Duration(milliseconds: 400)
+            : const Duration(milliseconds: 80);
     _deferredInboxTimer = Timer(delay, () {
       if (!mounted) return;
       unawaited(
@@ -257,7 +311,9 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
           if (sig == _lastInboxSignature) return;
           _lastInboxSignature = sig;
           _cachedListItems = null;
-          setState(() => _rows = List<HearingInboxRow>.from(rows));
+          setState(() => _rows = rows
+              .where((r) => !isHearingRecordUpdateNotification(r.data))
+              .toList());
         });
       },
       onError: (_) {},
@@ -280,9 +336,9 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
       });
     }
 
+    var items = <LightweightReminderItem>[];
     try {
-      final items =
-          await LightweightRemindersInboxService.loadNotificationReminders(
+      items = await LightweightRemindersInboxService.loadNotificationReminders(
         userId,
       );
       if (!mounted) return;
@@ -306,6 +362,9 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
     } catch (_) {
       if (mounted) {
         setState(() {
+          if (_lightItems.isEmpty && items.isNotEmpty) {
+            _lightItems = items;
+          }
           _loadingLight = false;
           _loadingMoreHearings = false;
         });
@@ -326,6 +385,7 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
       HearingNotificationFanoutService.instance.markInboxRowAsRead(
         userId: userId,
         notificationDocId: item.notificationDocId,
+        inboxRowKey: item.rowKey,
         rowData: item.hearingDocId != null
             ? {
                 'hearingDocId': item.hearingDocId,
@@ -431,7 +491,7 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
                   reuseCachedHearings: reuseCachedHearings,
                 ))
           .timeout(
-        const Duration(seconds: 10),
+        const Duration(seconds: 5),
         onTimeout: () =>
             fanout.peekInboxRows(
               userId,
@@ -471,7 +531,11 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
       if (gh && !ho && rows.where((r) => r.isHearingSource).isEmpty) {
         unawaited(_backgroundHearingSync(userId));
       }
-    } catch (_) {}
+    } catch (_) {
+      if (mounted && _rows == null) {
+        setState(() => _rows = const []);
+      }
+    }
   }
 
   Future<void> _backgroundHearingSync(String userId) async {
@@ -492,6 +556,10 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   }
 
   Future<void> _refreshInbox() async {
+    if (_isAttorneyStandalone) {
+      await _loadAttorneyRemindersDirect(force: true);
+      return;
+    }
     final userId = _auth.currentUser?.uid;
     if (userId == null) return;
     if (_useLightweightInbox) {
@@ -501,18 +569,631 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
     await _loadInboxOnce(userId);
   }
 
+  DateTime _asDate(dynamic value) {
+    if (value is Timestamp) return value.toDate();
+    if (value is DateTime) return value;
+    return DateTime.fromMillisecondsSinceEpoch(0);
+  }
+
+  Map<String, dynamic> _slimAttorneyInboxData(Map<String, dynamic> data) {
+    String clip(dynamic value, [int max = 160]) {
+      final s = HearingCalendarFields.asDisplayString(value);
+      if (s.isEmpty) return '';
+      if (s.length <= max) return s;
+      return '${s.substring(0, max)}…';
+    }
+
+    return {
+      'type': data['type'],
+      'title': data['title'],
+      'summary': clip(data['summary'], 240),
+      'message': clip(data['message'], 160),
+      'caseNo': data['caseNo'],
+      'clientName': data['clientName'],
+      'courtBranch': data['courtBranch'],
+      'hearingDate': data['hearingDate'],
+      'hearingTime': data['hearingTime'],
+      'location': data['location'],
+      'hearingDocId': data['hearingDocId'],
+      'isRead': data['isRead'] == true,
+      'createdAt': data['createdAt'],
+    };
+  }
+
+  Future<String?> _resolveAttorneyUserId() async {
+    var userId = _auth.currentUser?.uid;
+    if (userId != null && userId.isNotEmpty) return userId;
+    try {
+      final user = await _auth
+          .authStateChanges()
+          .firstWhere((u) => u != null)
+          .timeout(const Duration(seconds: 8));
+      return user?.uid;
+    } catch (_) {
+      return _auth.currentUser?.uid;
+    }
+  }
+
+  HearingInboxRow _rowFromMap({
+    required String rowKey,
+    String? notificationDocId,
+    required Map<String, dynamic> data,
+    required DateTime sortTime,
+  }) {
+    return HearingInboxRow(
+      rowKey: rowKey,
+      notificationDocId: notificationDocId,
+      data: data,
+      sortTime: sortTime,
+    );
+  }
+
+  /// Direct attorney inbox — notifications, hearings, appointments.
+  /// Paints cached rows first; purge and extra queries run in the background.
+  Future<void> _loadAttorneyRemindersDirect({bool force = false}) async {
+    final userId = _auth.currentUser?.uid ?? await _resolveAttorneyUserId();
+    if (userId == null || userId.isEmpty) {
+      if (mounted) setState(() => _rows = const []);
+      return;
+    }
+
+    final fanout = HearingNotificationFanoutService.instance;
+    unawaited(fanout.loadAttorneyInboxAck(userId));
+    unawaited(AttorneyInboxReadStore.instance.ensureLoaded(userId));
+    unawaited(fanout.staffReadHearingIds(userId));
+    var readHearingIds = fanout.peekReadHearingIds(userId);
+    final cached = fanout.peekInboxRows(
+      userId,
+      includeGlobalHearingsFallback: true,
+    );
+    if (cached != null && cached.isNotEmpty && mounted) {
+      setState(() {
+        _rows = cached
+            .where(
+              (r) {
+                final slim = _slimAttorneyInboxData(r.data);
+                return !isHearingRecordUpdateNotification(slim) &&
+                    !HearingCalendarFields.isNonCourtHearingSpam(slim);
+              },
+            )
+            .toList();
+        _loadingMoreHearings = true;
+      });
+    }
+
+    final gen = ++_loadGen;
+    final fs = FirebaseFirestore.instance;
+    final rows = <HearingInboxRow>[];
+    final keys = <String>{};
+
+    void add(HearingInboxRow row) {
+      if (keys.add(row.rowKey)) rows.add(row);
+    }
+
+    Future<void> loadNotifications(String field) async {
+      try {
+        final query =
+            fs.collection('notifications').where(field, isEqualTo: userId);
+        QuerySnapshot<Map<String, dynamic>> snap;
+        try {
+          snap = await query
+              .orderBy('createdAt', descending: true)
+              .limit(80)
+              .get()
+              .timeout(const Duration(seconds: 4));
+        } catch (_) {
+          snap = await query
+              .limit(80)
+              .get()
+              .timeout(const Duration(seconds: 4));
+        }
+        for (final doc in snap.docs) {
+          final raw = doc.data();
+          final type = HearingCalendarFields.asDisplayString(raw['type']).toLowerCase();
+          if (type == 'court_email_ingest' ||
+              type == 'attorney_inbox_ack' ||
+              type == 'attorney_read_keys' ||
+              type == 'hearing_activity_update') {
+            continue;
+          }
+          if (type.startsWith('court_') && !type.contains('hearing')) continue;
+          final data = _slimAttorneyInboxData(raw);
+          if (isHearingRecordUpdateNotification(data) ||
+              clientCourtEmailSpamNotification(data) ||
+              HearingCalendarFields.isNonCourtHearingSpam(data)) {
+            continue;
+          }
+          if (data['isRead'] != true &&
+              (readHearingIds.contains(doc.id) ||
+                  readHearingIds.contains(
+                    HearingCalendarFields.asDisplayString(data['hearingDocId']),
+                  ))) {
+            data['isRead'] = true;
+          }
+          add(
+            _rowFromMap(
+              rowKey: doc.id,
+              notificationDocId: doc.id,
+              data: data,
+              sortTime: _asDate(raw['createdAt']),
+            ),
+          );
+        }
+        debugPrint('attorney inbox notifications[$field]=${snap.docs.length}');
+      } catch (e) {
+        debugPrint('attorney inbox notifications[$field] failed: $e');
+      }
+    }
+
+    Future<void> loadHearings() async {
+      try {
+        QuerySnapshot<Map<String, dynamic>> snap;
+        try {
+          snap = await fs
+              .collection('hearings')
+              .orderBy('createdAt', descending: true)
+              .limit(80)
+              .get()
+              .timeout(const Duration(seconds: 4));
+        } catch (_) {
+          try {
+            snap = await fs
+                .collection('hearings')
+                .orderBy('updatedAt', descending: true)
+                .limit(80)
+                .get()
+                .timeout(const Duration(seconds: 4));
+          } catch (_) {
+            snap = await fs
+                .collection('hearings')
+                .limit(80)
+                .get()
+                .timeout(const Duration(seconds: 4));
+          }
+        }
+        var kept = 0;
+        for (final doc in snap.docs) {
+          final hd = doc.data();
+          if (!HearingNotificationFanoutService.isDisplayableHearingRow(hd)) {
+            continue;
+          }
+          if (HearingCalendarFields.isNonCourtHearingSpam(
+            _slimAttorneyInboxData(hd),
+          )) {
+            continue;
+          }
+          if (keys.contains('hearing_${doc.id}')) continue;
+          var already = false;
+          for (final r in rows) {
+            if (HearingCalendarFields.asDisplayString(r.data['hearingDocId']) ==
+                doc.id) {
+              already = true;
+              break;
+            }
+          }
+          if (already) continue;
+          kept++;
+          final ts = _asDate(hd['createdAt'] ?? hd['updatedAt']);
+          final sort = ts;
+          final caseNo = HearingCalendarFields.asDisplayString(hd['caseNo']);
+          final client = HearingCalendarFields.asDisplayString(hd['clientName']);
+          final summary = HearingCalendarFields.asDisplayString(hd['summary']);
+          final storedTitle = HearingCalendarFields.asDisplayString(hd['title']);
+          final title = caseNo.isNotEmpty
+              ? 'Court hearing — $caseNo'
+              : (storedTitle.isNotEmpty
+                  ? storedTitle
+                  : 'Court hearing / order');
+          add(
+            _rowFromMap(
+              rowKey: 'hearing_${doc.id}',
+              data: _slimAttorneyInboxData({
+                'type': 'hearing_activity',
+                'title': title,
+                'summary': summary.isNotEmpty ? summary : client,
+                'message': summary.isNotEmpty ? summary : client,
+                'hearingDocId': doc.id,
+                if (caseNo.isNotEmpty) 'caseNo': caseNo,
+                if (client.isNotEmpty) 'clientName': client,
+                'createdAt': Timestamp.fromDate(sort),
+                'isRead': readHearingIds.contains(doc.id) ||
+                    readHearingIds.contains('hearing_${doc.id}'),
+              }),
+              sortTime: sort,
+            ),
+          );
+        }
+        debugPrint('attorney inbox hearings=${snap.docs.length} kept=$kept');
+      } catch (e) {
+        debugPrint('attorney inbox hearings failed: $e');
+      }
+    }
+
+    Future<void> loadHearingNotifications() async {
+      try {
+        final snap = await fs
+            .collection('hearing_notifications')
+            .where('attorneyId', isEqualTo: userId)
+            .limit(30)
+            .get()
+            .timeout(const Duration(seconds: 4));
+        for (final doc in snap.docs) {
+          final data = doc.data();
+          if (HearingCalendarFields.isNonCourtHearingSpam(data)) continue;
+          final title = HearingCalendarFields.asDisplayString(data['title']);
+          if (title.isEmpty) continue;
+          final created = _asDate(
+            data['createdAt'] ?? data['notificationDate'] ?? data['hearingDate'],
+          );
+          final desc = HearingCalendarFields.asDisplayString(data['description']);
+          add(
+            _rowFromMap(
+              rowKey: 'hn_${doc.id}',
+              data: {
+                'type': 'hearing',
+                'title': title,
+                'message': desc,
+                'summary': desc,
+                'isRead': data['status'] == 'sent' ||
+                    data['isRead'] == true ||
+                    readHearingIds.contains('hn_${doc.id}') ||
+                    readHearingIds.contains(doc.id),
+                'createdAt': Timestamp.fromDate(
+                  created.millisecondsSinceEpoch == 0
+                      ? DateTime.now()
+                      : created,
+                ),
+              },
+              sortTime: created.millisecondsSinceEpoch == 0
+                  ? DateTime.now()
+                  : created,
+            ),
+          );
+        }
+        debugPrint('attorney inbox hearing_notifications=${snap.docs.length}');
+      } catch (e) {
+        debugPrint('attorney inbox hearing_notifications failed: $e');
+      }
+    }
+
+    Future<void> loadAppointments() async {
+      try {
+        final snap = await fs
+            .collection('appointments')
+            .where('attorneyId', isEqualTo: userId)
+            .limit(20)
+            .get()
+            .timeout(const Duration(seconds: 4));
+        for (final doc in snap.docs) {
+          final data = doc.data();
+          final status = HearingCalendarFields.asDisplayString(data['status']).toLowerCase();
+          if (status == 'cancelled' || status == 'declined') continue;
+          final when = _asDate(data['appointmentDateTime'] ?? data['createdAt']);
+          final client =
+              HearingCalendarFields.asDisplayString(data['clientName']);
+          add(
+            _rowFromMap(
+              rowKey: 'appt_${doc.id}',
+              data: {
+                'type': 'appointment_scheduled',
+                'title': 'Appointment with ${client.isEmpty ? 'Client' : client}',
+                'message': HearingCalendarFields.asDisplayString(data['notes']),
+                'summary': status.isEmpty ? 'Appointment' : status,
+                'isRead': true,
+                'createdAt': Timestamp.fromDate(
+                  when.millisecondsSinceEpoch == 0 ? DateTime.now() : when,
+                ),
+              },
+              sortTime:
+                  when.millisecondsSinceEpoch == 0 ? DateTime.now() : when,
+            ),
+          );
+        }
+        debugPrint('attorney inbox appointments=${snap.docs.length}');
+      } catch (e) {
+        debugPrint('attorney inbox appointments failed: $e');
+      }
+    }
+
+    Future<void> loadReminderJobs() async {
+      try {
+        QuerySnapshot<Map<String, dynamic>> snap;
+        try {
+          snap = await fs
+              .collection('hearing_reminder_jobs')
+              .orderBy('createdAt', descending: true)
+              .limit(80)
+              .get()
+              .timeout(const Duration(seconds: 4));
+        } catch (_) {
+          snap = await fs
+              .collection('hearing_reminder_jobs')
+              .limit(80)
+              .get()
+              .timeout(const Duration(seconds: 4));
+        }
+        final covered = <String>{};
+        for (final r in rows) {
+          final hid = HearingCalendarFields.asDisplayString(r.data['hearingDocId']);
+          if (hid.isNotEmpty) covered.add(hid);
+          if (r.rowKey.startsWith('hearing_')) {
+            covered.add(r.rowKey.substring('hearing_'.length));
+          }
+        }
+        var addedJobs = 0;
+        for (final doc in snap.docs) {
+          final jd = doc.data();
+          final hid = HearingCalendarFields.asDisplayString(jd['hearingDocId']);
+          if (hid.isEmpty || !covered.add(hid)) continue;
+          if (keys.contains('hearing_$hid')) continue;
+          final snapMap = (jd['snapshot'] is Map)
+              ? Map<String, dynamic>.from(jd['snapshot'] as Map)
+              : <String, dynamic>{};
+          if (HearingCalendarFields.isNonCourtHearingSpam(snapMap)) continue;
+          final caseNo = HearingCalendarFields.asDisplayString(snapMap['caseNo']);
+          final client =
+              HearingCalendarFields.asDisplayString(snapMap['clientName']);
+          final snapTitle =
+              HearingCalendarFields.asDisplayString(snapMap['caseTitle']);
+          final title = caseNo.isNotEmpty
+              ? 'Court hearing — $caseNo'
+              : (snapTitle.isNotEmpty ? snapTitle : 'Court hearing / order');
+          final ts = _asDate(jd['createdAt'] ?? jd['scheduledFor']);
+          final sort =
+              ts.millisecondsSinceEpoch == 0 ? DateTime.now() : ts;
+          add(
+            _rowFromMap(
+              rowKey: 'hearing_$hid',
+              data: {
+                'type': 'hearing_activity',
+                'title': title,
+                'summary': client,
+                'message': HearingCalendarFields.asDisplayString(
+                      snapMap['message'],
+                    ).isNotEmpty
+                    ? HearingCalendarFields.asDisplayString(snapMap['message'])
+                    : client,
+                'hearingDocId': hid,
+                if (caseNo.isNotEmpty) 'caseNo': caseNo,
+                if (client.isNotEmpty) 'clientName': client,
+                if (snapTitle.isNotEmpty) 'caseTitle': snapTitle,
+                if (HearingCalendarFields.asDisplayString(
+                  snapMap['courtBranch'],
+                ).isNotEmpty)
+                  'location': HearingCalendarFields.asDisplayString(
+                    snapMap['courtBranch'],
+                  ),
+                'createdAt': Timestamp.fromDate(sort),
+                'isRead': readHearingIds.contains(hid) ||
+                    readHearingIds.contains('hearing_$hid'),
+              },
+              sortTime: sort,
+            ),
+          );
+          addedJobs++;
+        }
+        debugPrint(
+          'attorney inbox reminder_jobs=${snap.docs.length} added=$addedJobs',
+        );
+      } catch (e) {
+        debugPrint('attorney inbox reminder_jobs failed: $e');
+      }
+    }
+
+    void commit({bool done = false}) {
+      if (!mounted || gen != _loadGen) return;
+      readHearingIds = fanout.peekReadHearingIds(userId);
+      final flagged = rows
+          .map((r) => _rowWithLocalRead(r, readHearingIds))
+          .toList();
+      final store = AttorneyInboxReadStore.instance;
+      final applied = flagged.map(store.withReadFlag).toList();
+      applied.sort((a, b) => b.sortTime.compareTo(a.sortTime));
+      if (applied.isEmpty && !done) {
+        final existing = _rows;
+        if (existing != null && existing.isNotEmpty) return;
+      }
+      rows
+        ..clear()
+        ..addAll(applied);
+      _loadWatchdog?.cancel();
+      fanout.publishAttorneyInbox(userId, applied);
+      _lastInboxSignature = _inboxSignature(applied);
+      _cachedListItems = null;
+      setState(() {
+        _rows = List<HearingInboxRow>.from(applied);
+        _loadingMoreHearings = !done && applied.isNotEmpty;
+      });
+      store.syncFromRows(applied);
+    }
+
+    try {
+      try {
+        await loadNotifications('userId')
+            .timeout(const Duration(seconds: 5));
+      } catch (_) {}
+      commit();
+
+      try {
+        await Future.wait<void>([
+          loadHearings(),
+          loadAppointments(),
+          loadReminderJobs(),
+        ]).timeout(const Duration(seconds: 6));
+      } catch (_) {}
+      commit();
+
+      try {
+        await Future.wait<void>([
+          loadNotifications('attorneyId'),
+          loadHearingNotifications(),
+        ]).timeout(const Duration(seconds: 5));
+      } catch (_) {}
+      commit(done: true);
+    } catch (_) {
+      if (mounted && gen == _loadGen && _rows == null) {
+        setState(() => _rows = const []);
+      }
+    } finally {
+      _loadWatchdog?.cancel();
+      if (mounted && gen == _loadGen) {
+        setState(() {
+          _rows ??= const [];
+          _loadingMoreHearings = false;
+        });
+      }
+    }
+  }
+
+  void _attachLiveHearings(String userId) {
+    if (!_isAttorneyStandalone) return;
+    if (_hearingsLiveSub != null) return;
+    final fs = FirebaseFirestore.instance;
+    _hearingsLiveSub = fs
+        .collection('hearings')
+        .orderBy('createdAt', descending: true)
+        .limit(80)
+        .snapshots()
+        .listen(
+          (snap) {
+            if (!mounted) return;
+            _mergeLiveHearings(userId, snap);
+          },
+          onError: (_) {
+            unawaited(_hearingsLiveSub?.cancel());
+            _hearingsLiveSub = fs
+                .collection('hearings')
+                .limit(80)
+                .snapshots()
+                .listen(
+                  (snap) {
+                    if (!mounted) return;
+                    _mergeLiveHearings(userId, snap);
+                  },
+                  onError: (_) {},
+                );
+          },
+        );
+  }
+
+  void _mergeLiveHearings(
+    String userId,
+    QuerySnapshot<Map<String, dynamic>> snap,
+  ) {
+    final current = _rows ?? const <HearingInboxRow>[];
+    final keys = current.map((r) => r.rowKey).toSet();
+    final added = <HearingInboxRow>[];
+    final readIds =
+        HearingNotificationFanoutService.instance.peekReadHearingIds(userId);
+
+    for (final doc in snap.docs) {
+      final rowKey = 'hearing_${doc.id}';
+      if (keys.contains(rowKey)) continue;
+      final hd = doc.data();
+      if (!HearingNotificationFanoutService.isDisplayableHearingRow(hd)) {
+        continue;
+      }
+      if (HearingCalendarFields.isNonCourtHearingSpam(hd)) continue;
+      final ts = _asDate(hd['createdAt'] ?? hd['updatedAt']);
+      final sort = ts.millisecondsSinceEpoch == 0 ? DateTime.now() : ts;
+      final caseNo = HearingCalendarFields.asDisplayString(hd['caseNo']);
+      final client = HearingCalendarFields.asDisplayString(hd['clientName']);
+      final caseTitle = HearingCalendarFields.asDisplayString(hd['caseTitle']);
+      final hearingTime = HearingCalendarFields.asDisplayString(hd['hearingTime']);
+      final location = HearingCalendarFields.asDisplayString(hd['location']);
+      final hearingDate = HearingCalendarFields.asDisplayString(hd['hearingDate']);
+      final fullText = HearingCalendarFields.asDisplayString(hd['fullText']);
+      final message = HearingCalendarFields.asDisplayString(hd['message']);
+      added.add(
+        _rowFromMap(
+          rowKey: rowKey,
+          data: {
+            'type': 'hearing_activity',
+            'title': caseNo.isNotEmpty
+                ? 'Court hearing / order — $caseNo'
+                : 'Court hearing / order',
+            'summary': client,
+            'message': HearingCalendarFields.asDisplayString(hd['summary'])
+                    .isNotEmpty
+                ? HearingCalendarFields.asDisplayString(hd['summary'])
+                : client,
+            'hearingDocId': doc.id,
+            if (caseNo.isNotEmpty) 'caseNo': caseNo,
+            if (client.isNotEmpty) 'clientName': client,
+            if (caseTitle.isNotEmpty) 'caseTitle': caseTitle,
+            if (hearingTime.isNotEmpty) 'hearingTime': hearingTime,
+            if (location.isNotEmpty) 'location': location,
+            if (hearingDate.isNotEmpty) 'hearingDate': hearingDate,
+            if (fullText.isNotEmpty)
+              'fullText': fullText
+            else if (message.isNotEmpty)
+              'fullText': message,
+            'createdAt': Timestamp.fromDate(sort),
+            'isRead': readIds.contains(doc.id) || readIds.contains(rowKey),
+          },
+          sortTime: sort,
+        ),
+      );
+      keys.add(rowKey);
+    }
+
+    if (added.isEmpty) return;
+    final store = AttorneyInboxReadStore.instance;
+    final next = [...added.map(store.withReadFlag), ...current]
+      ..sort((a, b) => b.sortTime.compareTo(a.sortTime));
+    _cachedListItems = null;
+    setState(() => _rows = next);
+    HearingNotificationFanoutService.instance.publishAttorneyInbox(userId, next);
+    store.syncFromRows(next);
+  }
+
   @override
   void dispose() {
     _inboxSub?.cancel();
     _inboxSub = null;
+    unawaited(_hearingsLiveSub?.cancel());
+    _hearingsLiveSub = null;
     _inboxStreamDebounce?.cancel();
     _deferredInboxTimer?.cancel();
+    _loadWatchdog?.cancel();
     super.dispose();
   }
 
   bool _isRowRead(HearingInboxRow row) {
+    if (AttorneyInboxReadStore.instance.isRead(row)) return true;
     if (_safeLocallyReadKeys.contains(row.rowKey)) return true;
+    final hid = HearingCalendarFields.asDisplayString(row.data['hearingDocId']);
+    if (hid.isNotEmpty && _safeLocallyReadKeys.contains(hid)) return true;
+    if (row.notificationDocId != null &&
+        _safeLocallyReadKeys.contains(row.notificationDocId)) {
+      return true;
+    }
     return !row.isUnread;
+  }
+
+  HearingInboxRow _rowWithLocalRead(
+    HearingInboxRow row,
+    Set<String> readHearingIds,
+  ) {
+    final uid = _auth.currentUser?.uid ?? '';
+    if (_isRowRead(row) ||
+        (uid.isNotEmpty &&
+            HearingNotificationFanoutService.instance
+                .attorneyInboxTreatsAsRead(uid, row.sortTime)) ||
+        readHearingIds.contains(row.rowKey) ||
+        readHearingIds.contains(row.notificationDocId ?? '') ||
+        readHearingIds.contains(
+          (HearingCalendarFields.asDisplayString(row.data['hearingDocId'])),
+        )) {
+      if (!row.isUnread) return row;
+      return HearingInboxRow(
+        rowKey: row.rowKey,
+        notificationDocId: row.notificationDocId,
+        data: {...row.data, 'isRead': true},
+        sortTime: row.sortTime,
+      );
+    }
+    return row;
   }
 
   int _unreadCount() {
@@ -530,42 +1211,67 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
       _safeLocallyReadKeys.add(row.rowKey);
       _cachedListItems = null;
     });
+    unawaited(AttorneyInboxReadStore.instance.markOne(userId, row));
+    AttorneyInboxReadStore.instance.syncFromRows(_safeRows);
 
     unawaited(
       HearingNotificationFanoutService.instance.markInboxRowAsRead(
         userId: userId,
         notificationDocId: row.notificationDocId,
+        inboxRowKey: row.rowKey,
         rowData: row.data,
       ),
     );
   }
 
   Future<void> _markAllAsRead() async {
-    final userId = _auth.currentUser?.uid;
-    if (userId == null) return;
+    final userId = _auth.currentUser?.uid ?? await _resolveAttorneyUserId();
+    if (userId == null || userId.isEmpty) return;
 
     if (_useLightweightInbox) {
       setState(() {
         _lightItems = _lightItems.map((i) => i.markRead()).toList();
       });
-      unawaited(
-        HearingNotificationFanoutService.instance.markAllInboxRowsRead(userId),
+      await HearingNotificationFanoutService.instance.markAllInboxRowsRead(
+        userId,
       );
       return;
     }
 
-    final allKeys = _safeRows.map((r) => r.rowKey).toSet();
+    _loadGen++;
+    final marked = _safeRows
+        .map(
+          (r) => HearingInboxRow(
+            rowKey: r.rowKey,
+            notificationDocId: r.notificationDocId,
+            data: {...r.data, 'isRead': true},
+            sortTime: r.sortTime,
+          ),
+        )
+        .toList();
+    final allKeys = <String>{};
+    for (final r in marked) {
+      allKeys.add(r.rowKey);
+      final hid = HearingCalendarFields.asDisplayString(r.data['hearingDocId']);
+      if (hid.isNotEmpty) allKeys.add(hid);
+      final nid = r.notificationDocId?.trim() ?? '';
+      if (nid.isNotEmpty) allKeys.add(nid);
+    }
     setState(() {
       _locallyReadRowKeys.addAll(allKeys);
+      _rows = marked;
       _cachedListItems = null;
     });
+    HearingNotificationFanoutService.instance.publishAttorneyInbox(
+      userId,
+      marked,
+    );
+    await AttorneyInboxReadStore.instance.markAll(userId, marked);
 
-    unawaited(
-      HearingNotificationFanoutService.instance.markAllInboxRowsRead(
-        userId,
-        includeGlobalHearingsFallback: widget.includeGlobalHearingsFallback,
-        hearingsOnly: widget.hearingsOnly,
-      ),
+    await HearingNotificationFanoutService.instance.markAllInboxRowsRead(
+      userId,
+      includeGlobalHearingsFallback: widget.includeGlobalHearingsFallback,
+      hearingsOnly: widget.hearingsOnly,
     );
   }
 
@@ -607,18 +1313,18 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
 
   String _listSubtitle(Map<String, dynamic> data) {
     if (data['_lightweight'] == true) {
-      return (data['summary'] as String?)?.trim() ?? '';
+      return HearingCalendarFields.asDisplayString(data['summary']);
     }
-    final type = (data['type'] as String? ?? '').toLowerCase();
+    final type = HearingCalendarFields.asDisplayString(data['type']).toLowerCase();
     if (type.contains('hearing') ||
-        (data['hearingDocId'] as String?)?.trim().isNotEmpty == true) {
+        HearingCalendarFields.asDisplayString(data['hearingDocId']).isNotEmpty) {
       return HearingNotificationFormatter.buildSummary(data);
     }
 
-    final summary = (data['summary'] as String?)?.trim();
-    if (summary != null && summary.isNotEmpty) return summary;
+    final summary = HearingCalendarFields.asDisplayString(data['summary']);
+    if (summary.isNotEmpty) return summary;
 
-    final typeLabel = data['type'] as String? ?? '';
+    final typeLabel = HearingCalendarFields.asDisplayString(data['type']);
     return _getReminderTitle(typeLabel);
   }
 
@@ -627,9 +1333,9 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
       return _isHearingDetail(data) || message.trim().isNotEmpty;
     }
     if (message.trim().isNotEmpty) return true;
-    final type = (data['type'] as String? ?? '').toLowerCase();
+    final type = HearingCalendarFields.asDisplayString(data['type']).toLowerCase();
     if (type.contains('hearing')) return true;
-    if ((data['hearingDocId'] as String?)?.trim().isNotEmpty == true) {
+    if (HearingCalendarFields.asDisplayString(data['hearingDocId']).isNotEmpty) {
       return true;
     }
     return HearingNotificationFormatter.fieldsFromNotificationData(data)
@@ -637,9 +1343,9 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   }
 
   bool _isHearingDetail(Map<String, dynamic> data) {
-    final type = (data['type'] as String? ?? '').toLowerCase();
+    final type = HearingCalendarFields.asDisplayString(data['type']).toLowerCase();
     return type.contains('hearing') ||
-        (data['hearingDocId'] as String?)?.trim().isNotEmpty == true;
+        HearingCalendarFields.asDisplayString(data['hearingDocId']).isNotEmpty;
   }
 
   String _getReminderTitle(String type) {
@@ -658,24 +1364,18 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   }
 
   List<Object> _buildListItemsForRows() {
-    final hearingRows = _safeRows.where((r) => r.isHearingSource).toList();
-    final appointmentRows = widget.hearingsOnly
-        ? <HearingInboxRow>[]
-        : _safeRows.where((r) => !r.isHearingSource).toList();
+    final rows = List<HearingInboxRow>.from(_safeRows)
+      ..sort((a, b) => b.sortTime.compareTo(a.sortTime));
 
     final items = <Object>[];
-    if (hearingRows.isNotEmpty) {
-      items.add(
-        widget.hearingsOnly
-            ? 'New notice court hearings'
-            : 'Court hearings & orders',
-      );
-      items.addAll(hearingRows);
-    }
-    if (appointmentRows.isNotEmpty) {
-      if (hearingRows.isNotEmpty) items.add('__gap__');
-      items.add('Appointments');
-      items.addAll(appointmentRows);
+    String? lastDate;
+    for (final row in rows) {
+      final dateKey = DateFormat('MMMM dd, yyyy').format(row.sortTime);
+      if (dateKey != lastDate) {
+        items.add(dateKey);
+        lastDate = dateKey;
+      }
+      items.add(row);
     }
     return items;
   }
@@ -696,24 +1396,36 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   }
 
   Widget _buildMarkAllReadAction() {
-    final unreadCount = _unreadCount();
-    if (unreadCount == 0) return const SizedBox.shrink();
-
-    return Padding(
-      padding: const EdgeInsets.only(right: 8),
-      child: TextButton.icon(
-        onPressed: _markAllAsRead,
-        style: TextButton.styleFrom(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-          minimumSize: Size.zero,
-          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        ),
-        icon: const Icon(Icons.done_all, color: Colors.white, size: 18),
-        label: Text(
-          'Mark read ($unreadCount)',
-          style: const TextStyle(color: Colors.white, fontSize: 12),
-        ),
-      ),
+    return ValueListenableBuilder<int>(
+      valueListenable: AttorneyInboxReadStore.instance.unreadCount,
+      builder: (context, unreadCount, _) {
+        if (unreadCount == 0) return const SizedBox.shrink();
+        return Padding(
+          padding: const EdgeInsets.only(right: 8),
+          child: TextButton.icon(
+            onPressed: _markAllAsRead,
+            style: TextButton.styleFrom(
+              foregroundColor: Colors.white,
+              backgroundColor: Colors.white.withValues(alpha: 0.12),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              minimumSize: const Size(0, 36),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+            icon: const Icon(Icons.done_all, color: Colors.white, size: 18),
+            label: Text(
+              'Mark read ($unreadCount)',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -723,6 +1435,33 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   }
 
   Widget _buildBody() {
+    if (_rows == null) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 32,
+                height: 32,
+                child: CircularProgressIndicator(strokeWidth: 2.5),
+              ),
+              SizedBox(height: 14),
+              Text(
+                'Loading reminders…',
+                style: TextStyle(
+                  fontSize: 14,
+                  color: Colors.grey,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     if (_safeRows.isEmpty) {
       if (_useLightweightInbox && _loadingMoreHearings) {
         return const Padding(
@@ -897,7 +1636,9 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
       ),
       padding: _listPadding(context),
       itemCount: items.length + (_loadingMoreHearings ? 1 : 0),
-      cacheExtent: 320,
+      cacheExtent: kIsWeb ? 480 : 320,
+      addAutomaticKeepAlives: false,
+      addRepaintBoundaries: false,
       itemBuilder: (_, index) {
         if (_loadingMoreHearings && index == 0) {
           return Padding(
@@ -931,7 +1672,7 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
     if (!widget.showScaffold) return body;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F4F4),
+      backgroundColor: AppTheme.lightGray,
       appBar: AppBar(
         title: const Text(
           'Reminders',
@@ -941,6 +1682,7 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
         foregroundColor: Colors.white,
         iconTheme: const IconThemeData(color: Colors.white),
         actions: [_buildMarkAllReadAction()],
+        actionsPadding: const EdgeInsets.only(right: 4),
       ),
       body: SafeArea(
         top: false,
@@ -988,21 +1730,18 @@ class _ReminderCardTileState extends State<_ReminderCardTile> {
   bool _loadingDetail = false;
   Map<String, dynamic>? _detailData;
 
-  bool get _isLightweight => widget.row.data['_lightweight'] == true;
-
   Future<void> _ensureDetailLoaded() async {
-    if (!_isLightweight || _detailData != null || _loadingDetail) return;
+    if (_detailData != null || _loadingDetail) return;
     setState(() => _loadingDetail = true);
     try {
-      final fs = FirebaseFirestore.instance;
-      final hid = (widget.row.data['hearingDocId'] as String?)?.trim();
-      final nid = widget.row.notificationDocId?.trim();
-      if (hid != null && hid.isNotEmpty) {
-        _detailData = (await fs.collection('hearings').doc(hid).get()).data();
-      } else if (nid != null && nid.isNotEmpty) {
-        _detailData =
-            (await fs.collection('notifications').doc(nid).get()).data();
-      }
+      final hid = HearingCalendarFields.asDisplayString(
+        widget.row.data['hearingDocId'],
+      );
+      _detailData = await loadHearingOrderDetail(
+        hearingDocId: hid,
+        notificationDocId: widget.row.notificationDocId,
+        seed: widget.row.data,
+      );
     } catch (_) {}
     if (mounted) setState(() => _loadingDetail = false);
   }
@@ -1010,18 +1749,15 @@ class _ReminderCardTileState extends State<_ReminderCardTile> {
   Future<void> _onHeaderTap() async {
     final willExpand = !_expanded;
     if (willExpand) {
-      setState(() => _expanded = true);
-      if (_isLightweight) {
+      final hearing = widget.isHearingDetail(widget.row.data);
+      setState(() {
+        _expanded = true;
+        _detailReady = !hearing;
+      });
+      if (!widget.isRead) widget.onMarkRead();
+      if (hearing) {
         await _ensureDetailLoaded();
         if (mounted) setState(() => _detailReady = true);
-      } else {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted || !_expanded) return;
-          setState(() => _detailReady = true);
-        });
-      }
-      if (!widget.isRead) {
-        widget.onMarkRead();
       }
       return;
     }
@@ -1034,10 +1770,12 @@ class _ReminderCardTileState extends State<_ReminderCardTile> {
   @override
   Widget build(BuildContext context) {
     final data = widget.row.data;
-    final detailData = _isLightweight ? (_detailData ?? data) : data;
-    final type = data['type'] as String? ?? '';
-    final title = data['title'] as String? ?? widget.getReminderTitle(type);
-    final message = data['message'] as String? ?? '';
+    final detailData = _detailData ?? data;
+    final type = HearingCalendarFields.asDisplayString(data['type']);
+    final title = HearingCalendarFields.asDisplayString(data['title']).isNotEmpty
+        ? HearingCalendarFields.asDisplayString(data['title'])
+        : widget.getReminderTitle(type);
+    final message = HearingCalendarFields.asDisplayString(data['message']);
     final subtitle = widget.listSubtitle(data);
     final createdAt = (data['createdAt'] as Timestamp?)?.toDate();
     final isRead = widget.isRead;
@@ -1171,65 +1909,62 @@ class _ReminderCardTileState extends State<_ReminderCardTile> {
                       Container(
                         color: Colors.grey.shade50,
                         padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-                        child: _detailReady
-                            ? (_loadingDetail
-                                ? const Center(
-                                    child: Padding(
-                                      padding: EdgeInsets.all(12),
-                                      child: SizedBox(
-                                        width: 24,
-                                        height: 24,
-                                        child: CircularProgressIndicator(
-                                          strokeWidth: 2,
-                                        ),
-                                      ),
-                                    ),
-                                  )
-                                : Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    widget.isHearingDetail(detailData)
-                                        ? 'Hearing details'
-                                        : 'Full message',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                      color: AppTheme.royalBlue,
-                                      letterSpacing: 0.3,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 8),
-                                  if (widget.isHearingDetail(detailData))
-                                    HearingNotificationDetailPanel(
-                                      data: detailData,
-                                      hearingDocId:
-                                          detailData['hearingDocId'] as String?,
-                                    )
-                                  else
-                                    SelectableText(
-                                      (detailData['message'] as String?)?.trim() ??
-                                          message,
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        height: 1.45,
-                                        color: Colors.grey[800],
-                                      ),
-                                    ),
-                                ],
-                              ))
-                            : const SizedBox(
-                                height: 32,
-                                child: Center(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              widget.isHearingDetail(detailData)
+                                  ? 'Hearing details'
+                                  : 'Full message',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: AppTheme.royalBlue,
+                                letterSpacing: 0.3,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            if (widget.isHearingDetail(data) && !_detailReady)
+                              const Center(
+                                child: Padding(
+                                  padding: EdgeInsets.all(12),
                                   child: SizedBox(
-                                    width: 20,
-                                    height: 20,
+                                    width: 24,
+                                    height: 24,
                                     child: CircularProgressIndicator(
                                       strokeWidth: 2,
                                     ),
                                   ),
                                 ),
+                              )
+                            else if (widget.isHearingDetail(detailData))
+                              HearingNotificationDetailPanel(
+                                data: detailData,
+                                hearingDocId: () {
+                                  final hid =
+                                      HearingCalendarFields.asDisplayString(
+                                    detailData['hearingDocId'],
+                                  );
+                                  return hid.isEmpty ? null : hid;
+                                }(),
+                              )
+                            else
+                              SelectableText(
+                                HearingCalendarFields.asDisplayString(
+                                  detailData['message'],
+                                ).isNotEmpty
+                                    ? HearingCalendarFields.asDisplayString(
+                                        detailData['message'],
+                                      )
+                                    : message,
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  height: 1.45,
+                                  color: Colors.grey[800],
+                                ),
                               ),
+                          ],
+                        ),
                       ),
                     ],
                   ),

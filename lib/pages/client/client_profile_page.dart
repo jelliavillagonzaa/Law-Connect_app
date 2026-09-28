@@ -59,7 +59,7 @@ class _ClientProfilePageState extends State<ClientProfilePage> {
           children: [
             // Profile Picture - loads independently
             ProfilePictureWidget(
-              photoUrl: null,
+              photoUrl: _userProfile?['photoUrl'] as String?,
               userName: _isLoading
                   ? 'User'
                   : (_userProfile?['fullName'] ??

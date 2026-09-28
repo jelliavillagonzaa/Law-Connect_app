@@ -82,6 +82,19 @@ class HearingSmsAlertService {
     }
   }
 
+  /// Cloud Functions already send the one intake SMS for n8n / court imports.
+  static bool _cloudFunctionsSendsIntakeSms(Map<String, dynamic> data) {
+    final source = '${data['source'] ?? ''}'.toLowerCase();
+    final activity = '${data['activityType'] ?? ''}'.toLowerCase().trim();
+    if (source == 'n8n' || source.contains('n8n') || activity == 'court_import') {
+      return true;
+    }
+    if (data['philsmsIntakeSent'] == true || data['philsmsLastSentAt'] != null) {
+      return true;
+    }
+    return false;
+  }
+
   /// Standalone path: `hearings` doc added/updated → SMS (if content digest is new).
   Future<void> _onHearingDocumentChanged(
     DocumentSnapshot<Map<String, dynamic>> doc,
@@ -91,6 +104,7 @@ class HearingSmsAlertService {
     if (data == null || !PhilSmsHearingAlertConfig.isSmsEligibleHearing(data)) {
       return;
     }
+    if (_cloudFunctionsSendsIntakeSms(data)) return;
 
     final clientUids = await _resolveClientUidsByName(data);
     await sendAlertsForHearing(
@@ -117,6 +131,11 @@ class HearingSmsAlertService {
       return;
     }
     if (!PhilSmsHearingAlertConfig.isSmsEligibleHearing(hearingData)) return;
+    if (_cloudFunctionsSendsIntakeSms(hearingData)) return;
+
+    final intakeKey = 'hearing_sms_intake_$hearingDocId';
+    if (await _alreadySent(intakeKey)) return;
+    await _markSent(intakeKey);
 
     final digestKey =
         PhilSmsHearingAlertConfig.digestForDocument(hearingDocId, hearingData);

@@ -4,8 +4,8 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../theme/app_theme.dart';
 import '../../models/user_model.dart';
 import '../../widgets/common/profile_picture_widget.dart';
-import '../../widgets/common/law_connect_logo.dart';
-import '../../widgets/common/min_touch_target.dart';
+import '../../widgets/common/brand_logo.dart';
+import 'attorney_ui_theme.dart';
 
 class AttorneyThinNavRail extends StatefulWidget {
   final String activeItem;
@@ -13,6 +13,7 @@ class AttorneyThinNavRail extends StatefulWidget {
   final VoidCallback onLogout;
   final bool isAvailable;
   final ValueChanged<bool> onAvailabilityChanged;
+  final int messageUnreadCount;
 
   const AttorneyThinNavRail({
     super.key,
@@ -21,40 +22,31 @@ class AttorneyThinNavRail extends StatefulWidget {
     required this.onLogout,
     required this.isAvailable,
     required this.onAvailabilityChanged,
+    this.messageUnreadCount = 0,
   });
 
   @override
   State<AttorneyThinNavRail> createState() => _AttorneyThinNavRailState();
 }
 
-class _AttorneyThinNavRailState extends State<AttorneyThinNavRail>
-    with SingleTickerProviderStateMixin {
+class _AttorneyThinNavRailState extends State<AttorneyThinNavRail> {
+  static const double _collapsedWidth = 72;
+  static const double _wideLayoutMin = 176;
+
   UserModel? _currentUser;
-  bool _isLoading = true;
-  bool _isExpanded = false;
-  late AnimationController _expandController;
+  bool _isExpanded = true;
+  String? _hoveredKey;
 
   @override
   void initState() {
     super.initState();
     _loadUserData();
-    _expandController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 300),
-    );
-  }
-
-  @override
-  void dispose() {
-    _expandController.dispose();
-    super.dispose();
   }
 
   Future<void> _loadUserData() async {
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) {
-        setState(() => _isLoading = false);
         return;
       }
 
@@ -65,16 +57,9 @@ class _AttorneyThinNavRailState extends State<AttorneyThinNavRail>
       if (userDoc.exists && mounted) {
         setState(() {
           _currentUser = UserModel.fromFirestore(userDoc.data()!, user.uid);
-          _isLoading = false;
         });
-      } else {
-        setState(() => _isLoading = false);
       }
-    } catch (e) {
-      if (mounted) {
-        setState(() => _isLoading = false);
-      }
-    }
+    } catch (_) {}
   }
 
   final List<Map<String, dynamic>> _menuItems = [
@@ -91,8 +76,14 @@ class _AttorneyThinNavRailState extends State<AttorneyThinNavRail>
       'badge': null,
     },
     {
+      'title': 'Closed Cases',
+      'icon': Icons.folder_off_outlined,
+      'key': 'closed_cases',
+      'badge': null,
+    },
+    {
       'title': 'Create Case',
-      'icon': Icons.inbox_outlined,
+      'icon': Icons.add,
       'key': 'case_requests',
       'badge': null,
     },
@@ -103,7 +94,7 @@ class _AttorneyThinNavRailState extends State<AttorneyThinNavRail>
       'badge': null,
     },
     {
-      'title': 'Tasks',
+      'title': 'Staff Tasks',
       'icon': Icons.task_outlined,
       'key': 'tasks',
       'badge': null,
@@ -120,7 +111,6 @@ class _AttorneyThinNavRailState extends State<AttorneyThinNavRail>
       'key': 'calendar',
       'badge': null,
     },
-
     {
       'title': 'Settings',
       'icon': Icons.settings_outlined,
@@ -131,381 +121,295 @@ class _AttorneyThinNavRailState extends State<AttorneyThinNavRail>
 
   @override
   Widget build(BuildContext context) {
-    return MouseRegion(
-      onEnter: (_) {
-        // Hover no longer auto-expands/collapses; use the toggle button instead
-      },
-      onExit: (_) {
-        // Do not auto-collapse on exit if the user has it expanded;
-        // leave collapse to the toggle button for better control.
-      },
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 250),
-        curve: Curves.easeInOut,
-        width: _isExpanded ? 240 : 72,
-        decoration: BoxDecoration(
-          color: Colors.white,
-          border: Border(right: BorderSide(color: Colors.grey[200]!, width: 1)),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.03),
-              blurRadius: 10,
-              offset: const Offset(2, 0),
-            ),
-          ],
-        ),
-        child: SafeArea(
-          child: Column(
-            children: [
-              // Logo/Branding Section
-              _buildLogoSection(),
-
-              const Divider(height: 1),
-
-              // Navigation Items
-              Expanded(
-                child: ListView.builder(
-                  padding: EdgeInsets.only(
-                    top: 12,
-                    bottom: 8,
-                    left: _isExpanded ? 12 : 0,
-                    right: _isExpanded ? 12 : 0,
-                  ),
-                  shrinkWrap: true,
-                  itemCount: _menuItems.length,
-                  itemBuilder: (context, index) {
-                    final item = _menuItems[index];
-                    final isActive = widget.activeItem == item['key'];
-
-                    return Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 2),
-                      child: _NavRailItem(
-                        title: item['title'],
-                        icon: item['icon'],
-                        isActive: isActive,
-                        isExpanded: _isExpanded,
-                        badge: item['badge'],
-                        onTap: () => widget.onItemSelected(item['key']),
-                      ),
-                    );
-                  },
-                ),
+    return Directionality(
+      textDirection: TextDirection.ltr,
+      child: SizedBox(
+        height: double.infinity,
+        child: AnimatedContainer(
+          duration: AttorneyUi.anim,
+          curve: Curves.easeInOut,
+          width: _isExpanded ? AttorneyUi.sidebarWidth : _collapsedWidth,
+          clipBehavior: Clip.hardEdge,
+          decoration: BoxDecoration(
+            gradient: AttorneyUi.sidebarGradient,
+            boxShadow: [
+              BoxShadow(
+                color: AttorneyUi.primary.withValues(alpha: 0.28),
+                blurRadius: 24,
+                offset: const Offset(8, 0),
               ),
-
-              const Divider(height: 1),
-
-              // Profile & Actions Section pinned to the very bottom
-              _buildProfileActionsSection(),
             ],
+          ),
+          child: SafeArea(
+            bottom: false,
+            right: false,
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final wide = constraints.maxWidth >= _wideLayoutMin;
+                return ClipRect(
+                  child: Column(
+                    children: [
+                      _buildLogoSection(wide),
+                      Padding(
+                        padding: EdgeInsets.symmetric(
+                          horizontal: wide ? 20 : 10,
+                        ),
+                        child: Container(
+                          height: 1,
+                          color: Colors.white.withValues(alpha: 0.08),
+                        ),
+                      ),
+                      Expanded(
+                        child: SingleChildScrollView(
+                          padding: EdgeInsets.only(
+                            top: 8,
+                            bottom: 6,
+                            left: wide ? 8 : 0,
+                            right: wide ? 8 : 0,
+                          ),
+                          child: Column(
+                            children: [
+                              for (final item in _menuItems)
+                                _buildNavItem(
+                                  title: item['title'] as String,
+                                  icon: item['icon'] as IconData,
+                                  itemKey: item['key'] as String,
+                                  isActive: widget.activeItem == item['key'],
+                                  wide: wide,
+                                  badge: item['key'] == 'messages'
+                                      ? (widget.messageUnreadCount > 0
+                                          ? widget.messageUnreadCount
+                                          : null)
+                                      : item['badge'] as int?,
+                                  onTap: () => widget.onItemSelected(
+                                    item['key'] as String,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      Padding(
+                        padding: EdgeInsets.symmetric(
+                          horizontal: wide ? 16 : 10,
+                        ),
+                        child: Container(
+                          height: 1,
+                          color: Colors.white.withValues(alpha: 0.08),
+                        ),
+                      ),
+                      _buildProfileActionsSection(wide),
+                    ],
+                  ),
+                );
+              },
+            ),
           ),
         ),
       ),
     );
   }
 
-  Widget _buildLogoSection() {
-    return Container(
-      padding: EdgeInsets.all(_isExpanded ? 20 : 16),
-      child: _isExpanded
-          ? FittedBox(
-              fit: BoxFit.scaleDown,
-              alignment: Alignment.centerLeft,
-              child: Row(
-                mainAxisSize: MainAxisSize.max,
-                children: [
-                  Container(
-                    width: 40,
-                    height: 40,
-                    decoration: BoxDecoration(
-                      color: AppTheme.royalBlue.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: const Center(
-                      child: LawConnectLogo(
-                        size: 28,
-                        color: AppTheme.royalBlue,
-                      ),
-                    ),
+  Icon _ltrIcon(IconData icon, {required double size, required Color color}) {
+    return Icon(
+      icon,
+      size: size,
+      color: color,
+      textDirection: TextDirection.ltr,
+    );
+  }
+
+  Widget _menuToggle() {
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: () => setState(() => _isExpanded = !_isExpanded),
+      child: Padding(
+        padding: const EdgeInsets.all(4),
+        child: _ltrIcon(
+          _isExpanded ? Icons.menu_open_rounded : Icons.menu_rounded,
+          size: 20,
+          color: Colors.white70,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLogoSection(bool wide) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        wide ? 12 : 8,
+        12,
+        wide ? 12 : 8,
+        10,
+      ),
+      child: wide
+          ? Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(14),
                   ),
-                  const SizedBox(width: 12),
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 140),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          'Law Connect',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                            color: AppTheme.darkText,
-                            letterSpacing: 0.3,
-                          ),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                  child: const BrandLogo(size: 28),
+                ),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Law Connect',
+                        textDirection: TextDirection.ltr,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w800,
+                          color: Colors.white,
                         ),
-                        Text(
-                          'Attorney Portal',
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: AppTheme.mutedText,
-                            fontWeight: FontWeight.w500,
-                          ),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                      ),
+                      Text(
+                        'Attorney Portal',
+                        textDirection: TextDirection.ltr,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w500,
+                          color: Color(0xB3FFFFFF),
                         ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  // Collapse / expand toggle icon (hamburger with arrow style)
-                  InkWell(
-                    borderRadius: BorderRadius.circular(12),
-                    onTap: () {
-                      setState(() {
-                        _isExpanded = !_isExpanded;
-                      });
-                    },
-                    child: Container(
-                      padding: const EdgeInsets.all(6),
-                      decoration: BoxDecoration(
-                        color: AppTheme.royalBlue.withOpacity(0.08),
-                        borderRadius: BorderRadius.circular(12),
                       ),
-                      child: Icon(
-                        Icons.menu_open_rounded,
-                        size: 20,
-                        color: AppTheme.royalBlue,
-                      ),
-                    ),
+                    ],
                   ),
-                ],
-              ),
+                ),
+                _menuToggle(),
+              ],
             )
           : Column(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Container(
-                  width: 40,
-                  height: 40,
+                  padding: const EdgeInsets.all(4),
                   decoration: BoxDecoration(
-                    color: AppTheme.royalBlue.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(10),
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(12),
                   ),
-                  child: const Center(
-                    child: LawConnectLogo(size: 28, color: AppTheme.royalBlue),
-                  ),
+                  child: const BrandLogo(size: 22),
                 ),
-                const SizedBox(height: 12),
-                // Compact toggle icon to match the “menu with arrow” feel
-                MinTouchTarget(
-                  minSize: 48,
-                  borderRadius: BorderRadius.circular(12),
-                  tooltip: 'Toggle menu',
-                  onTap: () => setState(() => _isExpanded = !_isExpanded),
-                  child: Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: AppTheme.royalBlue.withOpacity(0.12),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: const Icon(
-                      Icons.menu_rounded,
-                      size: 20,
-                      color: AppTheme.royalBlue,
-                    ),
-                  ),
-                ),
+                const SizedBox(height: 6),
+                _menuToggle(),
               ],
             ),
     );
   }
 
-  Widget _buildProfileActionsSection() {
-    if (_isLoading) {
-      return Container(
-        padding: const EdgeInsets.all(16),
-        child: const Center(child: CircularProgressIndicator(strokeWidth: 2)),
-      );
-    }
-
+  Widget _buildProfileActionsSection(bool wide) {
     if (_currentUser == null) {
       return const SizedBox.shrink();
     }
 
-    return Container(
-      padding: EdgeInsets.all(_isExpanded ? 16 : 12),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [AppTheme.royalBlue, AppTheme.deepNavy],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-      ),
-      // Make the bottom profile/actions area scrollable so it never overflows
-      child: SingleChildScrollView(
-        child: _isExpanded
-            ? Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // Profile Info (wrapped to avoid any horizontal overflow)
-                  FittedBox(
-                    fit: BoxFit.scaleDown,
-                    alignment: Alignment.centerLeft,
-                    child: Row(
-                      mainAxisSize: MainAxisSize.max,
-                      children: [
-                        ProfilePictureWidget(
-                          photoUrl: _currentUser!.photoUrl,
-                          userName: _currentUser!.name.isNotEmpty
-                              ? _currentUser!.name
-                              : 'Attorney',
-                          size: 40,
-                          isEditable: false,
-                        ),
-                        const SizedBox(width: 12),
-                        ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 140),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(
-                                _currentUser!.name,
-                                style: TextStyle(
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w600,
-                                  color: Colors.white,
-                                ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                softWrap: false,
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                _currentUser!.email,
-                                style: TextStyle(
-                                  fontSize: 10,
-                                  color: Colors.white.withOpacity(0.8),
-                                ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                softWrap: false,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  // Logout Button
-                  _buildLogoutButton(),
-                ],
-              )
-            : Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Center(
-                    child: ProfilePictureWidget(
-                      photoUrl: _currentUser!.photoUrl,
-                      userName: _currentUser!.name.isNotEmpty
-                          ? _currentUser!.name
-                          : 'Attorney',
-                      size: 40,
-                      isEditable: false,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  // Logout Button (compact)
-                  _buildLogoutButton(),
-                ],
-              ),
-      ),
-    );
-  }
-
-  // Unused method - kept for potential future use
-  // ignore: unused_element
-  Widget _buildAvailabilityToggle() {
-    return _isExpanded
-        ? Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(
-                  color: widget.isAvailable
-                      ? const Color(0xFF4CAF50)
-                      : const Color(0xFFFF9800),
-                  shape: BoxShape.circle,
-                ),
-              ),
-              const SizedBox(width: 8),
-              // Wrap status text in Flexible so it can shrink and avoid overflow
-              Flexible(
-                child: Text(
-                  widget.isAvailable ? 'Online' : 'Offline',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                    color: Colors.white,
-                  ),
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Transform.scale(
-                scale: 0.7,
-                child: Switch(
-                  value: widget.isAvailable,
-                  onChanged: widget.onAvailabilityChanged,
-                  activeColor: const Color(0xFF4CAF50),
-                  activeTrackColor: const Color(0xFF4CAF50).withOpacity(0.4),
-                  inactiveThumbColor: Colors.grey[300],
-                  inactiveTrackColor: Colors.grey[700]!.withOpacity(0.3),
-                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-              ),
-            ],
-          )
-        : Tooltip(
-            message: widget.isAvailable ? 'Online' : 'Offline',
-            child: GestureDetector(
-              onTap: () => widget.onAvailabilityChanged(!widget.isAvailable),
-              child: Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                  color: widget.isAvailable
-                      ? const Color(0xFF4CAF50).withOpacity(0.1)
-                      : const Color(0xFFFF9800).withOpacity(0.1),
-                  shape: BoxShape.circle,
-                  border: Border.all(
-                    color: widget.isAvailable
-                        ? const Color(0xFF4CAF50)
-                        : const Color(0xFFFF9800),
-                    width: 2,
-                  ),
-                ),
-                child: Center(
-                  child: Container(
-                    width: 12,
-                    height: 12,
-                    decoration: BoxDecoration(
-                      color: widget.isAvailable
-                          ? const Color(0xFF4CAF50)
-                          : const Color(0xFFFF9800),
-                      shape: BoxShape.circle,
-                    ),
-                  ),
+    if (!wide) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(6, 6, 6, 10),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ProfilePictureWidget(
+              photoUrl: _currentUser!.photoUrl,
+              userName: _currentUser!.name.isNotEmpty
+                  ? _currentUser!.name
+                  : 'Attorney',
+              size: 24,
+              isEditable: false,
+            ),
+            const SizedBox(height: 4),
+            InkWell(
+              borderRadius: BorderRadius.circular(10),
+              onTap: _showLogoutConfirmation,
+              child: const Padding(
+                padding: EdgeInsets.all(4),
+                child: Icon(
+                  Icons.logout_rounded,
+                  size: 16,
+                  color: Colors.white70,
+                  textDirection: TextDirection.ltr,
                 ),
               ),
             ),
-          );
+          ],
+        ),
+      );
+    }
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 8, 12, 16),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ProfilePictureWidget(
+                  photoUrl: _currentUser!.photoUrl,
+                  userName: _currentUser!.name.isNotEmpty
+                      ? _currentUser!.name
+                      : 'Attorney',
+                  size: 32,
+                  isEditable: false,
+                ),
+                const SizedBox(width: 12),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 120),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        _currentUser!.name,
+                        textDirection: TextDirection.ltr,
+                        style: const TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        softWrap: false,
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        _currentUser!.email,
+                        textDirection: TextDirection.ltr,
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: Colors.white.withOpacity(0.8),
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        softWrap: false,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          _buildLogoutButton(),
+        ],
+      ),
+    );
   }
 
   Future<void> _showLogoutConfirmation() async {
@@ -573,228 +477,156 @@ class _AttorneyThinNavRailState extends State<AttorneyThinNavRail>
   }
 
   Widget _buildLogoutButton() {
-    return _isExpanded
-        ? SizedBox(
-            width: double.infinity,
-            child: ElevatedButton(
-              onPressed: _showLogoutConfirmation,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: AppTheme.royalBlue,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 6,
-                  vertical: 10,
+    return SizedBox(
+      width: double.infinity,
+      child: ElevatedButton(
+        onPressed: _showLogoutConfirmation,
+        style: ElevatedButton.styleFrom(
+          backgroundColor: Colors.white.withValues(alpha: 0.12),
+          foregroundColor: Colors.white,
+          padding: const EdgeInsets.symmetric(
+            horizontal: 6,
+            vertical: 12,
+          ),
+          minimumSize: const Size(0, 36),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+          elevation: 0,
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            _ltrIcon(
+              Icons.logout_rounded,
+              size: 16,
+              color: Colors.white,
+            ),
+            const SizedBox(width: 6),
+            const Flexible(
+              child: Text(
+                'Logout',
+                textDirection: TextDirection.ltr,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
                 ),
-                minimumSize: const Size(0, 40),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                elevation: 0,
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(Icons.logout_rounded, size: 16),
-                  const SizedBox(width: 6),
-                  Flexible(
-                    child: Text(
-                      'Logout',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                      ),
-                      overflow: TextOverflow.ellipsis,
-                      maxLines: 1,
-                    ),
-                  ),
-                ],
+                overflow: TextOverflow.ellipsis,
+                maxLines: 1,
               ),
             ),
-          )
-        : Tooltip(
-            message: 'Logout',
-            child: InkWell(
-              onTap: _showLogoutConfirmation,
-              borderRadius: BorderRadius.circular(8),
-              child: Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFDC3545).withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: const Color(0xFFDC3545).withOpacity(0.5),
-                    width: 1,
-                  ),
-                ),
-                child: const Icon(
-                  Icons.logout_rounded,
-                  size: 18,
-                  color: Colors.white,
-                ),
-              ),
-            ),
-          );
+          ],
+        ),
+      ),
+    );
   }
-}
 
-class _NavRailItem extends StatefulWidget {
-  final String title;
-  final IconData icon;
-  final bool isActive;
-  final bool isExpanded;
-  final int? badge;
-  final VoidCallback onTap;
-
-  const _NavRailItem({
-    required this.title,
-    required this.icon,
-    required this.isActive,
-    required this.isExpanded,
-    this.badge,
-    required this.onTap,
-  });
-
-  @override
-  State<_NavRailItem> createState() => _NavRailItemState();
-}
-
-class _NavRailItemState extends State<_NavRailItem> {
-  bool _isHovered = false;
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: widget.isExpanded ? '' : widget.title,
-      preferBelow: false,
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          onTap: widget.onTap,
-          onHover: (hovered) {
-            if (_isHovered != hovered) setState(() => _isHovered = hovered);
-          },
-          borderRadius: BorderRadius.circular(10),
+  Widget _buildNavItem({
+    required String title,
+    required IconData icon,
+    required String itemKey,
+    required bool isActive,
+    required bool wide,
+    required int? badge,
+    required VoidCallback onTap,
+  }) {
+    final hovered = _hoveredKey == itemKey;
+    final iconColor = isActive ? AttorneyUi.primary : Colors.white;
+    return SizedBox(
+      key: ValueKey<String>('nav-$itemKey'),
+      height: 44,
+      width: double.infinity,
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _hoveredKey = itemKey),
+        onExit: (_) => setState(() => _hoveredKey = null),
+        cursor: SystemMouseCursors.click,
+        child: GestureDetector(
+          onTap: onTap,
           child: Container(
-            constraints: const BoxConstraints(minHeight: 48),
-            margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            margin: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
             padding: EdgeInsets.symmetric(
-              horizontal: widget.isExpanded ? 12 : 0,
-              vertical: 10,
+              horizontal: wide ? 10 : 0,
+              vertical: 6,
             ),
             decoration: BoxDecoration(
-              color: widget.isActive
-                  ? AppTheme.royalBlue.withOpacity(0.1)
-                  : (_isHovered
-                        ? AppTheme.royalBlue.withOpacity(0.05)
-                        : Colors.transparent),
-              borderRadius: BorderRadius.circular(10),
-              border: widget.isActive
-                  ? Border.all(
-                      color: AppTheme.royalBlue.withOpacity(0.3),
-                      width: 1,
-                    )
+              color: isActive
+                  ? Colors.white
+                  : (hovered
+                      ? Colors.white.withValues(alpha: 0.10)
+                      : Colors.transparent),
+              borderRadius: BorderRadius.circular(20),
+              boxShadow: isActive
+                  ? [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.12),
+                        blurRadius: 16,
+                        offset: const Offset(0, 6),
+                      ),
+                    ]
                   : null,
             ),
-            child: widget.isExpanded
-                ? FittedBox(
-                    fit: BoxFit.scaleDown,
-                    alignment: Alignment.centerLeft,
-                    child: Row(
-                      mainAxisSize: MainAxisSize.max,
-                      children: [
-                        Icon(
-                          widget.icon,
-                          size: 20,
-                          color: widget.isActive
-                              ? AppTheme.royalBlue
-                              : (_isHovered
-                                    ? AppTheme.royalBlue.withOpacity(0.7)
-                                    : AppTheme.mutedText),
+            child: wide
+                ? Row(
+                    children: [
+                      Container(
+                        width: 30,
+                        height: 30,
+                        decoration: BoxDecoration(
+                          color: isActive
+                              ? AttorneyUi.primary.withValues(alpha: 0.10)
+                              : Colors.white.withValues(alpha: 0.10),
+                          borderRadius: BorderRadius.circular(10),
                         ),
-                        const SizedBox(width: 12),
-                        ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 140),
+                        child: _ltrIcon(icon, size: 18, color: iconColor),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          title,
+                          textDirection: TextDirection.ltr,
+                          style: TextStyle(
+                            fontSize: 13.5,
+                            fontWeight:
+                                isActive ? FontWeight.w700 : FontWeight.w500,
+                            color: iconColor,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      if (badge != null && badge > 0)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: AttorneyUi.danger,
+                            borderRadius: BorderRadius.circular(10),
+                          ),
                           child: Text(
-                            widget.title,
-                            style: TextStyle(
-                              fontSize: 13,
-                              fontWeight: widget.isActive
-                                  ? FontWeight.w600
-                                  : FontWeight.w500,
-                              color: widget.isActive
-                                  ? AppTheme.royalBlue
-                                  : (_isHovered
-                                        ? AppTheme.royalBlue.withOpacity(0.8)
-                                        : AppTheme.mutedText),
+                            '$badge',
+                            textDirection: TextDirection.ltr,
+                            style: const TextStyle(
+                              fontSize: 9,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white,
                             ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            softWrap: false,
                           ),
                         ),
-                        if (widget.badge != null && widget.badge! > 0)
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 6,
-                              vertical: 2,
-                            ),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFFDC3545),
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            child: Text(
-                              '${widget.badge}',
-                              style: TextStyle(
-                                fontSize: 9,
-                                fontWeight: FontWeight.w700,
-                                color: Colors.white,
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
+                    ],
                   )
                 : Center(
-                    child: Stack(
-                      clipBehavior: Clip.none,
-                      children: [
-                        Icon(
-                          widget.icon,
-                          size: 22,
-                          color: widget.isActive
-                              ? AppTheme.royalBlue
-                              : (_isHovered
-                                    ? AppTheme.royalBlue.withOpacity(0.7)
-                                    : AppTheme.mutedText),
-                        ),
-                        if (widget.badge != null && widget.badge! > 0)
-                          Positioned(
-                            right: -4,
-                            top: -4,
-                            child: Container(
-                              padding: const EdgeInsets.all(4),
-                              decoration: const BoxDecoration(
-                                color: Color(0xFFDC3545),
-                                shape: BoxShape.circle,
-                              ),
-                              constraints: const BoxConstraints(
-                                minWidth: 16,
-                                minHeight: 16,
-                              ),
-                              child: Center(
-                                child: Text(
-                                  '${widget.badge}',
-                                  style: TextStyle(
-                                    fontSize: 8,
-                                    fontWeight: FontWeight.w700,
-                                    color: Colors.white,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                      ],
+                    child: Container(
+                      width: 30,
+                      height: 30,
+                      decoration: BoxDecoration(
+                        color: isActive
+                            ? AttorneyUi.primary.withValues(alpha: 0.10)
+                            : Colors.white.withValues(alpha: 0.10),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: _ltrIcon(icon, size: 18, color: iconColor),
                     ),
                   ),
           ),

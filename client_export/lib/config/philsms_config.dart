@@ -139,8 +139,6 @@ class PhilSmsHearingAlertConfig {
     'location',
     'summary',
     'hearingDateTime',
-    'updatedAt',
-    'createdAt',
   ];
 
   static bool isSmsEligibleHearing(Map<String, dynamic> data) {

@@ -4,17 +4,22 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../models/user_model.dart';
 import '../../services/admin_service.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/admin/admin_page_header.dart';
+import '../../widgets/admin/admin_ui_theme.dart';
 import '../../widgets/common/safe_network_avatar.dart';
 
 class UserManagementScreen extends StatefulWidget {
   final bool inline;
   /// When set (e.g. from admin dashboard stat cards), pre-selects the role filter.
   final String? initialRoleFilter;
+  /// When set (e.g. from admin header search), pre-fills the name/email search.
+  final String? initialSearchQuery;
 
   const UserManagementScreen({
     super.key,
     this.inline = false,
     this.initialRoleFilter,
+    this.initialSearchQuery,
   });
 
   @override
@@ -36,21 +41,38 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
     return 'all';
   }
 
+  void _applyInitialSearch() {
+    final q = widget.initialSearchQuery?.trim() ?? '';
+    _searchController.value = TextEditingValue(
+      text: q,
+      selection: TextSelection.collapsed(offset: q.length),
+    );
+    _searchQuery = q.toLowerCase();
+  }
+
   @override
   void initState() {
     super.initState();
     _selectedRole = _roleFromWidget();
+    _applyInitialSearch();
   }
 
   @override
   void didUpdateWidget(UserManagementScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.initialRoleFilter != oldWidget.initialRoleFilter) {
-      final next = _roleFromWidget();
-      if (next != _selectedRole) {
-        setState(() => _selectedRole = next);
+    final roleChanged =
+        widget.initialRoleFilter != oldWidget.initialRoleFilter;
+    final searchChanged =
+        widget.initialSearchQuery != oldWidget.initialSearchQuery;
+    if (!roleChanged && !searchChanged) return;
+    setState(() {
+      if (roleChanged) {
+        _selectedRole = _roleFromWidget();
       }
-    }
+      if (searchChanged) {
+        _applyInitialSearch();
+      }
+    });
   }
 
   @override
@@ -166,7 +188,7 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                   filled: true,
                   fillColor: Colors.white,
                   hintText: 'Search users by name or email...',
-                  prefixIcon: const Icon(Icons.search, color: AppTheme.mutedText),
+                  prefixIcon: const Icon(Icons.search, color: AdminUi.muted),
                   suffixIcon: _searchQuery.isNotEmpty
                       ? IconButton(
                           icon: const Icon(Icons.clear),
@@ -177,19 +199,19 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                         )
                       : null,
                   border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(AdminUi.radius),
                     borderSide:
-                        const BorderSide(color: AppTheme.borderGray, width: 1),
+                        const BorderSide(color: AdminUi.line, width: 1),
                   ),
                   enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(AdminUi.radius),
                     borderSide:
-                        const BorderSide(color: AppTheme.borderGray, width: 1),
+                        const BorderSide(color: AdminUi.line, width: 1),
                   ),
                   focusedBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(AdminUi.radius),
                     borderSide:
-                        const BorderSide(color: AppTheme.royalBlue, width: 2),
+                        const BorderSide(color: AdminUi.primary, width: 2),
                   ),
                 ),
                 onChanged: (value) {
@@ -212,9 +234,9 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                       padding: const EdgeInsets.symmetric(horizontal: 12),
                       decoration: BoxDecoration(
                         color: Colors.white,
-                        borderRadius: BorderRadius.circular(12),
+                        borderRadius: BorderRadius.circular(AdminUi.radius),
                         border: Border.all(
-                          color: AppTheme.borderGray,
+                          color: AdminUi.line,
                           width: 1,
                         ),
                       ),
@@ -258,8 +280,9 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
           child: StreamBuilder<QuerySnapshot>(
             stream: _firestore.collection('users').snapshots(),
             builder: (context, snapshot) {
-              if (snapshot.connectionState == ConnectionState.waiting) {
-                return const Center(child: CircularProgressIndicator());
+              if (snapshot.connectionState == ConnectionState.waiting &&
+                  !snapshot.hasData) {
+                return const SizedBox.shrink();
               }
 
               if (snapshot.hasError) {
@@ -297,19 +320,56 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                         const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                     decoration: BoxDecoration(
                       color: Colors.white,
-                      borderRadius: BorderRadius.circular(12),
+                      borderRadius: BorderRadius.circular(AdminUi.radius),
+                      boxShadow: AdminUi.cardShadow,
                       border: Border.all(
-                        color: AppTheme.borderGray,
+                        color: AdminUi.line,
                         width: 1,
                       ),
                     ),
-                    child: Row(
-                      children: const [
-                        Expanded(flex: 2, child: Text('Name')),
-                        Expanded(flex: 3, child: Text('Email')),
-                        Expanded(flex: 1, child: Text('Role')),
-                        Expanded(flex: 1, child: Text('Status')),
-                        SizedBox(width: 40), // space for actions
+                    child: const Row(
+                      children: [
+                        Expanded(
+                          flex: 2,
+                          child: Text(
+                            'Name',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w600,
+                              color: AdminUi.text,
+                            ),
+                          ),
+                        ),
+                        Expanded(
+                          flex: 3,
+                          child: Text(
+                            'Email',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w600,
+                              color: AdminUi.text,
+                            ),
+                          ),
+                        ),
+                        Expanded(
+                          flex: 1,
+                          child: Text(
+                            'Role',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w600,
+                              color: AdminUi.text,
+                            ),
+                          ),
+                        ),
+                        Expanded(
+                          flex: 1,
+                          child: Text(
+                            'Status',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w600,
+                              color: AdminUi.text,
+                            ),
+                          ),
+                        ),
+                        SizedBox(width: 40),
                       ],
                     ),
                   ),
@@ -336,14 +396,9 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                           ),
                           decoration: BoxDecoration(
                             color: Colors.white,
-                            borderRadius: BorderRadius.circular(12),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withOpacity(0.03),
-                                blurRadius: 6,
-                                offset: const Offset(0, 2),
-                              ),
-                            ],
+                            borderRadius: BorderRadius.circular(AdminUi.radius),
+                            boxShadow: AdminUi.cardShadow,
+                            border: Border.all(color: AdminUi.line),
                           ),
                           child: Row(
                             children: [
@@ -533,38 +588,23 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
     final body = _buildBody();
 
     if (widget.inline) {
-      return Column(
-        children: [
-          // Custom header bar for inline mode
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.05),
-                  blurRadius: 5,
-                  offset: const Offset(0, 2),
-                ),
-              ],
-            ),
-            child: Row(
-              children: [
-                const Text(
-                  'User Management',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                ),
-                const Spacer(),
+      return ColoredBox(
+        color: AdminUi.background,
+        child: Column(
+          children: [
+            AdminPageHeader(
+              title: 'User Management',
+              actions: [
                 IconButton(
-                  icon: const Icon(Icons.add),
+                  icon: const Icon(Icons.add_rounded, color: AdminUi.primary),
                   onPressed: () => _showAddAttorneyDialog(),
                   tooltip: 'Add Attorney',
                 ),
               ],
             ),
-          ),
-          Expanded(child: body),
-        ],
+            Expanded(child: body),
+          ],
+        ),
       );
     }
 
@@ -851,6 +891,24 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
     }
   }
 
+  /// "From admin: …." — careful wording, always ends with a period.
+  String? _adminSmsBody(String raw) {
+    var text = raw.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (text.isEmpty) return null;
+    final letters = RegExp(r'[A-Za-z]').allMatches(text).length;
+    if (letters < 3) return null;
+    text = text[0].toUpperCase() + text.substring(1);
+    if (!text.endsWith('.')) {
+      text = text.replaceFirst(RegExp(r'[!?]+$'), '');
+      text = '$text.';
+    }
+    final lower = text.toLowerCase();
+    if (lower.startsWith('from admin:') || lower.startsWith('from admin ')) {
+      return text;
+    }
+    return 'From admin: $text';
+  }
+
   void _showSendUserSmsDialog(UserModel user) {
     final phoneRaw = (user.phone ?? user.phoneNumber ?? '').trim();
     final phoneController = TextEditingController(text: phoneRaw);
@@ -859,7 +917,10 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
     showDialog<void>(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) {
+          final preview = _adminSmsBody(messageController.text);
+          return AlertDialog(
         title: Text('Send SMS — ${user.name}'),
         content: SingleChildScrollView(
           child: Column(
@@ -875,8 +936,19 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                 keyboardType: TextInputType.phone,
               ),
               const SizedBox(height: 12),
+              const Text(
+                'From admin',
+                style: TextStyle(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'Added automatically. Write a clear sentence. It will end with a period.',
+                style: TextStyle(fontSize: 12, color: Colors.black54),
+              ),
+              const SizedBox(height: 8),
               TextField(
                 controller: messageController,
+                onChanged: (_) => setDialogState(() {}),
                 decoration: const InputDecoration(
                   labelText: 'Message',
                   alignLabelWithHint: true,
@@ -884,6 +956,13 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                 ),
                 maxLines: 4,
               ),
+              if (preview != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  preview,
+                  style: const TextStyle(fontSize: 13, height: 1.3),
+                ),
+              ],
             ],
           ),
         ),
@@ -899,11 +978,11 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
           ElevatedButton(
             onPressed: () async {
               final to = phoneController.text.trim();
-              final msg = messageController.text.trim();
-              if (to.isEmpty || msg.isEmpty) {
+              final msg = _adminSmsBody(messageController.text);
+              if (to.isEmpty || msg == null) {
                 Get.snackbar(
                   'Missing fields',
-                  'Enter a phone number and message.',
+                  'Enter a phone number and a clear message. It is sent as “From admin: ….”',
                   backgroundColor: Colors.orange,
                   colorText: Colors.white,
                 );
@@ -936,6 +1015,8 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
             child: const Text('Send'),
           ),
         ],
+      );
+        },
       ),
     );
   }

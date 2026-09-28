@@ -1,43 +1,63 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import 'package:intl/intl.dart';
+import 'dart:async';
 import '../models/case_model.dart';
+import '../utils/calendar_live_hearing_map.dart';
+import 'fcm_service.dart';
 import 'firestore_mirror_helper.dart';
+import 'hearing_calendar_sync_service.dart';
+import 'hearing_calendar_fields.dart';
+import 'notification_service.dart';
+import 'sms_service.dart';
 
 class StaffService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirebaseAuth _auth = FirebaseAuth.instance;
 
+  Stream<T> _withEmptyOnError<T>(Stream<T> stream, T empty) {
+    return stream.transform(
+      StreamTransformer<T, T>.fromHandlers(
+        handleError: (error, stack, sink) => sink.add(empty),
+      ),
+    );
+  }
+
   // Get cases assigned to staff
   Stream<List<CaseModel>> getAssignedCases(String staffId) {
-    return _firestore
-        .collection('cases')
-        .where('staffAssigned', arrayContains: staffId)
-        .snapshots()
-        .map((snapshot) {
-          final cases = snapshot.docs
-              .map((doc) => CaseModel.fromFirestore(doc))
-              .toList();
-          // Sort by createdAt descending in memory
-          cases.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-          return cases;
-        });
+    return _withEmptyOnError(
+      _firestore
+          .collection('cases')
+          .where('staffAssigned', arrayContains: staffId)
+          .snapshots()
+          .map((snapshot) {
+            final cases = snapshot.docs
+                .map((doc) => CaseModel.fromFirestore(doc))
+                .toList();
+            cases.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+            return cases;
+          }),
+      const <CaseModel>[],
+    );
   }
 
   // Get all cases from assigned attorney (for staff to view and assist)
   Stream<List<CaseModel>> getAttorneyCases(String attorneyId) {
-    return _firestore
-        .collection('cases')
-        .where('attorneyId', isEqualTo: attorneyId)
-        .snapshots()
-        .map((snapshot) {
-          final cases = snapshot.docs
-              .map((doc) => CaseModel.fromFirestore(doc))
-              .toList();
-          // Sort by createdAt descending in memory
-          cases.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-          return cases;
-        });
+    return _withEmptyOnError(
+      _firestore
+          .collection('cases')
+          .where('attorneyId', isEqualTo: attorneyId)
+          .snapshots()
+          .map((snapshot) {
+            final cases = snapshot.docs
+                .map((doc) => CaseModel.fromFirestore(doc))
+                .toList();
+            cases.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+            return cases;
+          }),
+      const <CaseModel>[],
+    );
   }
 
   // Get all documents from attorney's cases
@@ -281,30 +301,82 @@ class StaffService {
     }
   }
 
+  List<Map<String, dynamic>> _mapActivityLogDocs(
+    QuerySnapshot<Map<String, dynamic>> snapshot, {
+    int take = 300,
+  }) {
+    final logs = <Map<String, dynamic>>[];
+    for (final doc in snapshot.docs) {
+      try {
+        final data = doc.data();
+        logs.add(<String, dynamic>{
+          'id': doc.id,
+          'action': data['action'],
+          'details': data['details'],
+          'resourceType': data['resourceType'],
+          'resourceId': data['resourceId'],
+          'userId': data['userId'],
+          'timestamp': parseActivityTimestamp(data['timestamp']) ??
+              parseActivityTimestamp(data['createdAt']),
+        });
+      } catch (_) {}
+    }
+    logs.sort((a, b) {
+      final aTime = parseActivityTimestamp(a['timestamp']) ?? DateTime(1970);
+      final bTime = parseActivityTimestamp(b['timestamp']) ?? DateTime(1970);
+      return bTime.compareTo(aTime);
+    });
+    return logs.take(take).toList();
+  }
+
+  Future<void> purgeJunkActivityLogs(String staffId) async {
+    try {
+      final snapshot = await _firestore
+          .collection('activity_logs')
+          .where('userId', isEqualTo: staffId)
+          .limit(300)
+          .get();
+      final refs = snapshot.docs
+          .where((doc) => HearingCalendarFields.isJunkWorkLog(doc.data()))
+          .map((doc) => doc.reference)
+          .toList();
+      for (var i = 0; i < refs.length; i += 400) {
+        final batch = _firestore.batch();
+        for (final ref in refs.skip(i).take(400)) {
+          batch.delete(ref);
+        }
+        await batch.commit();
+      }
+    } catch (_) {}
+  }
+
+  Future<List<Map<String, dynamic>>> fetchStaffActivityLogs(
+    String staffId,
+  ) async {
+    await purgeJunkActivityLogs(staffId);
+    try {
+      final snapshot = await _firestore
+          .collection('activity_logs')
+          .where('userId', isEqualTo: staffId)
+          .limit(300)
+          .get();
+      return _mapActivityLogDocs(snapshot)
+          .where((log) => !HearingCalendarFields.isJunkWorkLog(log))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
   // Get document upload history for staff
   Stream<List<Map<String, dynamic>>> getDocumentUploadHistory(String staffId) {
-    return _firestore
-        .collection('activity_logs')
-        .where('userId', isEqualTo: staffId)
-        .where('action', isEqualTo: 'Document uploaded')
-        .snapshots()
-        .map((snapshot) {
-          final logs = snapshot.docs.map((doc) {
-            final data = doc.data();
-            return <String, dynamic>{
-              'id': doc.id,
-              ...data,
-              'timestamp': (data['timestamp'] as Timestamp?)?.toDate(),
-            };
-          }).toList();
-          // Sort by timestamp descending in memory and limit to 100
-          logs.sort((a, b) {
-            final aTime = a['timestamp'] as DateTime? ?? DateTime(1970);
-            final bTime = b['timestamp'] as DateTime? ?? DateTime(1970);
-            return bTime.compareTo(aTime);
-          });
-          return logs.take(100).toList();
-        });
+    return Stream.fromFuture(() async {
+      final logs = await fetchStaffActivityLogs(staffId);
+      return logs.where((log) {
+        final action = (log['action'] ?? '').toString().toLowerCase();
+        return action.contains('upload');
+      }).take(100).toList();
+    }());
   }
 
   // Create calendar event/reminder
@@ -355,6 +427,20 @@ class StaffService {
       if (assignedTo != null) eventData['assignedTo'] = assignedTo;
       if (clientId != null) eventData['clientId'] = clientId;
 
+      final junkNotice = HearingCalendarFields.isNonCourtHearingSpam({
+        'title': title,
+        'description': description ?? '',
+        'message': description ?? '',
+        'eventType': eventType,
+        ...?extraFields,
+      });
+      if (eventType == 'hearing' && junkNotice) {
+        return {
+          'success': false,
+          'message': 'This hearing is out of scope and was not saved.',
+        };
+      }
+
       final eventResult = await HybridDatastore.add(
         collection: 'calendar_events',
         data: eventData,
@@ -362,8 +448,8 @@ class StaffService {
       if (!eventResult.isSuccess) throw Exception(eventResult.failureMessage);
       final eventRef = _firestore.collection('calendar_events').doc(eventResult.id!);
 
-      // Send immediate reminders if requested
-      if (sendNow) {
+      // Send immediate reminders if requested.
+      if (sendNow && !junkNotice) {
         await _sendImmediateReminders(
           eventId: eventRef.id,
           eventType: eventType,
@@ -385,7 +471,7 @@ class StaffService {
       final reminderDays = eventType == 'hearing' ? 2 : 1;
       final notificationDate = eventDate.subtract(Duration(days: reminderDays));
       
-      if (notificationDate.isAfter(DateTime.now())) {
+      if (notificationDate.isAfter(DateTime.now()) && !junkNotice) {
         // Create scheduled reminder document
         final reminderData = {
           'eventId': eventRef.id,
@@ -406,8 +492,8 @@ class StaffService {
           'createdAt': FieldValue.serverTimestamp(),
         };
 
-        // For hearings, also add to hearing_notifications collection (for backward compatibility)
-        if (eventType == 'hearing') {
+        // For hearings, also add to hearing_notifications (skip test / mashed titles)
+        if (eventType == 'hearing' && !junkNotice) {
           await HybridDatastore.add(
             collection: 'hearing_notifications',
             data: reminderData,
@@ -419,12 +505,14 @@ class StaffService {
       }
 
       // Log activity
-      await logActivity(
-        action: 'Calendar event created',
-        details: 'Created $eventType: $title',
-        resourceType: 'calendar',
-        resourceId: eventRef.id,
-      );
+      if (!junkNotice) {
+        await logActivity(
+          action: 'Calendar event created',
+          details: 'Created $eventType: $title',
+          resourceType: 'calendar',
+          resourceId: eventRef.id,
+        );
+      }
 
       return {
         'success': true,
@@ -483,8 +571,7 @@ class StaffService {
       );
 
       // Remind Attorney (if checked)
-      if (remindAttorney && assignedTo != null) {
-        // Notify attorney
+      if (remindAttorney && assignedTo != null && assignedTo != staffId) {
         await _createNotification(
           userId: assignedTo,
           type: 'calendar_reminder',
@@ -526,6 +613,7 @@ class StaffService {
             title: 'Calendar Event Reminder',
             message: '$fullMessage\n\nReminder sent by: $staffName',
             eventId: eventId,
+            isClient: true,
           );
         }
       }
@@ -535,27 +623,119 @@ class StaffService {
     }
   }
 
-  // Create notification in Firestore
+  // In-app bell + push + SMS for one recipient.
   Future<void> _createNotification({
     required String userId,
     required String type,
     required String title,
     required String message,
     String? eventId,
+    bool isClient = false,
   }) async {
+    final uid = userId.trim();
+    if (uid.isEmpty) return;
+
     try {
       final notifData = <String, dynamic>{
-        'userId': userId,
+        'userId': uid,
+        if (isClient) 'clientId': uid,
         'type': type,
         'title': title,
         'message': message,
+        'summary': message,
         if (eventId != null) 'eventId': eventId,
         'isRead': false,
-        'createdAt': FieldValue.serverTimestamp(),
+        'createdAt': Timestamp.fromDate(DateTime.now()),
       };
       await HybridDatastore.add(collection: 'notifications', data: notifData);
     } catch (e) {
-      print('Error creating notification for user $userId: $e');
+      if (kDebugMode) {
+        debugPrint('Error creating notification for user $uid: $e');
+      }
+    }
+
+    final smsBody = _smsSafeBody(title: title, message: message);
+
+    unawaited(
+      FCMService()
+          .sendNotificationToUser(
+            userId: uid,
+            title: title,
+            body: smsBody,
+            data: <String, dynamic>{
+              'type': type,
+              if (eventId != null) 'eventId': eventId,
+            },
+          )
+          .catchError((Object e) {
+            if (kDebugMode) {
+              debugPrint('FCM calendar reminder failed for $uid: $e');
+            }
+            return false;
+          }),
+    );
+
+    try {
+      if (_auth.currentUser?.uid == uid) {
+        await NotificationService().showAlert(
+          title: title,
+          message: smsBody,
+        );
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('Local calendar reminder failed for $uid: $e');
+      }
+    }
+
+    unawaited(_sendCalendarSms(userId: uid, body: smsBody));
+  }
+
+  String _smsSafeBody({required String title, required String message}) {
+    var t = '$title - $message'
+        .replaceAll('\r', ' ')
+        .replaceAll('\n', ' - ')
+        .replaceAll(RegExp(r'[^\x20-\x7E]'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .replaceAll(RegExp(r'( - ){2,}'), ' - ')
+        .trim();
+    if (t.length > 480) t = '${t.substring(0, 477)}...';
+    return t;
+  }
+
+  Future<String?> _phoneForUser(String uid) async {
+    try {
+      final snap = await _firestore.collection('users').doc(uid).get();
+      final data = snap.data() ?? {};
+      final profilePhone =
+          (data['phoneNumber'] ?? data['phone'])?.toString().trim();
+      if (profilePhone == null || profilePhone.isEmpty) return null;
+      return profilePhone;
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('calendar SMS phone lookup $uid: $e');
+      }
+      return null;
+    }
+  }
+
+  Future<void> _sendCalendarSms({
+    required String userId,
+    required String body,
+  }) async {
+    try {
+      final phone = await _phoneForUser(userId);
+      if (phone == null || phone.trim().isEmpty || body.trim().isEmpty) return;
+      await SmsService().queueSms(
+        to: phone,
+        body: body,
+        userId: userId,
+        meta: const {'kind': 'calendar_reminder'},
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('calendar SMS failed for $userId: $e');
+      }
     }
   }
 
@@ -743,6 +923,7 @@ class StaffService {
                 title: 'Upcoming Event Reminder',
                 message: fullMessage,
                 eventId: calendarEventId,
+                isClient: true,
               );
             }
           }
@@ -783,6 +964,19 @@ class StaffService {
   /// Shared per-attorney stream so dashboard + calendar tab do not open duplicate listeners.
   static final Map<String, Stream<List<Map<String, dynamic>>>>
       _calendarEventsStreamCache = {};
+  static final Map<String, Stream<List<Map<String, dynamic>>>>
+      _liveHearingsStreamCache = {};
+
+  /// Drop cached Firestore broadcast streams after logout (they stop emitting).
+  static void clearCalendarStreamCaches() {
+    _calendarEventsStreamCache.clear();
+    _liveHearingsStreamCache.clear();
+  }
+
+  /// Drop the cached `hearings` listener so Calendar gets a fresh query.
+  static void clearLiveHearingsStreamCache() {
+    _liveHearingsStreamCache.clear();
+  }
 
   // Get calendar events for staff's attorney (bounded — not entire collection).
   Stream<List<Map<String, dynamic>>> getCalendarEvents(String attorneyId) {
@@ -802,17 +996,38 @@ class StaffService {
     });
   }
 
+  static const _heavyCalendarEventKeys = {
+    'fullText',
+    'message',
+    'rawText',
+    'body',
+    'emailBody',
+    'extractedText',
+    'hearingOrderExcerpt',
+    'orderText',
+    'orderExcerpt',
+    'attachments',
+    'raw',
+    'ocrText',
+    'html',
+  };
+
   static List<Map<String, dynamic>> _mapCalendarEventDocs(
     QuerySnapshot<Map<String, dynamic>> snapshot,
   ) {
     final events = snapshot.docs.map((doc) {
       final data = doc.data();
-      return <String, dynamic>{
-        'id': doc.id,
-        ...data,
-        'eventDate': (data['eventDate'] as Timestamp?)?.toDate(),
-        'createdAt': (data['createdAt'] as Timestamp?)?.toDate(),
-      };
+      final mapped = <String, dynamic>{'id': doc.id};
+      data.forEach((key, value) {
+        if (_heavyCalendarEventKeys.contains(key)) return;
+        if (key == 'description' && value is String && value.length > 400) {
+          return;
+        }
+        mapped[key] = value;
+      });
+      mapped['eventDate'] = (data['eventDate'] as Timestamp?)?.toDate();
+      mapped['createdAt'] = (data['createdAt'] as Timestamp?)?.toDate();
+      return mapped;
     }).toList();
     events.sort((a, b) {
       final aDate = a['eventDate'] as DateTime? ?? DateTime(1970);
@@ -822,29 +1037,138 @@ class StaffService {
     return events;
   }
 
-  // Get staff activity logs
-  Stream<List<Map<String, dynamic>>> getStaffActivityLogs(String staffId) {
-    return _firestore
-        .collection('activity_logs')
-        .where('userId', isEqualTo: staffId)
-        .snapshots()
-        .map((snapshot) {
-          final logs = snapshot.docs.map((doc) {
-            final data = doc.data();
-            return <String, dynamic>{
-              'id': doc.id,
-              ...data,
-              'timestamp': (data['timestamp'] as Timestamp?)?.toDate(),
-            };
-          }).toList();
-          // Sort by timestamp descending in memory and limit to 50
-          logs.sort((a, b) {
-            final aTime = a['timestamp'] as DateTime? ?? DateTime(1970);
-            final bTime = b['timestamp'] as DateTime? ?? DateTime(1970);
-            return bTime.compareTo(aTime);
-          });
-          return logs.take(50).toList();
+  /// Live hearings as calendar rows. attorneyUid is optional — newest
+  /// hearing/order notices are recorded on staff and attorney calendars.
+  Stream<List<Map<String, dynamic>>> watchLiveHearingsForGrid(String attorneyId) {
+    final aid = HearingCalendarSyncService.overlayKey(attorneyId);
+    return _liveHearingsStreamCache.putIfAbsent(aid, () {
+      final controller =
+          StreamController<List<Map<String, dynamic>>>.broadcast();
+      var rows = <Map<String, dynamic>>[];
+      StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? uidSub;
+      StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? recentSub;
+      var fetching = false;
+
+      void emit() {
+        if (controller.isClosed) return;
+        controller.add(List<Map<String, dynamic>>.from(rows));
+      }
+
+      Future<void> hydrateFromServer() async {
+        if (fetching) return;
+        fetching = true;
+        try {
+          final overlay = await HearingCalendarSyncService.instance
+              .fetchAutomatedCalendarRows(aid);
+          final inbox = await HearingCalendarSyncService.instance
+              .fetchRowsFromHearingNotifications(aid);
+          final fetched = CalendarLiveHearingMap.mergeHearingRows(
+            overlay,
+            inbox,
+          );
+          if (fetched.isEmpty || controller.isClosed) return;
+          rows = CalendarLiveHearingMap.mergeHearingRows(rows, fetched);
+          emit();
+        } catch (e) {
+          debugPrint('[HearingCalendar] web/live overlay hydrate failed: $e');
+        } finally {
+          fetching = false;
+        }
+      }
+
+      controller.onListen = () {
+        final cached =
+            HearingCalendarSyncService.instance.peekHearingNavRows(aid);
+        if (cached != null && cached.isNotEmpty) {
+          rows = CalendarLiveHearingMap.mergeHearingRows(rows, cached);
+        }
+        if (rows.isNotEmpty) emit();
+        if (aid != HearingCalendarSyncService.firmOverlayId) {
+          uidSub ??= _firestore
+              .collection('hearings')
+              .where('attorneyUid', isEqualTo: aid)
+              .limit(80)
+              .snapshots()
+              .listen(
+                (snap) {
+                  final live =
+                      CalendarLiveHearingMap.mapHearingSnapshot(snap, aid);
+                  rows = CalendarLiveHearingMap.mergeHearingRows(rows, live);
+                  HearingCalendarSyncService.instance.rememberOverlayRows(
+                    aid,
+                    live,
+                  );
+                  emit();
+                },
+                onError: (e) {
+                  debugPrint('[HearingCalendar] live hearings stream: $e');
+                },
+              );
+        }
+        recentSub ??= _firestore
+            .collection('hearings')
+            .orderBy('createdAt', descending: true)
+            .limit(150)
+            .snapshots()
+            .listen(
+              (snap) {
+                final live = CalendarLiveHearingMap.mapHearingDocs(
+                  snap.docs,
+                  aid,
+                );
+                if (live.isEmpty) return;
+                rows = CalendarLiveHearingMap.mergeHearingRows(rows, live);
+                HearingCalendarSyncService.instance.rememberOverlayRows(
+                  aid,
+                  live,
+                );
+                emit();
+              },
+              onError: (e) {
+                debugPrint('[HearingCalendar] recent hearings stream: $e');
+              },
+            );
+        unawaited(hydrateFromServer());
+        Future<void>.delayed(const Duration(seconds: 4), () {
+          if (controller.isClosed) return;
+          unawaited(hydrateFromServer());
         });
+      };
+      controller.onCancel = () {
+        if (controller.hasListener) return;
+        uidSub?.cancel();
+        uidSub = null;
+        recentSub?.cancel();
+        recentSub = null;
+        _liveHearingsStreamCache.remove(aid);
+      };
+
+      return controller.stream;
+    });
+  }
+
+  // Get staff activity logs (one-shot — live snapshots crash Flutter web
+  // when Firestore returns FirebaseException).
+  Stream<List<Map<String, dynamic>>> getStaffActivityLogs(String staffId) {
+    return Stream.fromFuture(fetchStaffActivityLogs(staffId)).asBroadcastStream();
+  }
+
+  static DateTime? parseActivityTimestamp(dynamic value) {
+    try {
+      if (value == null) return null;
+      if (value is DateTime) return value;
+      if (value is Timestamp) return value.toDate();
+      if (value is int) {
+        if (value > 1000000000000) {
+          return DateTime.fromMillisecondsSinceEpoch(value);
+        }
+        return DateTime.fromMillisecondsSinceEpoch(value * 1000);
+      }
+      if (value is String) return DateTime.tryParse(value);
+      return null;
+    } catch (_) {
+      return null;
+    }
   }
 
   // Log staff activity
@@ -864,6 +1188,8 @@ class StaffService {
         userRole = ud.data()?['role'] as String? ?? 'staff';
       } catch (_) {}
 
+      final now = DateTime.now();
+      final stamp = Timestamp.fromDate(now);
       final activityData = <String, dynamic>{
         'userId': user.uid,
         'userRole': userRole,
@@ -871,11 +1197,18 @@ class StaffService {
         if (details != null) 'details': details,
         if (resourceType != null) 'resourceType': resourceType,
         if (resourceId != null) 'resourceId': resourceId,
-        'timestamp': FieldValue.serverTimestamp(),
+        'timestamp': stamp,
+        'createdAt': stamp,
       };
-      await HybridDatastore.add(collection: 'activity_logs', data: activityData);
+      final result =
+          await HybridDatastore.add(collection: 'activity_logs', data: activityData);
+      if (!result.firestoreOk && kDebugMode) {
+        debugPrint('activity_logs write failed: ${result.firestoreError}');
+      }
     } catch (e) {
-      // Silently fail logging
+      if (kDebugMode) {
+        debugPrint('logActivity failed: $e');
+      }
     }
   }
 }

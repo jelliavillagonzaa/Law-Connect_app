@@ -4,7 +4,6 @@ import 'package:get/get.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../services/firestore_service.dart';
-import '../../services/storage_service.dart';
 import '../../services/profile_service.dart';
 import '../../services/auth_service.dart';
 import '../../controllers/auth_controller.dart';
@@ -14,7 +13,7 @@ import '../../utils/safe_network_image.dart';
 import '../chat/chat_list_page.dart';
 import '../case/search_attorney_page.dart';
 import '../notary/notary_portal.dart';
-import '../client/client_landing_page.dart';
+import '../../routes/portal_navigation.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 
@@ -29,7 +28,6 @@ class ClientDashboard extends StatefulWidget {
 
 class _ClientDashboardState extends State<ClientDashboard> {
   final FirestoreService _firestoreService = FirestoreService();
-  final StorageService _storageService = StorageService();
   final ProfileService _profileService = ProfileService();
   final AuthService _authService = AuthService();
   final ImagePicker _imagePicker = ImagePicker();
@@ -104,7 +102,7 @@ class _ClientDashboardState extends State<ClientDashboard> {
     final isMobile = MediaQuery.of(context).size.width < 600;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F4F4),
+      backgroundColor: AppTheme.lightGray,
       appBar: AppBar(
         title: Text('My Cases', style: TextStyle(fontWeight: FontWeight.bold)),
         elevation: 0,
@@ -684,9 +682,9 @@ class _ClientDashboardState extends State<ClientDashboard> {
         } else {
           await _authService.logout();
         }
-        Get.offAll(() => const ClientLandingPage());
+        navigateAfterLogout();
       } catch (e) {
-        Get.offAll(() => const ClientLandingPage());
+        navigateAfterLogout();
       }
     }
   }
@@ -854,18 +852,10 @@ class _ClientDashboardState extends State<ClientDashboard> {
       );
 
       try {
-        final photoUrl = await _storageService.uploadProfilePhoto(
-          userId: user.uid,
-          imageFile: pickedFile,
-        );
-
-        await _firestoreService.updateUserProfile(user.uid, {
-          'photoUrl': photoUrl,
-        });
+        final photoUrl = await _profileService.uploadProfilePicture(pickedFile);
 
         await _loadUserData();
 
-        // Reload local image if photoUrl is 'local_storage'
         if (photoUrl == 'local_storage') {
           await _loadLocalImage();
         }

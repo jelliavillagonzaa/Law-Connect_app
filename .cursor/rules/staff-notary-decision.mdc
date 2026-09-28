@@ -1,0 +1,18 @@
+---
+description: Staff-only notary accept/decline; attorney SMS only
+globs: lib/services/notary_service.dart,lib/screens/attorney/attorney_notary_request_detail_screen.dart,lib/screens/attorney/attorney_notary_requests_screen.dart,lib/pages/attorney/attorney_dashboard.dart,lib/widgets/attorney/attorney_thin_nav_rail.dart,firestore.rules
+alwaysApply: false
+---
+
+# Notary accept / decline
+
+Only **assigned staff** may Accept, Decline, or Schedule a notary request.
+
+- Attorney portal has **no Notary nav item** and no Notary tab. Do not add it back.
+- Do not show Accept/Decline/Schedule buttons unless `actingAsStaff` is true.
+- `acceptNotaryRequest` / `declineNotaryRequest` / `scheduleRelease` must reject non-staff.
+- After a decision: **client** SMS + bell + push; **staff** bell + app push; **attorney** SMS + bell + app push.
+- Staff Notary is on **web and the app** (sidebar, drawer, and mobile Notary button). Calendar overlay shows accepted notary visits on both.
+- First office visit: message is **go to the office on {date time}**. Reschedule keeps the old date/time filled, requires a purpose, moves the calendar row, and notifies with the new time + reason.
+- When a visit is **moved**: client SMS + bell; staff bell; attorney SMS + bell (move only).
+- Firestore `notary_requests` update is staff (or admin/client-docs), not attorney.

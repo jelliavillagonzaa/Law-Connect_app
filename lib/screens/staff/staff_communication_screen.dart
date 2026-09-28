@@ -8,6 +8,7 @@ import '../../services/chat_service.dart';
 import '../../models/message_model.dart';
 import '../../theme/app_theme.dart';
 import '../../screens/client/chat_screen.dart';
+import '../../widgets/common/nav_unread_dot.dart';
 import 'staff_client_chat_screen.dart';
 
 class StaffCommunicationScreen extends StatefulWidget {
@@ -312,7 +313,7 @@ class _StaffCommunicationScreenState extends State<StaffCommunicationScreen> {
           // Don't show loading - show empty state immediately if no data yet
           if (snapshot.connectionState == ConnectionState.waiting &&
               !snapshot.hasData) {
-            return const Center(child: CircularProgressIndicator());
+            return const SizedBox.shrink();
           }
 
           if (snapshot.hasError) {
@@ -451,6 +452,7 @@ class _StaffCommunicationScreenState extends State<StaffCommunicationScreen> {
             name: clientName,
             email: clientEmail,
             isClient: true,
+            userId: staffId,
             onTap: () {
               Get.to(
                 () => StaffClientChatScreen(
@@ -489,6 +491,7 @@ class _StaffCommunicationScreenState extends State<StaffCommunicationScreen> {
             name: attorneyName,
             email: attorneyEmail,
             isClient: false,
+            userId: staffId,
             onTap: () {
               Get.to(
                 () => ChatScreen(
@@ -508,6 +511,7 @@ class _StaffCommunicationScreenState extends State<StaffCommunicationScreen> {
         name: 'Unknown',
         email: '',
         isClient: false,
+        userId: staffId,
         onTap: () {},
       );
     }
@@ -518,9 +522,14 @@ class _StaffCommunicationScreenState extends State<StaffCommunicationScreen> {
     required String name,
     required String email,
     required bool isClient,
+    required String userId,
     required VoidCallback onTap,
   }) {
-    return Card(
+    return StreamBuilder<bool>(
+      stream: _chatService.watchChatHasUnread(chat.id, userId),
+      builder: (context, unreadSnap) {
+        final hasUnread = unreadSnap.data == true;
+        return Card(
       margin: const EdgeInsets.only(bottom: 12),
       elevation: 2,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -550,13 +559,17 @@ class _StaffCommunicationScreenState extends State<StaffCommunicationScreen> {
                   children: [
                     Row(
                       children: [
-                        Text(
+                        Flexible(
+                          child: Text(
                           name,
                           style: TextStyle(
                             fontSize: 16,
-                            fontWeight: FontWeight.bold,
+                            fontWeight:
+                                hasUnread ? FontWeight.bold : FontWeight.w600,
                             color: AppTheme.darkText,
                           ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
                         ),
                         const SizedBox(width: 8),
                         Container(
@@ -608,12 +621,21 @@ class _StaffCommunicationScreenState extends State<StaffCommunicationScreen> {
                   ],
                 ),
               ),
-              const SizedBox(width: 8),
-              Icon(Icons.arrow_forward_ios, size: 16, color: Colors.grey[400]),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  if (hasUnread) const ListUnreadDot(),
+                  const SizedBox(height: 8),
+                  Icon(Icons.arrow_forward_ios, size: 16, color: Colors.grey[400]),
+                ],
+              ),
             ],
           ),
         ),
       ),
+    );
+      },
     );
   }
 }

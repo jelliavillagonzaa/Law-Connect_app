@@ -5,6 +5,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../theme/app_theme.dart';
 import '../../models/notary_request_model.dart';
 import '../../services/notary_service.dart';
+import '../../services/notary_service_config.dart';
 
 class AttorneyNotaryRequestDetailScreen extends StatefulWidget {
   final String requestId;
@@ -508,6 +509,12 @@ class _AttorneyNotaryRequestDetailScreenState
                     const SizedBox(height: 12),
                     _buildInfoRow('Service Type', _request!.serviceType),
                     _buildInfoRow('Client', _clientName ?? 'Loading...'),
+                    if (_request!.preferredDateTime != null)
+                      _buildInfoRow(
+                        'Preferred visit',
+                        DateFormat('MMM dd, yyyy • hh:mm a')
+                            .format(_request!.preferredDateTime!),
+                      ),
                   ],
                 ),
               ),
@@ -515,7 +522,7 @@ class _AttorneyNotaryRequestDetailScreenState
 
             const SizedBox(height: 16),
 
-            // Documents
+            // Documents to bring (no confidential uploads)
             Card(
               elevation: 2,
               shape: RoundedRectangleBorder(
@@ -527,54 +534,74 @@ class _AttorneyNotaryRequestDetailScreenState
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     const Text(
-                      'Uploaded Documents',
+                      'Bring to the office',
                       style: TextStyle(
                         fontSize: 16,
                         fontWeight: FontWeight.bold,
                       ),
                     ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Client will bring originals. No confidential files are stored in the app.',
+                      style: TextStyle(fontSize: 13, color: Colors.grey[600]),
+                    ),
                     const SizedBox(height: 12),
-                    ...(_request!.documentsWithNames != null &&
-                            _request!.documentsWithNames!.isNotEmpty
-                        ? _request!.documentsWithNames!.map((doc) {
-                            return Card(
-                              margin: const EdgeInsets.only(bottom: 8),
-                              child: ListTile(
-                                leading: const Icon(Icons.description),
-                                title: Text(doc['name'] ?? 'Document'),
-                                subtitle: doc['url'] != null
-                                    ? Text(
-                                        'Click to view',
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          color: Colors.grey[600],
-                                        ),
-                                      )
-                                    : null,
-                                trailing: doc['url'] != null
-                                    ? IconButton(
-                                        icon: const Icon(Icons.open_in_new),
-                                        onPressed: () => _openDocument(doc['url']!),
-                                      )
-                                    : null,
-                              ),
-                            );
-                          })
-                        : _request!.documents.asMap().entries.map((entry) {
-                            final index = entry.key;
-                            final url = entry.value;
-                            return Card(
-                              margin: const EdgeInsets.only(bottom: 8),
-                              child: ListTile(
-                                leading: const Icon(Icons.description),
-                                title: Text('Document ${index + 1}'),
-                                trailing: IconButton(
-                                  icon: const Icon(Icons.open_in_new),
-                                  onPressed: () => _openDocument(url),
+                    ..._bringList().map((name) {
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Row(
+                          children: [
+                            const Icon(
+                              Icons.inventory_2_outlined,
+                              size: 18,
+                              color: AppTheme.royalBlue,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(child: Text(name)),
+                          ],
+                        ),
+                      );
+                    }),
+                    if (_hasLegacyUploads()) ...[
+                      const SizedBox(height: 12),
+                      const Text(
+                        'Older uploaded files',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      const SizedBox(height: 8),
+                      ...(_request!.documentsWithNames != null &&
+                              _request!.documentsWithNames!.isNotEmpty
+                          ? _request!.documentsWithNames!.map((doc) {
+                              return Card(
+                                margin: const EdgeInsets.only(bottom: 8),
+                                child: ListTile(
+                                  leading: const Icon(Icons.description),
+                                  title: Text(doc['name'] ?? 'Document'),
+                                  trailing: doc['url'] != null
+                                      ? IconButton(
+                                          icon: const Icon(Icons.open_in_new),
+                                          onPressed: () =>
+                                              _openDocument(doc['url']!),
+                                        )
+                                      : null,
                                 ),
-                              ),
-                            );
-                          })),
+                              );
+                            })
+                          : _request!.documents.asMap().entries.map((entry) {
+                              return Card(
+                                margin: const EdgeInsets.only(bottom: 8),
+                                child: ListTile(
+                                  leading: const Icon(Icons.description),
+                                  title: Text('Document ${entry.key + 1}'),
+                                  trailing: IconButton(
+                                    icon: const Icon(Icons.open_in_new),
+                                    onPressed: () =>
+                                        _openDocument(entry.value),
+                                  ),
+                                ),
+                              );
+                            })),
+                    ],
                   ],
                 ),
               ),
@@ -751,6 +778,23 @@ class _AttorneyNotaryRequestDetailScreenState
         ),
       ),
     );
+  }
+
+  bool _hasLegacyUploads() {
+    final request = _request;
+    if (request == null) return false;
+    if (request.documentsWithNames != null &&
+        request.documentsWithNames!.isNotEmpty) {
+      return true;
+    }
+    return request.documents.isNotEmpty;
+  }
+
+  List<String> _bringList() {
+    final request = _request;
+    if (request == null) return const [];
+    if (request.bringDocuments.isNotEmpty) return request.bringDocuments;
+    return NotaryServiceConfig.getRequiredDocuments(request.serviceType);
   }
 
   Widget _buildInfoRow(String label, String value) {

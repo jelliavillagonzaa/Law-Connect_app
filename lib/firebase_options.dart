@@ -2,7 +2,7 @@
 // ignore_for_file: type=lint
 import 'package:firebase_core/firebase_core.dart' show FirebaseOptions;
 import 'package:flutter/foundation.dart'
-    show defaultTargetPlatform, kIsWeb, TargetPlatform;
+    show defaultTargetPlatform, kDebugMode, kIsWeb, TargetPlatform;
 
 /// Default [FirebaseOptions] for use with your Firebase apps.
 ///
@@ -51,8 +51,12 @@ class DefaultFirebaseOptions {
     measurementId: "G-S7G14B5T35",
   );
 
-  static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyDYhAD-NA5fr_xayommEg9vGP0WyuqGLqM',
+  // Debug uses the web API key so `flutter run` is not blocked when this PC's
+  // debug SHA-1 is missing from the Android-restricted Firebase key.
+  static FirebaseOptions get android => FirebaseOptions(
+    apiKey: kDebugMode
+        ? web.apiKey
+        : 'AIzaSyDYhAD-NA5fr_xayommEg9vGP0WyuqGLqM',
     appId: '1:969711743833:android:12db52dbd2114b941e1248',
     messagingSenderId: '969711743833',
     projectId: 'jurislink-app',

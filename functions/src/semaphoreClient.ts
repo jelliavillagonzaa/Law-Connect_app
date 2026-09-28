@@ -36,11 +36,28 @@ function parseSemaphoreRows(text: string): SemaphoreRow[] {
   throw new Error(`Semaphore unexpected response: ${text.slice(0, 200)}`);
 }
 
+/** Laravel-style `{ apikey: ["The selected apikey is invalid."] }` and similar. */
+function validationDetail(row: SemaphoreRow): string {
+  const rec = row as Record<string, unknown>;
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(rec)) {
+    if (key === "status" || key === "message_id" || key === "network") continue;
+    if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
+      const joined = value.map((item) => item.trim()).filter(Boolean).join("; ");
+      if (joined) parts.push(`${key}: ${joined}`);
+    }
+  }
+  if (parts.length) return parts.join(" | ");
+  if (typeof rec.message === "string" && rec.message.trim()) {
+    return rec.message.trim();
+  }
+  return "";
+}
+
 function assertSemaphoreAccepted(rows: SemaphoreRow[]): SemaphoreSendResult {
   const first = rows[0];
   const st = String(first.status || "").toLowerCase();
-  const detail =
-    typeof first.message === "string" ? first.message.trim() : "";
+  const detail = validationDetail(first);
 
   if (st === "failed") {
     throw new Error(

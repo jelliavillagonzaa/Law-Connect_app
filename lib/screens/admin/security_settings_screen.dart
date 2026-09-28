@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import '../../services/backup_service.dart';
+import '../../services/system_settings_service.dart';
 import '../../theme/app_theme.dart';
 
 class SecuritySettingsScreen extends StatefulWidget {
@@ -93,6 +95,8 @@ class _SecuritySettingsScreenState extends State<SecuritySettingsScreen> {
         'autoBackup': _autoBackup,
         'updatedAt': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
+      SystemSettingsService.instance.invalidate();
+      await BackupService().setBackupEnabled(_autoBackup);
 
       if (mounted) {
         Get.snackbar(
@@ -121,7 +125,7 @@ class _SecuritySettingsScreenState extends State<SecuritySettingsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F4F4),
+      backgroundColor: AppTheme.lightGray,
       appBar: AppBar(
         title: Text(
           'Security Settings',

@@ -4,6 +4,7 @@ import 'package:get/get.dart';
 import 'package:intl/intl.dart';
 import '../../models/staff_model.dart';
 import '../../services/staff_auth_service.dart';
+import '../../services/calendar_session_cleanup.dart';
 import '../../widgets/common/profile_picture_widget.dart';
 import '../../theme/app_theme.dart';
 import '../auth/login_page.dart';
@@ -18,22 +19,34 @@ class StaffProfilePage extends StatefulWidget {
 class _StaffProfilePageState extends State<StaffProfilePage> {
   final StaffAuthService _staffAuthService = StaffAuthService();
   StaffModel? _currentStaff;
-  bool _isLoading = true;
 
   @override
   void initState() {
     super.initState();
+    final user = FirebaseAuth.instance.currentUser;
+    if (user != null) {
+      _currentStaff = StaffModel(
+        id: user.uid,
+        name: user.displayName ?? 'Staff',
+        email: user.email ?? '',
+        photoUrl: user.photoURL,
+        assignedAttorneyId: '',
+        createdAt: user.metadata.creationTime ?? DateTime.now(),
+        isVerified: user.emailVerified,
+      );
+    }
     _loadStaffData();
   }
 
   Future<void> _loadStaffData() async {
-    final staff = await _staffAuthService.getCurrentStaff();
-    if (mounted) {
-      setState(() {
-        _currentStaff = staff;
-        _isLoading = false;
-      });
-    }
+    try {
+      final staff = await _staffAuthService
+          .getCurrentStaff()
+          .timeout(const Duration(seconds: 4));
+      if (mounted && staff != null) {
+        setState(() => _currentStaff = staff);
+      }
+    } catch (_) {}
   }
 
   Future<void> _editProfile() async {
@@ -202,6 +215,7 @@ class _StaffProfilePageState extends State<StaffProfilePage> {
     );
 
     if (confirmed == true) {
+      CalendarSessionCleanup.onLogout();
       await FirebaseAuth.instance.signOut();
       if (mounted) {
         Get.offAll(() => const LoginPage());
@@ -212,20 +226,6 @@ class _StaffProfilePageState extends State<StaffProfilePage> {
   @override
   Widget build(BuildContext context) {
     final user = FirebaseAuth.instance.currentUser;
-
-    if (_isLoading) {
-      return Scaffold(
-        appBar: AppBar(
-          title: Text(
-            'My Profile',
-            style: TextStyle(fontWeight: FontWeight.w600),
-          ),
-          backgroundColor: AppTheme.royalBlue,
-          foregroundColor: Colors.white,
-        ),
-        body: const Center(child: CircularProgressIndicator()),
-      );
-    }
 
     if (_currentStaff == null) {
       return Scaffold(
@@ -258,7 +258,7 @@ class _StaffProfilePageState extends State<StaffProfilePage> {
         ],
       ),
       body: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
         child: Column(
           children: [
             // Profile Picture
@@ -269,7 +269,7 @@ class _StaffProfilePageState extends State<StaffProfilePage> {
               isEditable: true,
               onUpdated: _loadStaffData,
             ),
-            const SizedBox(height: 24),
+            const SizedBox(height: 16),
             // User Info
             Text(
               _currentStaff!.name,
@@ -278,98 +278,99 @@ class _StaffProfilePageState extends State<StaffProfilePage> {
                 fontWeight: FontWeight.bold,
               ),
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 4),
             Text(
               user?.email ?? _currentStaff!.email,
               style: TextStyle(fontSize: 14, color: Colors.grey[600]),
             ),
-            const SizedBox(height: 32),
+            const SizedBox(height: 20),
             // Profile Details Card
-            Card(
-              elevation: 2,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(16),
-              ),
-              child: Padding(
-                padding: const EdgeInsets.all(20),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Profile Information',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 420),
+              child: Card(
+                elevation: 2,
+                margin: EdgeInsets.zero,
+                clipBehavior: Clip.antiAlias,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 14, 14, 6),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Text(
+                        'Profile Information',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          color: AppTheme.darkText,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 16),
-                    _buildInfoRow(
-                      Icons.person,
-                      'Name',
-                      _currentStaff!.name,
-                    ),
-                    const Divider(height: 24),
-                    _buildInfoRow(
-                      Icons.email,
-                      'Email',
-                      _currentStaff!.email,
-                    ),
-                    const Divider(height: 24),
-                    _buildInfoRow(
-                      Icons.phone,
-                      'Phone',
-                      _currentStaff!.phoneNumber ?? 'Not set',
-                    ),
-                    const Divider(height: 24),
-                    _buildInfoRow(
-                      Icons.location_on,
-                      'Address',
-                      _currentStaff!.address ?? 'Not set',
-                    ),
-                    const Divider(height: 24),
-                    _buildInfoRow(
-                      Icons.work,
-                      'Role',
-                      'Staff (Paralegal/Legal Assistant)',
-                    ),
-                    const Divider(height: 24),
-                    _buildInfoRow(
-                      Icons.calendar_today,
-                      'Member Since',
-                      DateFormat('MMM dd, yyyy').format(_currentStaff!.createdAt),
-                    ),
-                  ],
+                      const SizedBox(height: 4),
+                      _buildInfoRow(
+                        Icons.person_outline,
+                        'Name',
+                        _currentStaff!.name,
+                      ),
+                      _buildInfoRow(
+                        Icons.email_outlined,
+                        'Email',
+                        _currentStaff!.email,
+                      ),
+                      _buildInfoRow(
+                        Icons.phone_outlined,
+                        'Phone',
+                        _currentStaff!.phoneNumber ?? 'Not set',
+                      ),
+                      _buildInfoRow(
+                        Icons.location_on_outlined,
+                        'Address',
+                        _currentStaff!.address ?? 'Not set',
+                      ),
+                      _buildInfoRow(
+                        Icons.work_outline,
+                        'Role',
+                        'Staff (Paralegal/Legal Assistant)',
+                      ),
+                      _buildInfoRow(
+                        Icons.calendar_today_outlined,
+                        'Member Since',
+                        DateFormat('MMM dd, yyyy')
+                            .format(_currentStaff!.createdAt),
+                        showDivider: false,
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
             const SizedBox(height: 24),
             // Logout Button
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
+            Align(
+              alignment: Alignment.center,
+              child: ElevatedButton.icon(
                 onPressed: _handleLogout,
+                icon: const Icon(Icons.logout, size: 18),
+                label: const Text(
+                  'Logout',
+                  style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: AppTheme.royalBlue,
                   foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 28,
+                    vertical: 12,
+                  ),
+                  minimumSize: const Size(140, 44),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),
                   elevation: 2,
-                ),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Icon(Icons.logout, size: 20),
-                    const SizedBox(width: 8),
-                    Text(
-                      'Logout',
-                      style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
                 ),
               ),
             ),
@@ -380,33 +381,67 @@ class _StaffProfilePageState extends State<StaffProfilePage> {
     );
   }
 
-  Widget _buildInfoRow(IconData icon, String label, String value) {
-    return Row(
+  Widget _buildInfoRow(
+    IconData icon,
+    String label,
+    String value, {
+    bool showDivider = true,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Icon(icon, color: AppTheme.royalBlue, size: 24),
-        const SizedBox(width: 16),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              Text(
-                label,
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.grey[600],
+              Container(
+                width: 32,
+                height: 32,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: AppTheme.royalBlue.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(8),
                 ),
+                child: Icon(icon, color: AppTheme.royalBlue, size: 16),
               ),
-              const SizedBox(height: 4),
-              Text(
-                value,
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w500,
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      label,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: Colors.grey[600],
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      value,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: AppTheme.darkText,
+                        height: 1.25,
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],
           ),
         ),
+        if (showDivider)
+          const Divider(
+            height: 1,
+            thickness: 1,
+            indent: 0,
+            endIndent: 0,
+            color: AppTheme.borderGray,
+          ),
       ],
     );
   }

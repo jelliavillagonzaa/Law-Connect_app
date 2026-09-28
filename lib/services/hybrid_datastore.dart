@@ -29,10 +29,14 @@ class HybridDatastore {
     String? supabaseError;
 
     await Future.wait<void>([
-      firestore().then((_) => firestoreOk = true).catchError((Object e) {
-        firestoreError = e.toString();
-        return false;
-      }),
+      () async {
+        try {
+          await firestore();
+          firestoreOk = true;
+        } catch (e) {
+          firestoreError = e.toString();
+        }
+      }(),
       if (supabaseRequired)
         supabase().then((String? err) {
           if (err == null) {
@@ -71,8 +75,13 @@ class HybridDatastore {
   }) {
     return _parallel(
       id: id,
-      firestore: () =>
-          _db.collection(collection).doc(id).set(data, options ?? SetOptions()),
+      firestore: () {
+        final docRef = _db.collection(collection).doc(id);
+        if (options != null) {
+          return docRef.set(data, options);
+        }
+        return docRef.set(data);
+      },
       supabase: () => _hybrid.upsertCollectionDocChecked(collection, id, data),
     );
   }
@@ -134,6 +143,8 @@ class HybridDatastore {
       progress: mirrorModel.progress,
       staffId: mirrorModel.staffId,
       staffAssigned: mirrorModel.staffAssigned,
+      opposingParty: mirrorModel.opposingParty,
+      caseResult: mirrorModel.caseResult,
       hearingDate: mirrorModel.hearingDate,
       isArchived: mirrorModel.isArchived,
       archivedAt: mirrorModel.archivedAt,

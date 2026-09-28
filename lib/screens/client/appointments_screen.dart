@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
@@ -5,6 +7,7 @@ import '../../theme/app_theme.dart';
 import '../../widgets/empty_state.dart';
 import '../../models/appointment_model.dart';
 import '../../services/auth_service.dart';
+import '../../utils/quiet_console.dart';
 
 class AppointmentsScreen extends StatefulWidget {
   const AppointmentsScreen({super.key});
@@ -19,8 +22,8 @@ class _AppointmentsScreenState extends State<AppointmentsScreen>
 
   late TabController _tabController;
   List<AppointmentModel> _allAppointments = const [];
-  bool _loading = true;
   String? _error;
+  bool _inFlight = false;
 
   @override
   void initState() {
@@ -29,48 +32,62 @@ class _AppointmentsScreenState extends State<AppointmentsScreen>
     _tabController.addListener(() {
       if (mounted) setState(() {});
     });
-    _loadAppointments();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_loadAppointments());
+    });
   }
 
   Future<void> _loadAppointments() async {
+    if (_inFlight) return;
     final user = _authService.currentUser;
-    if (user == null) {
-      if (mounted) setState(() => _loading = false);
-      return;
-    }
+    if (user == null) return;
 
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+    _inFlight = true;
+    final query = FirebaseFirestore.instance
+        .collection('appointments')
+        .where('clientId', isEqualTo: user.uid)
+        .limit(30);
 
     try {
-      final snapshot = await FirebaseFirestore.instance
-          .collection('appointments')
-          .where('clientId', isEqualTo: user.uid)
-          .limit(80)
-          .get()
-          .timeout(const Duration(seconds: 12));
+      try {
+        final cached = await query
+            .get(const GetOptions(source: Source.cache))
+            .timeout(const Duration(milliseconds: 600));
+        if (mounted && cached.docs.isNotEmpty) {
+          _applyAppointments(cached.docs);
+        }
+      } catch (_) {}
 
-      final list = snapshot.docs
-          .map((doc) => AppointmentModel.fromFirestore(doc))
-          .toList()
-        ..sort(
-          (a, b) => a.appointmentDateTime.compareTo(b.appointmentDateTime),
-        );
-
-      if (!mounted) return;
-      setState(() {
-        _allAppointments = list;
-        _loading = false;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _error = e.toString();
-        _loading = false;
-      });
+      try {
+        final snapshot = await query.get().timeout(const Duration(seconds: 1));
+        if (!mounted) return;
+        _applyAppointments(snapshot.docs);
+      } catch (e) {
+        if (mounted && _allAppointments.isEmpty) {
+          setState(() => _error = safeErrorString(e));
+        }
+      }
+    } finally {
+      _inFlight = false;
     }
+  }
+
+  void _applyAppointments(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
+  ) {
+    final list = <AppointmentModel>[];
+    for (final doc in docs) {
+      try {
+        list.add(AppointmentModel.fromFirestore(doc));
+      } catch (_) {}
+    }
+    list.sort(
+      (a, b) => a.appointmentDateTime.compareTo(b.appointmentDateTime),
+    );
+    setState(() {
+      _allAppointments = list;
+      _error = null;
+    });
   }
 
   @override
@@ -155,10 +172,6 @@ class _AppointmentsScreenState extends State<AppointmentsScreen>
   }
 
   Widget _buildBody(String userId, bool isWeb) {
-    if (_loading && _allAppointments.isEmpty) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
     if (_error != null && _allAppointments.isEmpty) {
       return Center(
         child: Padding(

@@ -8,17 +8,27 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/bottom_navigation_bar_5tabs.dart';
+import '../../widgets/client/client_ui_theme.dart';
+import '../../models/case_model.dart';
+import '../../models/appointment_model.dart';
+import '../../pages/case/case_detail_page.dart';
+import 'package:intl/intl.dart';
 import '../../services/chat_service.dart';
+import '../../services/fcm_service.dart';
 import '../../services/profile_service.dart';
 import '../../models/user_model.dart';
-import '../../pages/client/client_landing_page.dart';
+import '../../routes/portal_navigation.dart';
 import 'dashboard/client_dashboard_tabs.dart' deferred as dashboard_tabs;
 import 'dashboard/client_dashboard_nav.dart' deferred as dashboard_nav;
-import 'dashboard/dashboard_notification_badge.dart';
 import '../../utils/safe_network_image.dart';
 import '../../utils/quiet_console.dart';
 import '../../utils/screen_debug_probe.dart';
+import '../../utils/case_status_filter.dart';
 import '../../widgets/common/safe_network_avatar.dart';
+import '../../widgets/common/brand_logo.dart';
+import '../../widgets/common/instant_async.dart';
+import '../../widgets/common/lazy_indexed_stack.dart';
+import '../../widgets/client/client_notification_bell_button.dart';
 import '../../services/auth_service.dart';
 
 class DashboardScreenWithNav extends StatefulWidget {
@@ -37,8 +47,8 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
   StreamSubscription? _appointmentStreamSubscription;
   StreamSubscription? _unreadCountStreamSubscription;
   StreamSubscription? _caseCountStreamSubscription;
-  final DashboardNotificationBadgeController _notificationBadge =
-      DashboardNotificationBadgeController();
+  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>?
+      _userProfileSubscription;
   final ScreenDebugProbe _probe = ScreenDebugProbe('client_dashboard');
   StreamSubscription<User?>? _authStreamSubscription;
   Timer? _unreadCountRefreshTimer;
@@ -52,7 +62,8 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
   int _caseCount = 0;
   int _appointmentCount = 0;
   int _unreadMessageCount = 0;
-  int _unreadNotificationCount = 0; // Separate count for notifications
+  List<CaseModel> _previewCases = const [];
+  AppointmentModel? _nextAppointment;
   bool _isLoading = false;
 
   // Color palette aligned with AppTheme
@@ -88,21 +99,21 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
           appLog('Failed to load dashboard tabs library: $e\n$st');
         });
         unawaited(_loadUserData());
-        if (kIsWeb) {
-          // Web: counts only on pull-to-refresh.
-          return;
-        }
-        // Mobile: instant shell — summary counts load once after a short delay.
-        Future<void>.delayed(const Duration(seconds: 2), () {
-          if (!mounted) return;
-          _probe.event('deferredSummaryCounts');
+        Future<void>.delayed(const Duration(milliseconds: 400), () {
+          if (!mounted || _currentIndex != 0) return;
           unawaited(
             _refreshSummaryCounts().catchError((Object e, StackTrace st) {
               appLog('refreshSummaryCounts crashed: $e\n$st');
             }),
           );
         });
-        Future<void>.delayed(const Duration(seconds: 3), () {
+        final uid = user.uid;
+        unawaited(FCMService().initialize().catchError((_) {}));
+        unawaited(FCMService().saveTokenForUser(uid).catchError((_) {}));
+        if (kIsWeb) {
+          return;
+        }
+        Future<void>.delayed(const Duration(seconds: 2), () {
           if (!mounted) return;
           _probe.event('deferredLocalImage');
           unawaited(
@@ -120,7 +131,8 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
       if (!mounted || _redirectingToLanding) return;
       if (user == null) {
         _redirectingToLanding = true;
-        Get.offAllNamed('/');
+        // App → LoginPage; website stays on the firm-portal landing.
+        navigateAfterLogout();
       }
     });
   }
@@ -140,7 +152,18 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
           email: email,
         ),
       );
-      final userDoc = await _firestore.collection('users').doc(user.uid).get();
+      final userRef = _firestore.collection('users').doc(user.uid);
+      DocumentSnapshot<Map<String, dynamic>> userDoc;
+      try {
+        userDoc = await userRef
+            .get(const GetOptions(source: Source.cache))
+            .timeout(const Duration(seconds: 1));
+        if (!userDoc.exists) {
+          userDoc = await userRef.get().timeout(const Duration(seconds: 1));
+        }
+      } catch (_) {
+        userDoc = await userRef.get().timeout(const Duration(seconds: 1));
+      }
       if (userDoc.exists && mounted) {
         final data = Map<String, dynamic>.from(userDoc.data()!);
         final storedRole = (data['role'] as String?)?.toLowerCase() ?? 'client';
@@ -180,6 +203,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
           _currentUser = UserModel.fromFirestore(data, user.uid);
           _isLoading = false;
         });
+        unawaited(_listenToUserProfile(user.uid));
         unawaited(_loadLocalImage());
       } else {
         setState(() => _isLoading = false);
@@ -190,6 +214,22 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
       }
     }
   });
+
+  Future<void> _listenToUserProfile(String uid) async {
+    await _userProfileSubscription?.cancel();
+    _userProfileSubscription = _firestore
+        .collection('users')
+        .doc(uid)
+        .snapshots()
+        .listen((doc) {
+      if (!mounted || !doc.exists) return;
+      final data = doc.data();
+      if (data == null) return;
+      setState(() {
+        _currentUser = UserModel.fromFirestore(data, uid);
+      });
+    });
+  }
 
   Future<void> _loadLocalImage() => _probe.track('loadLocalImage', () async {
     final user = FirebaseAuth.instance.currentUser;
@@ -213,12 +253,11 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
   });
 
   Future<void> _refreshSummaryCounts() => _probe.track('refreshSummaryCounts', () async {
-    await Future.wait([
-      _loadCaseCount(),
-      _loadAppointmentCount(),
-      _loadUnreadCount(),
-      if (!kIsWeb) _loadNotificationCount(),
-    ]);
+    await _loadCaseCount();
+    if (!mounted) return;
+    await _loadAppointmentCount();
+    if (!mounted) return;
+    await _loadUnreadCount();
   });
 
   Future<void> _loadCaseCount() => _probe.track('loadCaseCount', () async {
@@ -228,6 +267,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
         if (mounted) {
           setState(() {
             _caseCount = 0;
+            _previewCases = const [];
           });
         }
         return;
@@ -237,28 +277,42 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
       _caseCountStreamSubscription = null;
 
       try {
-        final snapshot = await _firestore
+        final query = _firestore
             .collection('cases')
             .where('clientId', isEqualTo: user.uid)
-            .limit(60)
-            .get()
-            .timeout(const Duration(seconds: 10));
+            .limit(8);
+        QuerySnapshot<Map<String, dynamic>> snapshot;
+        try {
+          snapshot = await query
+              .get(const GetOptions(source: Source.cache))
+              .timeout(const Duration(seconds: 1));
+          if (snapshot.docs.isEmpty) {
+            snapshot = await query.get().timeout(const Duration(seconds: 1));
+          }
+        } catch (_) {
+          snapshot = await query.get().timeout(const Duration(seconds: 1));
+        }
         if (!mounted) return;
-        final count = snapshot.docs.where((doc) {
-          final data = doc.data();
-          return data['isArchived'] != true;
-        }).length;
-        setState(() => _caseCount = count);
+        final visible = <CaseModel>[];
+        for (final doc in snapshot.docs) {
+          try {
+            final c = CaseModel.fromFirestore(doc);
+            if (CaseStatusFilter.visibleToClient(c)) visible.add(c);
+          } catch (_) {}
+        }
+        visible.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+        final active = visible
+            .where((c) => !CaseStatusFilter.isCompleted(c.status))
+            .toList();
+        setState(() {
+          _caseCount = active.length;
+          _previewCases = active.take(5).toList();
+        });
       } catch (_) {
-        if (mounted) setState(() => _caseCount = 0);
+        /* keep last painted counts */
       }
     } catch (e) {
-      appLog('Error in _loadCaseCount: $e');
-      if (mounted) {
-        setState(() {
-          _caseCount = 0;
-        });
-      }
+      appLog('Error in _loadCaseCount: ${safeErrorString(e)}');
     }
   });
 
@@ -269,6 +323,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
         if (mounted) {
           setState(() {
             _appointmentCount = 0;
+            _nextAppointment = null;
           });
         }
         return;
@@ -279,45 +334,56 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
       _appointmentStreamSubscription = null;
 
       try {
-        final snapshot = await _firestore
+        final query = _firestore
             .collection('appointments')
             .where('clientId', isEqualTo: user.uid)
-            .limit(80)
-            .get()
-            .timeout(const Duration(seconds: 10));
+            .limit(20);
+        QuerySnapshot<Map<String, dynamic>> snapshot;
+        try {
+          snapshot = await query
+              .get(const GetOptions(source: Source.cache))
+              .timeout(const Duration(seconds: 1));
+          if (snapshot.docs.isEmpty) {
+            snapshot = await query.get().timeout(const Duration(seconds: 1));
+          }
+        } catch (_) {
+          snapshot = await query.get().timeout(const Duration(seconds: 1));
+        }
         if (!mounted) return;
         final now = DateTime.now();
         final today = DateTime(now.year, now.month, now.day);
-        final count = snapshot.docs.where((doc) {
-          final data = doc.data();
-          final status = data['status'] as String?;
-          if (status == 'cancelled' || status == 'completed') return false;
-          final appointmentDateTime = data['appointmentDateTime'];
-          if (appointmentDateTime == null) return false;
-          final aptDate = appointmentDateTime is Timestamp
-              ? appointmentDateTime.toDate()
-              : appointmentDateTime is DateTime
-              ? appointmentDateTime
-              : null;
-          if (aptDate == null) return false;
+        var todayCount = 0;
+        AppointmentModel? next;
+        for (final doc in snapshot.docs) {
+          AppointmentModel apt;
+          try {
+            apt = AppointmentModel.fromFirestore(doc);
+          } catch (_) {
+            continue;
+          }
+          final status = apt.status.toLowerCase();
+          if (status == 'cancelled' || status == 'completed') continue;
           final aptDateOnly = DateTime(
-            aptDate.year,
-            aptDate.month,
-            aptDate.day,
+            apt.appointmentDateTime.year,
+            apt.appointmentDateTime.month,
+            apt.appointmentDateTime.day,
           );
-          return aptDateOnly == today;
-        }).length;
-        setState(() => _appointmentCount = count);
+          if (aptDateOnly == today) todayCount++;
+          if (apt.appointmentDateTime.isBefore(now)) continue;
+          if (next == null ||
+              apt.appointmentDateTime.isBefore(next.appointmentDateTime)) {
+            next = apt;
+          }
+        }
+        setState(() {
+          _appointmentCount = todayCount;
+          _nextAppointment = next;
+        });
       } catch (_) {
-        if (mounted) setState(() => _appointmentCount = 0);
+        /* keep last painted counts */
       }
     } catch (e) {
       appLog('Error in _loadAppointmentCount: $e');
-      if (mounted) {
-        setState(() {
-          _appointmentCount = 0;
-        });
-      }
     }
   });
 
@@ -334,42 +400,16 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
       try {
         final count = await _chatService
             .getUnreadCount(user.uid)
-            .timeout(const Duration(seconds: 10));
+            .timeout(const Duration(seconds: 1));
         if (!mounted) return;
         if (count != _unreadMessageCount) {
           setState(() => _unreadMessageCount = count);
         }
       } catch (e) {
         if (kDebugMode) debugPrint('Error refreshing unread count: $e');
-        if (mounted && _unreadMessageCount != 0) {
-          setState(() => _unreadMessageCount = 0);
-        }
       }
     } catch (e) {
       if (kDebugMode) debugPrint('Error in _loadUnreadCount: $e');
-      if (mounted && _unreadMessageCount != 0) {
-        setState(() => _unreadMessageCount = 0);
-      }
-    }
-  });
-
-  Future<void> _loadNotificationCount() => _probe.track('loadNotificationCount', () async {
-    if (kIsWeb) return;
-    try {
-      final user = FirebaseAuth.instance.currentUser;
-      if (user == null) return;
-
-      _notificationBadge.stop();
-      await _notificationBadge.start(
-        user.uid,
-        (count) {
-          if (mounted) setState(() => _unreadNotificationCount = count);
-        },
-        debugProbe: _probe,
-      );
-    } catch (e) {
-      appLog('Error in _loadNotificationCount: $e');
-      if (mounted) setState(() => _unreadNotificationCount = 0);
     }
   });
 
@@ -382,10 +422,10 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
     _probe.event('dispose');
     _probe.detach();
     _authStreamSubscription?.cancel();
+    _userProfileSubscription?.cancel();
     _caseCountStreamSubscription?.cancel();
     _appointmentStreamSubscription?.cancel();
     _unreadCountStreamSubscription?.cancel();
-    _notificationBadge.stop();
     _unreadCountRefreshTimer?.cancel();
     super.dispose();
   }
@@ -425,13 +465,10 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
 
   void _onTabTapped(int index) {
     _probe.event('tabTap', detail: 'index=$index');
+    if (index == _currentIndex) return;
     setState(() {
       _currentIndex = index;
     });
-
-    if (index == 0) {
-      unawaited(_refreshSummaryCounts());
-    }
   }
 
   Widget _buildHomeScreen() {
@@ -443,7 +480,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
         message: 'Please log in to access your dashboard',
         actionLabel: 'Go to Login',
         onAction: () {
-          Get.offAll(() => const ClientLandingPage());
+          navigateAfterLogout();
         },
       );
     }
@@ -457,30 +494,27 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // User Header Card
               _buildUserHeaderCard(user),
-              const SizedBox(height: 24),
-
-              // Overview Section
-              Text(
+              const SizedBox(height: 22),
+              _buildSectionHeader(
                 'Overview',
-                style: AppTheme.heading3.copyWith(
-                  color: primaryColor,
-                  fontWeight: FontWeight.bold,
-                ),
+                onViewAll: () => setState(() => _currentIndex = 1),
               ),
               const SizedBox(height: 12),
               _buildSummarySection(context),
-              const SizedBox(height: 24),
-
-              // Quick Actions Section
-              Text(
-                'Quick Actions',
-                style: AppTheme.heading4.copyWith(
-                  color: primaryColor,
-                  fontWeight: FontWeight.w600,
-                ),
+              const SizedBox(height: 22),
+              _buildSectionHeader(
+                'My Cases',
+                onViewAll: () => setState(() => _currentIndex = 1),
               ),
+              const SizedBox(height: 12),
+              _buildMyCasesStrip(),
+              if (_nextAppointment != null) ...[
+                const SizedBox(height: 22),
+                _buildUpcomingCallout(_nextAppointment!),
+              ],
+              const SizedBox(height: 22),
+              Text('Quick Actions', style: ClientUi.heading),
               const SizedBox(height: 12),
               _buildQuickActions(),
             ],
@@ -525,160 +559,125 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
     }
 
     return Container(
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.06),
-            blurRadius: 18,
-            offset: const Offset(0, 8),
-          ),
-        ],
+        color: ClientUi.navy,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: ClientUi.cardShadow,
       ),
-      child: Row(
+      child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Profile Photo - Always show initials immediately
-          Builder(
-            builder: (context) {
-              final memoryProvider = _buildProfileImageProvider(photoUrl);
-              if (memoryProvider != null) {
-                return CircleAvatar(
-                  radius: 32,
-                  backgroundColor: primaryColor.withOpacity(0.1),
-                  backgroundImage: memoryProvider,
-                );
-              }
-              if (isValidNetworkImageUrl(photoUrl)) {
-                return SafeNetworkAvatar(
-                  photoUrl: photoUrl,
-                  radius: 32,
-                  fallbackLetter: firstLetter,
-                  backgroundColor: primaryColor.withOpacity(0.1),
-                  foregroundColor: primaryColor,
-                );
-              }
-              return CircleAvatar(
-                radius: 32,
-                backgroundColor: primaryColor.withOpacity(0.1),
-                child: Text(
-                  firstLetter,
-                  style: const TextStyle(
-                    fontSize: 24,
-                    fontWeight: FontWeight.bold,
-                    color: primaryColor,
-                  ),
-                ),
-              );
-            },
-          ),
-          const SizedBox(width: 16),
-
-          // User Info + View Profile
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Builder(
+                builder: (context) {
+                  if (isValidNetworkImageUrl(photoUrl)) {
+                    return SafeNetworkAvatar(
+                      photoUrl: photoUrl,
+                      radius: 30,
+                      fallbackLetter: firstLetter,
+                      backgroundColor: Colors.white.withValues(alpha: 0.16),
+                      foregroundColor: Colors.white,
+                    );
+                  }
+                  final memoryProvider = _buildProfileImageProvider(photoUrl);
+                  if (memoryProvider != null) {
+                    return CircleAvatar(
+                      radius: 30,
+                      backgroundColor: Colors.white.withValues(alpha: 0.16),
+                      backgroundImage: memoryProvider,
+                    );
+                  }
+                  return CircleAvatar(
+                    radius: 30,
+                    backgroundColor: Colors.white.withValues(alpha: 0.16),
+                    child: Text(
+                      firstLetter,
+                      style: TextStyle(fontFamily: AppTheme.fontFamily,
+                        fontSize: 22,
+                        fontWeight: FontWeight.w800,
+                        color: Colors.white,
+                      ),
+                    ),
+                  );
+                },
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  displayName,
-                                  style: AppTheme.heading4.copyWith(
-                                    color: primaryColor,
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                              if (isVerified)
-                                Container(
-                                  padding: const EdgeInsets.all(4),
-                                  decoration: const BoxDecoration(
-                                    color: Colors.green,
-                                    shape: BoxShape.circle,
-                                  ),
-                                  child: const Icon(
-                                    Icons.verified,
-                                    color: Colors.white,
-                                    size: 16,
-                                  ),
-                                ),
-                            ],
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            displayEmail,
-                            style: AppTheme.bodyMedium.copyWith(
-                              color: Colors.grey[600],
-                            ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ],
+                    Text(
+                      displayName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontFamily: AppTheme.fontFamily,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w800,
+                        color: Colors.white,
                       ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      displayEmail,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontFamily: AppTheme.fontFamily,
+                        fontSize: 12,
+                        color: Colors.white.withValues(alpha: 0.72),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      children: [
+                        _pill(
+                          (_currentUser?.role ?? 'client').toUpperCase(),
+                          ClientUi.gold,
+                          ClientUi.navy,
+                        ),
+                        if (isVerified)
+                          _pill('Verified', Colors.white, ClientUi.navy),
+                      ],
                     ),
                   ],
                 ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 4,
-                      ),
-                      decoration: BoxDecoration(
-                        color: goldColor.withOpacity(0.15),
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(
-                          color: goldColor.withOpacity(0.4),
-                          width: 1,
-                        ),
-                      ),
-                      child: Text(
-                        (_currentUser?.role ?? 'client').toUpperCase(),
-                        style: AppTheme.caption.copyWith(
-                          color: goldColor,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 11,
-                          letterSpacing: 0.6,
-                        ),
-                      ),
-                    ),
-                    const Spacer(),
-                    TextButton(
-                      onPressed: () {
-                        setState(() {
-                          _currentIndex = 4; // Profile tab
-                        });
-                      },
-                      style: TextButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(horizontal: 8),
-                        minimumSize: const Size(0, 0),
-                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      ),
-                      child: Text(
-                        'View Profile',
-                        style: AppTheme.bodySmall.copyWith(
-                          color: primaryColor,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ],
+              ),
+              TextButton(
+                onPressed: () {
+                  setState(() {
+                    _currentIndex = 4;
+                  });
+                },
+                child: Text(
+                  'View Profile  >',
+                  style: TextStyle(fontFamily: AppTheme.fontFamily,
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 12,
+                  ),
                 ),
-              ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Text(
+            'Good day, ${displayName.split(' ').first}!',
+            style: TextStyle(fontFamily: AppTheme.fontFamily,
+              fontSize: 20,
+              fontWeight: FontWeight.w800,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            "Here's your overview and latest updates.",
+            style: TextStyle(fontFamily: AppTheme.fontFamily,
+              fontSize: 13,
+              color: Colors.white.withValues(alpha: 0.72),
             ),
           ),
         ],
@@ -687,223 +686,500 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
   }
 
   Widget _buildSummarySection(BuildContext context) {
-    // Original design: 3 cards in a row
-    return GridView.count(
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      crossAxisCount: 3,
-      crossAxisSpacing: 12,
-      mainAxisSpacing: 12,
-      childAspectRatio: 1.0,
+    return SizedBox(
+      height: 122,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            child: _buildSummaryCard(
+              icon: Icons.folder_copy_rounded,
+              label: 'Active Cases',
+              subtitle: "Case's in progress.",
+              count: _caseCount,
+              color: primaryColor,
+              onTap: () {
+                setState(() => _currentIndex = 1);
+              },
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: _buildSummaryCard(
+              icon: Icons.calendar_today_rounded,
+              label: 'Appointments',
+              subtitle: 'Upcoming schedule.',
+              count: _appointmentCount,
+              color: goldColor,
+              onTap: () {
+                setState(() => _currentIndex = 2);
+              },
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: _buildSummaryCard(
+              icon: Icons.chat_bubble_outline_rounded,
+              label: 'Unread Messages',
+              subtitle: 'New messages.',
+              count: _unreadMessageCount,
+              color: Colors.green,
+              onTap: () {
+                setState(() => _currentIndex = 3);
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildQuickActions() {
+    return Column(
       children: [
-        _buildSummaryCard(
-          icon: Icons.folder_copy_rounded,
-          label: 'Active Cases',
-          count: _caseCount,
-          color: primaryColor,
-          onTap: () {
-            setState(() => _currentIndex = 1); // Navigate to Cases tab
-          },
+        Row(
+          children: [
+            Expanded(
+              child: _actionTile(
+                icon: Icons.calendar_month_outlined,
+                title: 'Request Appointment',
+                subtitle: 'Book a consultation',
+                filled: true,
+                gold: false,
+                onTap: () async {
+                  await _ensureNavLibrary();
+                  await dashboard_nav.openAttorneySelection();
+                },
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _actionTile(
+                icon: Icons.chat_bubble_outline,
+                title: 'Message Attorney',
+                subtitle: 'Chat with counsel',
+                filled: true,
+                gold: true,
+                onTap: _openMessageStaffForm,
+              ),
+            ),
+          ],
         ),
-        _buildSummaryCard(
-          icon: Icons.calendar_today_rounded,
-          label: 'Appointments',
-          count: _appointmentCount,
-          color: goldColor,
-          onTap: () {
-            setState(() => _currentIndex = 2);
-          },
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Expanded(
+              child: _actionTile(
+                icon: Icons.help_outline_rounded,
+                title: 'Send Request',
+                subtitle: 'Ask for assistance',
+                filled: false,
+                gold: false,
+                onTap: () async {
+                  await _ensureNavLibrary();
+                  await dashboard_nav.openSendRequest();
+                },
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _actionTile(
+                icon: Icons.gavel_outlined,
+                title: 'Notary Portal',
+                subtitle: 'Notary services',
+                filled: false,
+                gold: false,
+                onTap: () async {
+                  await _ensureNavLibrary();
+                  await dashboard_nav.openNotaryPortal();
+                },
+              ),
+            ),
+          ],
         ),
-        _buildSummaryCard(
-          icon: Icons.chat_bubble_outline_rounded,
-          label: 'Unread Messages',
-          count: _unreadMessageCount,
-          color: Colors.green,
-          onTap: () {
-            setState(() => _currentIndex = 3);
+        const SizedBox(height: 10),
+        _actionTile(
+          icon: Icons.account_balance_wallet_outlined,
+          title: 'Billing & Payments',
+          subtitle: 'Balances and legal fees',
+          filled: false,
+          gold: false,
+          onTap: () async {
+            await _ensureNavLibrary();
+            await dashboard_nav.openBilling();
           },
         ),
       ],
     );
   }
 
-  Widget _buildQuickActions() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        // Row 1: Request Appointment + Contact Staff
-        Row(
-          children: [
-            Expanded(
-              child: ElevatedButton.icon(
-                onPressed: () async {
-                  await _ensureNavLibrary();
-                  await dashboard_nav.openAttorneySelection();
-                },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: primaryColor,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  elevation: 2,
-                ),
-                icon: const Icon(Icons.calendar_today_rounded),
-                label: const Text(
-                  'Request Appointment',
-                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-                ),
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: ElevatedButton.icon(
-                onPressed: () async {
-                  // Open message form to contact staff
-                  await _openMessageStaffForm();
-                },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: primaryColor,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  elevation: 2,
-                ),
-                icon: const Icon(Icons.mail_outline_rounded),
-                label: const Text(
-                  'Contact Staff',
-                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-                ),
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-        // Row 2: Send Request + Notary Portal
-        Row(
-          children: [
-            Expanded(
-              child: ElevatedButton.icon(
-                onPressed: () async {
-                  await _ensureNavLibrary();
-                  await dashboard_nav.openSendRequest();
-                },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: primaryColor,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  elevation: 2,
-                ),
-                icon: const Icon(Icons.help_outline_rounded),
-                label: const Text(
-                  'Send Request',
-                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-                ),
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: ElevatedButton.icon(
-                onPressed: () async {
-                  await _ensureNavLibrary();
-                  await dashboard_nav.openNotaryPortal();
-                },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.white,
-                  foregroundColor: primaryColor,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                    side: BorderSide(color: primaryColor.withOpacity(0.15)),
-                  ),
-                  elevation: 1,
-                ),
-                icon: const Icon(Icons.gavel_outlined),
-                label: const Text(
-                  'Notary Portal',
-                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-                ),
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-        // Row 3: Billing & Payments (view outstanding balance, pay legal fees)
-        SizedBox(
+  Widget _actionTile({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required bool filled,
+    required bool gold,
+    required VoidCallback onTap,
+  }) {
+    final bg = gold
+        ? ClientUi.gold
+        : filled
+            ? ClientUi.navy
+            : Colors.white;
+    final fg = gold
+        ? ClientUi.navy
+        : filled
+            ? Colors.white
+            : ClientUi.navy;
+    return Material(
+      color: bg,
+      borderRadius: BorderRadius.circular(14),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(14),
+        child: Container(
           width: double.infinity,
-          child: ElevatedButton.icon(
-            onPressed: () async {
-              await _ensureNavLibrary();
-              await dashboard_nav.openBilling();
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: goldColor,
-              foregroundColor: AppTheme.deepNavy,
-              padding: const EdgeInsets.symmetric(vertical: 14),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            border: filled || gold
+                ? null
+                : Border.all(color: ClientUi.line),
+            boxShadow: ClientUi.cardShadow,
+          ),
+          child: Row(
+            children: [
+              Icon(icon, color: fg, size: 22),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontFamily: AppTheme.fontFamily,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 13,
+                        color: fg,
+                      ),
+                    ),
+                    Text(
+                      subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontFamily: AppTheme.fontFamily,
+                        fontSize: 11,
+                        color: fg.withValues(alpha: 0.7),
+                      ),
+                    ),
+                  ],
+                ),
               ),
-              elevation: 2,
-            ),
-            icon: const Icon(Icons.account_balance_wallet_outlined),
-            label: const Text(
-              'Billing & Payments',
-              style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-            ),
+              Icon(Icons.chevron_right, color: fg),
+            ],
           ),
         ),
-      ],
+      ),
     );
   }
 
   Widget _buildSummaryCard({
     required IconData icon,
     required String label,
+    required String subtitle,
     required int count,
     required Color color,
     required VoidCallback onTap,
   }) {
     return Material(
       color: Colors.white,
-      elevation: 1,
-      shadowColor: Colors.black.withOpacity(0.05),
-      borderRadius: BorderRadius.circular(12),
+      borderRadius: BorderRadius.circular(14),
+      clipBehavior: Clip.antiAlias,
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(12),
         child: Container(
-          padding: const EdgeInsets.all(16),
+          width: double.infinity,
+          padding: const EdgeInsets.fromLTRB(10, 12, 10, 0),
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: color.withOpacity(0.2), width: 1),
+            borderRadius: BorderRadius.circular(14),
+            boxShadow: ClientUi.cardShadow,
           ),
           child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            crossAxisAlignment: CrossAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Icon(icon, size: 32, color: color),
-              const SizedBox(height: 12),
+              Icon(icon, size: 20, color: color),
+              const SizedBox(height: 8),
               Text(
                 '$count',
-                style: AppTheme.heading3.copyWith(
-                  color: primaryColor,
-                  fontWeight: FontWeight.bold,
+                style: TextStyle(fontFamily: AppTheme.fontFamily,
+                  fontSize: 22,
+                  fontWeight: FontWeight.w800,
+                  color: ClientUi.navy,
+                  height: 1.05,
                 ),
               ),
-              const SizedBox(height: 4),
               Text(
                 label,
-                style: AppTheme.bodySmall.copyWith(color: Colors.grey[600]),
-                textAlign: TextAlign.center,
-                maxLines: 2,
+                maxLines: 1,
                 overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontFamily: AppTheme.fontFamily,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: ClientUi.text,
+                ),
               ),
+              Text(
+                subtitle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontFamily: AppTheme.fontFamily,fontSize: 10, color: ClientUi.muted),
+              ),
+              const Spacer(),
+              Container(height: 3, color: color),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSectionHeader(String title, {VoidCallback? onViewAll}) {
+    return Row(
+      children: [
+        Expanded(child: Text(title, style: ClientUi.heading)),
+        if (onViewAll != null)
+          TextButton(
+            onPressed: onViewAll,
+            child: Text(
+              'View All  >',
+              style: TextStyle(fontFamily: AppTheme.fontFamily,
+                fontWeight: FontWeight.w700,
+                color: ClientUi.navyMid,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _pill(String label, Color bg, Color fg) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(99),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(fontFamily: AppTheme.fontFamily,
+          fontSize: 10,
+          fontWeight: FontWeight.w800,
+          color: fg,
+          letterSpacing: 0.3,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMyCasesStrip() {
+    if (_previewCases.isEmpty) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: ClientUi.cardShadow,
+        ),
+        child: Text(
+          'No cases yet. Your filed cases will show here.',
+          style: ClientUi.body,
+          textAlign: TextAlign.center,
+        ),
+      );
+    }
+
+    return SizedBox(
+      height: 210,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: _previewCases.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 12),
+        itemBuilder: (context, index) {
+          final c = _previewCases[index];
+          return _casePreviewCard(c);
+        },
+      ),
+    );
+  }
+
+  Widget _casePreviewCard(CaseModel c) {
+    final status = c.status.toLowerCase();
+    final color = status == 'completed'
+        ? ClientUi.green
+        : status == 'in_progress' || status == 'accepted'
+            ? ClientUi.navyMid
+            : ClientUi.gold;
+    final progress = status == 'completed'
+        ? 1.0
+        : status == 'in_progress'
+            ? 0.7
+            : status == 'accepted'
+                ? 0.5
+                : 0.35;
+    final footer = c.hearingDate != null
+        ? 'Hearing scheduled • ${DateFormat('MMM d, y').format(c.hearingDate!)}'
+        : 'Case filed • ${DateFormat('MMM d, y').format(c.createdAt)}';
+
+    return Container(
+      width: 240,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: ClientUi.cardShadow,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.balance, color: ClientUi.navyMid, size: 20),
+              const Spacer(),
+              _pill(
+                CaseStatusFilter.statusLabel(c.status).toUpperCase(),
+                color.withValues(alpha: 0.18),
+                color,
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            c.caseTitle,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontFamily: AppTheme.fontFamily,
+              fontWeight: FontWeight.w800,
+              fontSize: 15,
+              color: ClientUi.navy,
+            ),
+          ),
+          Text(
+            c.caseType,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontFamily: AppTheme.fontFamily,fontSize: 12, color: ClientUi.muted),
+          ),
+          const SizedBox(height: 10),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(99),
+            child: LinearProgressIndicator(
+              value: progress,
+              minHeight: 6,
+              color: color,
+              backgroundColor: ClientUi.line,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            footer,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontFamily: AppTheme.fontFamily,fontSize: 11, color: ClientUi.muted),
+          ),
+          const Spacer(),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: () {
+                Get.to(() => CaseDetailPage(caseId: c.id));
+              },
+              icon: const Icon(Icons.visibility_outlined, size: 16),
+              label: const Text('View Case  >'),
+              style: FilledButton.styleFrom(
+                backgroundColor: ClientUi.navy,
+                foregroundColor: Colors.white,
+                visualDensity: VisualDensity.compact,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildUpcomingCallout(AppointmentModel apt) {
+    final days = apt.appointmentDateTime.difference(DateTime.now()).inDays;
+    return Material(
+      color: const Color(0xFFFFF6D8),
+      borderRadius: BorderRadius.circular(16),
+      child: InkWell(
+        onTap: () => setState(() => _currentIndex = 2),
+        borderRadius: BorderRadius.circular(16),
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Row(
+            children: [
+              Container(
+                width: 42,
+                height: 42,
+                decoration: BoxDecoration(
+                  color: ClientUi.gold,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Icon(Icons.calendar_today, color: ClientUi.navy),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Text(
+                          'Upcoming Appointment',
+                          style: TextStyle(fontFamily: AppTheme.fontFamily,
+                            fontWeight: FontWeight.w800,
+                            color: ClientUi.navy,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        _pill(
+                          days <= 0 ? 'TODAY' : 'IN $days DAYS',
+                          ClientUi.gold,
+                          ClientUi.navy,
+                        ),
+                      ],
+                    ),
+                    Text(
+                      apt.caseTitle?.trim().isNotEmpty == true
+                          ? apt.caseTitle!
+                          : apt.appointmentType.replaceAll('_', ' '),
+                      style: TextStyle(fontFamily: AppTheme.fontFamily,
+                        fontSize: 13,
+                        color: ClientUi.text,
+                      ),
+                    ),
+                    Text(
+                      [
+                        DateFormat('MMM d, y • h:mm a')
+                            .format(apt.appointmentDateTime),
+                        if ((apt.attorneyName ?? '').trim().isNotEmpty)
+                          apt.attorneyName!,
+                      ].join('  ·  '),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontFamily: AppTheme.fontFamily,
+                        fontSize: 12,
+                        color: ClientUi.muted,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Icon(Icons.chevron_right, color: ClientUi.navy),
             ],
           ),
         ),
@@ -912,17 +1188,46 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
   }
 
   Widget _buildCurrentScreen() {
-    if (_currentIndex == 0) {
-      return _buildHomeScreen();
-    }
+    return LazyIndexedStack(
+      index: _currentIndex,
+      activeTabRevision:
+          _currentIndex == 0 ? _homeTabRevision : 'frozen-tabs',
+      builders: [
+        () => _buildHomeScreen(),
+        () => _DeferredClientTab(
+              ensureLoaded: _ensureTabsLibrary,
+              pageBuilder: () => dashboard_tabs.buildClientDashboardTab(1),
+            ),
+        () => _DeferredClientTab(
+              ensureLoaded: _ensureTabsLibrary,
+              pageBuilder: () => dashboard_tabs.buildClientDashboardTab(2),
+            ),
+        () => _DeferredClientTab(
+              ensureLoaded: _ensureTabsLibrary,
+              pageBuilder: () => dashboard_tabs.buildClientDashboardTab(3),
+            ),
+        () => _DeferredClientTab(
+              ensureLoaded: _ensureTabsLibrary,
+              pageBuilder: () => dashboard_tabs.buildClientDashboardTab(4),
+            ),
+      ],
+    );
+  }
 
-    return FutureBuilder<void>(
-      future: _tabsLibrary ??= dashboard_tabs.loadLibrary(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState != ConnectionState.done) {
-          return const Center(child: CircularProgressIndicator());
-        }
-        return dashboard_tabs.buildClientDashboardTab(_currentIndex);
+  Object get _homeTabRevision => Object.hash(
+        _caseCount,
+        _appointmentCount,
+        _unreadMessageCount,
+        _previewCases.length,
+        _nextAppointment?.id,
+        _currentUser?.id,
+        _localImageBase64?.length,
+      );
+
+  Future<void> _ensureTabsLibrary() {
+    return _tabsLibrary ??= dashboard_tabs.loadLibrary().catchError(
+      (Object e, StackTrace st) {
+        appLog('Failed to load dashboard tabs library: $e\n$st');
       },
     );
   }
@@ -935,7 +1240,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
       return _probe.wrap(
         Scaffold(
           backgroundColor: backgroundColor,
-          body: const Center(child: CircularProgressIndicator()),
+          body: const InstantFill(),
         ),
       );
     }
@@ -951,7 +1256,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
             message: 'Please log in to access your dashboard',
             actionLabel: 'Go to Login',
             onAction: () {
-              Get.offAll(() => const ClientLandingPage());
+              navigateAfterLogout();
             },
           ),
         ),
@@ -960,52 +1265,53 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
 
     return _probe.wrap(
       Scaffold(
-      backgroundColor: backgroundColor,
-      // Only show AppBar for Home screen, other screens have their own
+      backgroundColor: ClientUi.background,
       appBar: _currentIndex == 0
           ? AppBar(
-              backgroundColor: primaryColor,
-              title: const Text('Dashboard'),
-              actions: [
-                IconButton(
-                  icon: Stack(
-                    children: [
-                      const Icon(Icons.notifications_outlined),
-                      if (_unreadNotificationCount > 0)
-                        Positioned(
-                          right: 0,
-                          top: 0,
-                          child: Container(
-                            padding: const EdgeInsets.all(4),
-                            decoration: const BoxDecoration(
-                              color: Colors.red,
-                              shape: BoxShape.circle,
-                            ),
-                            constraints: const BoxConstraints(
-                              minWidth: 18,
-                              minHeight: 18,
-                            ),
-                            child: Text(
-                              _unreadNotificationCount > 99
-                                  ? '99+'
-                                  : _unreadNotificationCount > 9
-                                  ? '9+'
-                                  : '$_unreadNotificationCount',
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 10,
-                                fontWeight: FontWeight.bold,
-                              ),
-                              textAlign: TextAlign.center,
-                            ),
+              backgroundColor: ClientUi.navy,
+              automaticallyImplyLeading: false,
+              titleSpacing: 12,
+              title: Row(
+                children: [
+                  const BrandLogo(size: 36),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          'LawConnect',
+                          style: TextStyle(fontFamily: AppTheme.fontFamily,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w800,
+                            color: Colors.white,
                           ),
                         ),
-                    ],
+                        Text(
+                          'Connect • Consult • Resolve',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(fontFamily: AppTheme.fontFamily,
+                            fontSize: 10,
+                            color: Colors.white70,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                  onPressed: () {
-                    Get.toNamed('/ClientNotifications');
-                  },
-                ),
+                  Text(
+                    'Dashboard',
+                    style: TextStyle(fontFamily: AppTheme.fontFamily,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
+                    ),
+                  ),
+                ],
+              ),
+              actions: const [
+                ClientNotificationBellButton(),
               ],
             )
           : null,
@@ -1032,5 +1338,41 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
 
     // Return null — network photos use SafeNetworkAvatar in the header UI.
     return null;
+  }
+}
+
+class _DeferredClientTab extends StatefulWidget {
+  const _DeferredClientTab({
+    required this.ensureLoaded,
+    required this.pageBuilder,
+  });
+
+  final Future<void> Function() ensureLoaded;
+  final Widget Function() pageBuilder;
+
+  @override
+  State<_DeferredClientTab> createState() => _DeferredClientTabState();
+}
+
+class _DeferredClientTabState extends State<_DeferredClientTab> {
+  Widget? _page;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_open());
+  }
+
+  Future<void> _open() async {
+    try {
+      await widget.ensureLoaded();
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() => _page = widget.pageBuilder());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _page ?? const InstantFill();
   }
 }

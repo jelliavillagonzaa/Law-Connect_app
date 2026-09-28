@@ -15,5 +15,23 @@ firebase.initializeApp({
 const messaging = firebase.messaging();
 
 messaging.onBackgroundMessage((payload) => {
-  console.log('[firebase-messaging-sw.js] Background message', payload);
+  const title = (payload.notification && payload.notification.title) || 'New message';
+  const body = (payload.notification && payload.notification.body) || '';
+  return self.registration.showNotification(title, {
+    body: body,
+    data: payload.data || {},
+  });
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil(
+    clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
+      for (let i = 0; i < windowClients.length; i++) {
+        const client = windowClients[i];
+        if ('focus' in client) return client.focus();
+      }
+      if (clients.openWindow) return clients.openWindow('/');
+    }),
+  );
 });

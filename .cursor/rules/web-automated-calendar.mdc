@@ -1,0 +1,13 @@
+---
+description: Web automated hearing calendar must not use cache-first 1s Firestore gets
+globs: lib/services/hearing_calendar_sync_service.dart,lib/services/staff_service.dart,lib/screens/staff/staff_calendar_screen.dart,lib/screens/attorney/appointment_calendar_view.dart,lib/utils/firestore_query_get.dart
+alwaysApply: false
+---
+
+# Web automated calendar
+
+Chrome/web Firestore cache is often empty. Never load hearings with:
+
+`get(Source.cache)` then `get().timeout(1 second)`
+
+That returns empty and the court overlay vanishes. Use `FirestoreQueryGet.hearings()` (15s on web). Replay overlay rows on stream `onListen`. Staff calendar must call `_loadAutomatedHearings` + `_applyAutomatedHearingRows`.

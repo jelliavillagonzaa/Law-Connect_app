@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 import '../../models/appointment_model.dart';
 import '../../services/enhanced_appointment_service.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/common/schedule_full_dialog.dart';
 
 class ConfirmAppointmentSchedulePage extends StatefulWidget {
   final AppointmentModel pendingRequest;
@@ -129,6 +130,8 @@ class _ConfirmAppointmentSchedulePageState
       );
       // Pop back to the pending requests list / dashboard
       Get.back();
+    } else if (EnhancedAppointmentService.isScheduleFull(result)) {
+      await showScheduleFullDialog(context, date: finalDateTime);
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -153,7 +156,7 @@ class _ConfirmAppointmentSchedulePageState
         foregroundColor: const Color(0xFF1C1C1C),
         elevation: 0.5,
       ),
-      backgroundColor: const Color(0xFFF4F4F4),
+      backgroundColor: AppTheme.lightGray,
       body: Center(
         child: ConstrainedBox(
           constraints: BoxConstraints(

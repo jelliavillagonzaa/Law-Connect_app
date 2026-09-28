@@ -42,8 +42,15 @@
             "type": "dart",
             "program": "lib/main.dart",
             "deviceId": "web-server",
+            "args": [
+                "--no-web-resources-cdn",
+                "--no-web-experimental-hot-reload",
+                "--no-web-enable-expression-evaluation"
+            ],
             "toolArgs": [
-                "--no-web-resources-cdn"
+                "--no-web-resources-cdn",
+                "--no-web-experimental-hot-reload",
+                "--no-web-enable-expression-evaluation"
             ]
         },
         {
@@ -52,8 +59,15 @@
             "type": "dart",
             "program": "lib/main.dart",
             "deviceId": "chrome",
+            "args": [
+                "--no-web-resources-cdn",
+                "--no-web-experimental-hot-reload",
+                "--no-web-enable-expression-evaluation"
+            ],
             "toolArgs": [
-                "--no-web-resources-cdn"
+                "--no-web-resources-cdn",
+                "--no-web-experimental-hot-reload",
+                "--no-web-enable-expression-evaluation"
             ]
         },
         {
@@ -62,8 +76,15 @@
             "type": "dart",
             "program": "lib/main.dart",
             "deviceId": "edge",
+            "args": [
+                "--no-web-resources-cdn",
+                "--no-web-experimental-hot-reload",
+                "--no-web-enable-expression-evaluation"
+            ],
             "toolArgs": [
-                "--no-web-resources-cdn"
+                "--no-web-resources-cdn",
+                "--no-web-experimental-hot-reload",
+                "--no-web-enable-expression-evaluation"
             ]
         },
         {

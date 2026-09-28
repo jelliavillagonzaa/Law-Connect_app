@@ -3,9 +3,9 @@ import { onCall, HttpsError } from "firebase-functions/v2/https";
 import { logger } from "firebase-functions";
 import {
   buildNotificationBody,
+  clientProfileMatchesHearingClientName,
   deliverHearingNotification,
   isImportedCourtRow,
-  resolveClientUidsByHearingName,
   type HearingDoc,
 } from "./hearingNotifications";
 
@@ -234,12 +234,12 @@ export async function syncClientHearingInboxForUid(
 
   try {
     const snap = await fetchRecentHearings(db, 120);
+    const profile = userSnap.data() as Record<string, unknown>;
     for (const doc of snap.docs) {
       const d = doc.data() as HearingDoc;
       const cn = asString(d.clientName);
       if (!cn) continue;
-      const uids = await resolveClientUidsByHearingName(db, cn);
-      if (uids.includes(uid)) {
+      if (clientProfileMatchesHearingClientName(profile, cn)) {
         await ingestHearing(doc.id, d);
       }
     }

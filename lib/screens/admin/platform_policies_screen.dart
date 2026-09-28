@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import '../../services/system_settings_service.dart';
 import '../../theme/app_theme.dart';
 
 class PlatformPoliciesScreen extends StatefulWidget {
@@ -63,6 +64,7 @@ class _PlatformPoliciesScreenState extends State<PlatformPoliciesScreen> {
         'privacyPolicy': _privacyController.text,
         'updatedAt': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
+      SystemSettingsService.instance.invalidate();
 
       if (mounted) {
         Get.snackbar(
@@ -91,7 +93,7 @@ class _PlatformPoliciesScreenState extends State<PlatformPoliciesScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F4F4),
+      backgroundColor: AppTheme.lightGray,
       appBar: AppBar(
         title: Text(
           'Platform Policies',

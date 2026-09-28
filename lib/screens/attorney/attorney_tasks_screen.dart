@@ -4,6 +4,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../services/task_service.dart';
 import '../../models/task_model.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/task_priority.dart';
 import '../../pages/case/case_detail_page.dart';
 import 'attorney_create_task_screen.dart';
 import 'attorney_task_detail_screen.dart';
@@ -30,7 +31,7 @@ class _AttorneyTasksScreenState extends State<AttorneyTasksScreen> {
     return Scaffold(
       backgroundColor: AppTheme.lightGray,
       appBar: AppBar(
-        title: const Text('Tasks'),
+        title: const Text('Staff Tasks'),
         backgroundColor: AppTheme.royalBlue,
         foregroundColor: Colors.white,
         actions: [
@@ -52,7 +53,7 @@ class _AttorneyTasksScreenState extends State<AttorneyTasksScreen> {
                 );
               }
             },
-            tooltip: 'Create Task',
+            tooltip: 'New Staff Task',
           ),
           PopupMenuButton<String>(
             icon: const Icon(Icons.filter_list),
@@ -77,8 +78,9 @@ class _AttorneyTasksScreenState extends State<AttorneyTasksScreen> {
             ? _taskService.getAttorneyTasks(user.uid)
             : _taskService.getAttorneyTasksByStatus(user.uid, _selectedFilter),
         builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
+          if (snapshot.connectionState == ConnectionState.waiting &&
+              !snapshot.hasData) {
+            return const SizedBox.shrink();
           }
 
           if (snapshot.hasError) {
@@ -104,37 +106,8 @@ class _AttorneyTasksScreenState extends State<AttorneyTasksScreen> {
                   Icon(Icons.task_outlined, size: 64, color: Colors.grey),
                   const SizedBox(height: 16),
                   Text(
-                    'No tasks created yet',
+                    'No staff tasks yet',
                     style: TextStyle(fontSize: 18, color: Colors.grey),
-                  ),
-                  const SizedBox(height: 24),
-                  ElevatedButton.icon(
-                    onPressed: () async {
-                      final result = await Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => const AttorneyCreateTaskScreen(),
-                        ),
-                      );
-                      if (result == true && mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text('✅ Task created successfully!'),
-                            backgroundColor: Colors.green,
-                          ),
-                        );
-                      }
-                    },
-                    icon: const Icon(Icons.add_task),
-                    label: const Text('Create Your First Task'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: AppTheme.royalBlue,
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 24,
-                        vertical: 12,
-                      ),
-                    ),
                   ),
                 ],
               ),
@@ -383,35 +356,9 @@ class _AttorneyTasksScreenState extends State<AttorneyTasksScreen> {
     );
   }
 
-  String _getPriorityLabel(int? priority) {
-    switch (priority) {
-      case 1:
-        return 'Urgent';
-      case 2:
-        return 'High';
-      case 3:
-        return 'Normal';
-      case 4:
-        return 'Low';
-      default:
-        return 'Normal';
-    }
-  }
+  String _getPriorityLabel(int? priority) => TaskPriority.label(priority);
 
-  Color _getPriorityColor(int? priority) {
-    switch (priority) {
-      case 1:
-        return Colors.orange; // Professional warning color for urgent
-      case 2:
-        return Colors.orange;
-      case 3:
-        return AppTheme.royalBlue;
-      case 4:
-        return Colors.grey;
-      default:
-        return AppTheme.royalBlue;
-    }
-  }
+  Color _getPriorityColor(int? priority) => TaskPriority.color(priority);
 
   String _getStatusLabel(String status) {
     switch (status) {

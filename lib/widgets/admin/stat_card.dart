@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../../theme/app_theme.dart';
+
 class StatCard extends StatelessWidget {
   final String title;
   final String value;
@@ -28,121 +30,146 @@ class StatCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final radius = BorderRadius.circular(12);
-    final content = Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: backgroundColor ?? Colors.white,
-        borderRadius: radius,
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.05),
-            blurRadius: 8,
-            offset: const Offset(0, 2),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          // Icon and Title Row
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: iconBackgroundColor ?? iconColor.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Icon(icon, color: iconColor, size: 18),
-              ),
-              if (percentageChange != null)
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 6,
-                    vertical: 3,
-                  ),
-                  decoration: BoxDecoration(
-                    color: isPositiveChange
-                        ? Colors.green.withOpacity(0.1)
-                        : Colors.red.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        isPositiveChange
-                            ? Icons.arrow_upward
-                            : Icons.arrow_downward,
-                        size: 10,
-                        color: isPositiveChange ? Colors.green : Colors.red,
-                      ),
-                      const SizedBox(width: 2),
-                      Text(
-                        percentageChange!,
-                        style: TextStyle(
-                          fontSize: 10,
-                          fontWeight: FontWeight.w600,
-                          color: isPositiveChange ? Colors.green : Colors.red,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          // Title
-          Text(
-            title,
-            style: TextStyle(
-              fontSize: 11,
-              color: const Color(0xFF6D6D6D),
-              fontWeight: FontWeight.w500,
-            ),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          const SizedBox(height: 3),
-          // Value
-          Text(
-            value,
-            style: TextStyle(
-              fontSize: 22,
-              fontWeight: FontWeight.bold,
-              color: const Color(0xFF1C1C1C),
-            ),
-          ),
-          if (description != null) ...[
-            const SizedBox(height: 2),
-            Text(
+    final compact = MediaQuery.sizeOf(context).width < 800;
+    final radius = BorderRadius.circular(compact ? 14 : 16);
+
+    Widget card({required bool fill}) {
+      final descriptionText = description == null
+          ? null
+          : Text(
               description!,
               style: TextStyle(
-                fontSize: 9,
-                color: const Color(0xFF6D6D6D),
+                fontSize: compact ? 10 : 11,
+                color: AppTheme.mutedText,
+                height: 1.2,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            );
+
+      return Container(
+        width: fill ? double.infinity : null,
+        height: fill ? double.infinity : null,
+        padding: EdgeInsets.fromLTRB(
+          compact ? 12 : 14,
+          compact ? 10 : 12,
+          compact ? 12 : 14,
+          compact ? 8 : 10,
+        ),
+        decoration: BoxDecoration(
+          color: backgroundColor ?? AppTheme.pastelBlueGray,
+          borderRadius: radius,
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.05),
+              blurRadius: compact ? 8 : 12,
+              offset: const Offset(0, 3),
+            ),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: fill ? MainAxisSize.max : MainAxisSize.min,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Container(
+                  padding: iconBackgroundColor == null
+                      ? EdgeInsets.zero
+                      : EdgeInsets.all(compact ? 6 : 8),
+                  decoration: iconBackgroundColor == null
+                      ? null
+                      : BoxDecoration(
+                          color: iconBackgroundColor,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                  child: Icon(icon, color: iconColor, size: compact ? 18 : 20),
+                ),
+                if (percentageChange != null)
+                  Container(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: compact ? 6 : 8,
+                      vertical: compact ? 2 : 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: isPositiveChange
+                          ? AppTheme.successSoft
+                          : const Color(0xFFFEE2E2),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      percentageChange!,
+                      style: TextStyle(
+                        fontSize: compact ? 10 : 11,
+                        fontWeight: FontWeight.w600,
+                        color: isPositiveChange
+                            ? AppTheme.success
+                            : const Color(0xFFDC2626),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            SizedBox(height: compact ? 6 : 8),
+            FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Text(
+                value,
+                style: TextStyle(
+                  fontSize: compact ? 22 : 26,
+                  fontWeight: FontWeight.bold,
+                  color: AppTheme.darkText,
+                  height: 1.05,
+                ),
+              ),
+            ),
+            SizedBox(height: compact ? 2 : 4),
+            Text(
+              title,
+              style: TextStyle(
+                fontSize: compact ? 12 : 13,
+                color: AppTheme.darkText,
+                fontWeight: FontWeight.w600,
+                height: 1.2,
               ),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
+            if (descriptionText != null) ...[
+              const SizedBox(height: 2),
+              if (fill)
+                Expanded(
+                  child: Align(
+                    alignment: Alignment.topLeft,
+                    child: descriptionText,
+                  ),
+                )
+              else
+                descriptionText,
+            ],
           ],
-        ],
-      ),
-    );
-
-    if (onTap == null) {
-      return content;
+        ),
+      );
     }
 
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: radius,
-        child: content,
-      ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final fill =
+            constraints.maxHeight.isFinite &&
+            constraints.maxHeight < double.infinity;
+        final content = card(fill: fill);
+        if (onTap == null) return content;
+        return Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: onTap,
+            borderRadius: radius,
+            child: content,
+          ),
+        );
+      },
     );
   }
 }

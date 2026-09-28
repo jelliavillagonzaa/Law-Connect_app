@@ -14,6 +14,7 @@ import '../../services/local_attachment_service.dart';
 import '../../models/task_model.dart';
 import '../../models/case_model.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/task_priority.dart';
 import '../../pages/case/case_detail_page.dart';
 import '../client/chat_screen.dart';
 
@@ -231,7 +232,10 @@ class _AttorneyTaskDetailScreenState extends State<AttorneyTaskDetailScreen> {
                     ),
                   ),
                 ),
-                _buildPriorityChip(priorityLabel, _task!.priority),
+                Flexible(
+                  fit: FlexFit.loose,
+                  child: _buildPriorityChip(priorityLabel, _task!.priority),
+                ),
               ],
             ),
             const SizedBox(height: 12),
@@ -245,26 +249,17 @@ class _AttorneyTaskDetailScreenState extends State<AttorneyTaskDetailScreen> {
             const SizedBox(height: 4),
             Text(_task!.description, style: const TextStyle(fontSize: 14)),
             const SizedBox(height: 16),
-            Row(
-              children: [
-                Expanded(
-                  child: _buildInfoRow(
-                    'Priority',
-                    priorityLabel,
-                    _getPriorityColor(_task!.priority),
-                  ),
-                ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: _buildInfoRow(
-                    'Status',
-                    statusLabel,
-                    _getStatusColor(_task!.status),
-                  ),
-                ),
-              ],
+            _buildInfoRow(
+              'Priority',
+              priorityLabel,
+              _getPriorityColor(_task!.priority),
             ),
-            const SizedBox(height: 12),
+            _buildInfoRow(
+              'Status',
+              statusLabel,
+              _getStatusColor(_task!.status),
+            ),
+            const SizedBox(height: 4),
             if (_task!.dueDate != null)
               _buildInfoRow(
                 'Due Date',
@@ -785,26 +780,29 @@ class _AttorneyTaskDetailScreenState extends State<AttorneyTaskDetailScreen> {
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          SizedBox(
-            width: 120,
-            child: Text(
-              '$label:',
-              style: TextStyle(
-                fontWeight: FontWeight.bold,
-                color: Colors.grey[700],
-                fontSize: 14,
-              ),
+          Text(
+            '$label:',
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              color: Colors.grey[700],
+              fontSize: 14,
             ),
           ),
-          Expanded(
+          const SizedBox(width: 8),
+          Flexible(
             child: Text(
               value,
               style: TextStyle(
                 fontSize: 14,
                 color: valueColor ?? Colors.black87,
+                fontWeight:
+                    valueColor != null ? FontWeight.w600 : FontWeight.normal,
               ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              softWrap: false,
             ),
           ),
         ],
@@ -816,45 +814,23 @@ class _AttorneyTaskDetailScreenState extends State<AttorneyTaskDetailScreen> {
     return Chip(
       label: Text(
         label,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
         style: TextStyle(
           fontSize: 12,
-          color: _getPriorityColor(priority),
           fontWeight: FontWeight.bold,
+          color: _getPriorityColor(priority),
         ),
       ),
+      visualDensity: VisualDensity.compact,
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
       backgroundColor: _getPriorityColor(priority).withOpacity(0.1),
     );
   }
 
-  String _getPriorityLabel(int? priority) {
-    switch (priority) {
-      case 1:
-        return 'Urgent';
-      case 2:
-        return 'High';
-      case 3:
-        return 'Normal';
-      case 4:
-        return 'Low';
-      default:
-        return 'Normal';
-    }
-  }
+  String _getPriorityLabel(int? priority) => TaskPriority.label(priority);
 
-  Color _getPriorityColor(int? priority) {
-    switch (priority) {
-      case 1:
-        return Colors.red;
-      case 2:
-        return Colors.orange;
-      case 3:
-        return Colors.blue;
-      case 4:
-        return Colors.green;
-      default:
-        return Colors.grey;
-    }
-  }
+  Color _getPriorityColor(int? priority) => TaskPriority.color(priority);
 
   String _getStatusLabel(String status) {
     switch (status) {
@@ -934,7 +910,7 @@ class _AttorneyTaskDetailScreenState extends State<AttorneyTaskDetailScreen> {
     final descriptionController = TextEditingController(
       text: _task!.description,
     );
-    String? selectedPriority = _task!.priority?.toString();
+    String? selectedPriority = TaskPriority.coerce(_task!.priority).toString();
     DateTime? selectedDueDate = _task!.dueDate;
 
     final result = await showDialog<bool>(
@@ -970,7 +946,6 @@ class _AttorneyTaskDetailScreenState extends State<AttorneyTaskDetailScreen> {
                     border: OutlineInputBorder(),
                   ),
                   items: const [
-                    DropdownMenuItem(value: '1', child: Text('Urgent')),
                     DropdownMenuItem(value: '2', child: Text('High')),
                     DropdownMenuItem(value: '3', child: Text('Normal')),
                     DropdownMenuItem(value: '4', child: Text('Low')),

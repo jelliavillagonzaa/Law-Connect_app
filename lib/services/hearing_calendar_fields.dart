@@ -2,14 +2,31 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
 
 import '../utils/hearing_notification_formatter.dart';
+import '../utils/out_of_system_notice.dart';
 import 'court_notice_rule_extractor.dart';
+import 'hearing_notification_fanout_service.dart';
+import 'hearing_party_names.dart';
 
 /// Maps a Firestore `hearings` document into calendar UI / `calendar_events` fields.
 class HearingCalendarFields {
+  /// n8n / Firestore may store `caseNo` as int (5297). Never `as String?`.
+  static String asDisplayString(dynamic v) {
+    if (v == null) return '';
+    if (v is String) return v.trim();
+    if (v is num) return v.toString();
+    if (v is bool) return v.toString();
+    if (v is Timestamp) {
+      return DateFormat('MMMM d, yyyy').format(v.toDate());
+    }
+    if (v is DateTime) return DateFormat('MMMM d, yyyy').format(v);
+    return v.toString().trim();
+  }
+
   /// Coerces Firestore `hearingDate` / `hearingTime` (String or Timestamp) for parsing.
   static String hearingFieldAsString(Map<String, dynamic> hd, String key) {
     final v = hd[key];
     if (v is String) return v.trim();
+    if (v is num) return v.toString();
     if (v is Timestamp) {
       if (key == 'hearingTime') {
         return DateFormat('h:mm a').format(v.toDate());
@@ -291,12 +308,17 @@ class HearingCalendarFields {
     return best ?? '';
   }
 
+  static String _capExtractBlob(String text, [int max = 12000]) {
+    if (text.length <= max) return text;
+    return text.substring(0, max);
+  }
+
   static String _caseTitleFromOrderText(Map<String, dynamic> hd) {
-    final blob = [
+    final blob = _capExtractBlob([
       (hd['fullText'] as String?)?.trim() ?? '',
       (hd['message'] as String?)?.trim() ?? '',
       (hd['summary'] as String?)?.trim() ?? '',
-    ].join('\n');
+    ].join('\n'), 4000);
     if (blob.isEmpty) return '';
 
     for (final line in blob.split('\n')) {
@@ -344,19 +366,28 @@ class HearingCalendarFields {
       }
     }
     final caseNo = (hd['caseNo'] as String?)?.trim() ?? '';
-    if (caseNo.isEmpty) return null;
-    final norm = caseNo.toLowerCase().replaceAll(RegExp(r'\s+'), '');
-    for (final c in caseMaps) {
-      for (final field in [
-        'caseNumber',
-        'caseNo',
-        'docketNumber',
-        'criminalCaseNo',
-      ]) {
-        final raw = (c[field] as String?)?.trim() ?? '';
-        if (raw.isEmpty) continue;
-        final v = raw.toLowerCase().replaceAll(RegExp(r'\s+'), '');
-        if (v == norm || v.contains(norm) || norm.contains(v)) return c;
+    if (caseNo.isNotEmpty) {
+      for (final c in caseMaps) {
+        if (HearingNotificationFanoutService.caseMapMatchesHearing(
+          c,
+          caseNo,
+          hd,
+        )) {
+          return c;
+        }
+      }
+    }
+
+    final clientName = fieldAsDisplayString(hd, 'clientName');
+    if (clientName.isNotEmpty) {
+      final target = clientName.toLowerCase();
+      for (final c in caseMaps) {
+        for (final field in ['clientName', 'clientFullName']) {
+          final stored = fieldAsDisplayString(c, field);
+          if (stored.isNotEmpty && stored.toLowerCase() == target) {
+            return c;
+          }
+        }
       }
     }
     return null;
@@ -389,6 +420,7 @@ class HearingCalendarFields {
     }
     final v = m[key];
     if (v is String) return v.trim();
+    if (v is num) return v.toString();
     if (v is Timestamp) return hearingFieldAsString(m, key);
     if (v is DateTime) {
       if (key == 'hearingTime') {
@@ -396,7 +428,7 @@ class HearingCalendarFields {
       }
       return DateFormat('MMMM d, yyyy').format(v);
     }
-    return '';
+    return asDisplayString(v);
   }
 
   static String _pickBestString(
@@ -453,7 +485,8 @@ class HearingCalendarFields {
       rawList.add(linked);
     }
 
-    final out = Map<String, dynamic>.from(rawList.first);
+    final anchor = Map<String, dynamic>.from(rawList.first);
+    final out = Map<String, dynamic>.from(anchor);
     for (final key in HearingNotificationFormatter.calendarHearingKeys.keys) {
       if (key == 'caseTitle') continue;
       final best = _pickBestString(key, rawList);
@@ -464,12 +497,34 @@ class HearingCalendarFields {
     if (linked != null) {
       final cn = (linked['caseNo'] as String?)?.trim() ??
           (linked['caseNumber'] as String?)?.trim();
-      if (cn != null && cn.isNotEmpty) out['caseNo'] = cn;
+      if (cn != null &&
+          cn.isNotEmpty &&
+          fieldAsDisplayString(anchor, 'caseNo').isEmpty) {
+        out['caseNo'] = cn;
+      }
       final client = (linked['clientName'] as String?)?.trim() ??
           (linked['clientFullName'] as String?)?.trim();
-      if (client != null && client.isNotEmpty) out['clientName'] = client;
+      if (client != null &&
+          client.isNotEmpty &&
+          fieldAsDisplayString(anchor, 'clientName').isEmpty) {
+        out['clientName'] = client;
+      }
       final branch = (linked['courtBranch'] as String?)?.trim();
-      if (branch != null && branch.isNotEmpty) out['courtBranch'] = branch;
+      if (branch != null &&
+          branch.isNotEmpty &&
+          fieldAsDisplayString(anchor, 'courtBranch').isEmpty) {
+        out['courtBranch'] = branch;
+      }
+    }
+
+    for (final key in [
+      'caseNo',
+      'clientName',
+      'hearingDate',
+      'hearingTime',
+    ]) {
+      final v = fieldAsDisplayString(anchor, key);
+      if (v.isNotEmpty) out[key] = v;
     }
 
     applyResolvedCaseTitle(
@@ -482,7 +537,285 @@ class HearingCalendarFields {
     final venue = resolveVenueForDisplay(out);
     if (venue.isNotEmpty) out['location'] = venue;
 
+    fillStructuredFieldsFromOrderText(out);
     return out;
+  }
+
+  /// Fills Case No, title, client, time, location, date, summary from OCR / order text.
+  static void fillStructuredFieldsFromOrderText(Map<String, dynamic> out) {
+    final summaryNow = fieldAsDisplayString(out, 'summary');
+    if (fieldAsDisplayString(out, 'caseNo').isNotEmpty &&
+        fieldAsDisplayString(out, 'clientName').isNotEmpty &&
+        fieldAsDisplayString(out, 'hearingDate').isNotEmpty &&
+        summaryNow.isNotEmpty &&
+        !summaryLooksCutOff(summaryNow) &&
+        fieldAsDisplayString(out, 'fullText').isNotEmpty) {
+      return;
+    }
+
+    final blob = _capExtractBlob([
+      out['fullText'],
+      out['message'],
+      out['summary'],
+      out['description'],
+      out['body'],
+    ].whereType<Object>().map((e) => '$e').join('\n').trim());
+    if (blob.length < 40) return;
+
+    if ((out['fullText'] as String?)?.trim().isEmpty != false) {
+      if (_isCourtOrderText(blob)) out['fullText'] = blob;
+    }
+
+    void putIfEmpty(String key, String value) {
+      final v = value.trim();
+      if (v.isEmpty) return;
+      if (fieldAsDisplayString(out, key).isEmpty) out[key] = v;
+    }
+
+    if (fieldAsDisplayString(out, 'caseNo').isEmpty) {
+      putIfEmpty('caseNo', extractCaseNoFromOrderText(blob));
+    }
+    if (fieldAsDisplayString(out, 'caseTitle').isEmpty) {
+      putIfEmpty('caseTitle', extractCaseTitleFromOrderText(blob));
+    }
+    if (fieldAsDisplayString(out, 'clientName').isEmpty) {
+      putIfEmpty(
+        'clientName',
+        extractClientFromOrderText(
+          blob,
+          fieldAsDisplayString(out, 'caseTitle'),
+        ),
+      );
+    }
+    if (fieldAsDisplayString(out, 'hearingDate').isEmpty) {
+      putIfEmpty('hearingDate', extractHearingDateFromOrderText(blob));
+    }
+    if (fieldAsDisplayString(out, 'hearingTime').isEmpty) {
+      putIfEmpty('hearingTime', extractHearingTimeFromOrderText(blob));
+    }
+    if (fieldAsDisplayString(out, 'location').isEmpty) {
+      putIfEmpty(
+        'location',
+        extractLocationFromOrderText(
+          blob,
+          fieldAsDisplayString(out, 'courtBranch'),
+        ),
+      );
+    }
+    putIfEmpty('courtBranch', fieldAsDisplayString(out, 'location'));
+
+    final existingSummary = fieldAsDisplayString(out, 'summary');
+    final ft = fieldAsDisplayString(out, 'fullText');
+    if (existingSummary.isEmpty ||
+        existingSummary.length > 420 ||
+        summaryLooksCutOff(existingSummary) ||
+        (ft.isNotEmpty && existingSummary == ft)) {
+      final summary = extractSummaryFromOrderText(blob);
+      if (summary.isNotEmpty) out['summary'] = summary;
+    }
+  }
+
+  static String extractCaseNoFromOrderText(String text) {
+    final patterns = [
+      RegExp(
+        r'((?:spec(?:ial)?\.?\s*case\s*no\.?\s*)[A-Za-z0-9\-_/]+)',
+        caseSensitive: false,
+      ),
+      RegExp(
+        r'(civil\s*case\s*no\.?\s*[A-Za-z0-9\-_/]+)',
+        caseSensitive: false,
+      ),
+      RegExp(
+        r'(criminal\s*case\s*no\.?\s*[A-Za-z0-9\-_/]+)',
+        caseSensitive: false,
+      ),
+      RegExp(
+        r'case\s*(?:no\.?|number|#)\s*[:\s]*([A-Za-z0-9\-_/]+)',
+        caseSensitive: false,
+      ),
+    ];
+    for (final re in patterns) {
+      final m = re.firstMatch(text);
+      if (m != null) {
+        final raw = (m.group(1) ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
+        if (raw.isNotEmpty) {
+          if (raw.toLowerCase().startsWith('spec') ||
+              raw.toLowerCase().contains('case')) {
+            return raw;
+          }
+          return 'Case No. $raw';
+        }
+      }
+    }
+    return '';
+  }
+
+  static String extractCaseTitleFromOrderText(String text) {
+    text = _capExtractBlob(text);
+    final fromLines = _caseTitleFromOrderText({'fullText': text});
+    if (fromLines.isNotEmpty) return fromLines;
+    final vs = RegExp(
+      r"([A-Z][A-Za-z0-9.,'’&\-\s]{3,80}?)\s+(?:vs\.?|versus)\s+([A-Z][A-Za-z0-9.,'’&\-\s]{3,120})",
+    ).firstMatch(text);
+    if (vs != null) {
+      final right = vs.group(2)!.trim().replaceAll(RegExp(r'[.,;]+$'), '');
+      return '${vs.group(1)!.trim()} vs. $right';
+    }
+    final heirs = RegExp(
+      r'(HEIRS OF [A-Z][A-Z\s.,\-]+?)(?:\n|Namely|Plaintiff)',
+      caseSensitive: false,
+    ).firstMatch(text);
+    if (heirs != null) {
+      return heirs.group(1)!.replaceAll(RegExp(r'\s+'), ' ').trim();
+    }
+    final phCaption = RegExp(
+      r'([A-Z][A-Za-z0-9.,\s\-]+?)\s*,?\s*Plaintiffs?\s*,?\s*[-–]?\s*versus',
+      caseSensitive: false,
+    ).firstMatch(text);
+    if (phCaption != null) {
+      return phCaption.group(1)!.replaceAll(RegExp(r'\s+'), ' ').trim();
+    }
+    return '';
+  }
+
+  /// Splits OCR / court `clientName` blobs into individual party names.
+  static List<String> splitHearingPartyNames(String raw) =>
+      HearingPartyNames.split(raw);
+
+  static String extractClientFromOrderText(String text, String caseTitle) {
+    final vsLeft = caseTitle.contains(' vs.')
+        ? caseTitle
+            .split(RegExp(r'\s+vs\.?\s+', caseSensitive: false))
+            .first
+            .trim()
+        : '';
+    final petitioner = RegExp(
+      r'(?:petitioner|plaintiff|applicant)\s*[:\-]\s*([^\n]{3,400})',
+      caseSensitive: false,
+    ).firstMatch(text);
+    final petitionerText = petitioner?.group(1)?.trim() ?? '';
+    final heirs = RegExp(
+      r'(HEIRS OF [A-Z][A-Z\s.,&\-]+?)(?:\n|Namely|Plaintiff)',
+      caseSensitive: false,
+    ).firstMatch(text);
+    final heirsText =
+        heirs?.group(1)?.replaceAll(RegExp(r'\s+'), ' ').trim() ?? '';
+
+    String pickRichest(List<String> candidates) {
+      var best = '';
+      for (final c in candidates) {
+        final t = c.trim();
+        if (t.isEmpty) continue;
+        if (splitHearingPartyNames(t).length > splitHearingPartyNames(best).length) {
+          best = t;
+          continue;
+        }
+        if (best.isEmpty || t.length > best.length) best = t;
+      }
+      return best;
+    }
+
+    return pickRichest([heirsText, petitionerText, vsLeft]);
+  }
+
+  static String extractHearingDateFromOrderText(String text) {
+    final reset = RegExp(
+      '(?:reset|set|schedul\\w*|next hearing)\\b[^\\n.]{0,80}?\\bon\\s+'
+      '(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\\.?\\s+'
+      r'(\d{1,2}),?\s+(\d{4})',
+      caseSensitive: false,
+    ).firstMatch(text);
+    if (reset != null) {
+      return _monthPhrase(reset.group(1)!, reset.group(2)!, reset.group(3)!);
+    }
+    final m = RegExp(
+      r'(?:on\s+)?(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})',
+      caseSensitive: false,
+    ).firstMatch(text);
+    if (m == null) return '';
+    return '${m.group(1)} ${m.group(2)}, ${m.group(3)}';
+  }
+
+  static String extractHearingTimeFromOrderText(String text) {
+    final clock = RegExp(
+      r"(\d{1,2}:\d{2})\s*(?:o['’]?clock\s+)?(?:in the morning|in the afternoon|a\.?m\.?|p\.?m\.?)",
+      caseSensitive: false,
+    ).firstMatch(text);
+    if (clock != null) return clock.group(0)!.replaceAll(RegExp(r'\s+'), ' ').trim();
+    final at = RegExp(
+      r'at\s+(\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?)',
+      caseSensitive: false,
+    ).firstMatch(text);
+    return at?.group(1)?.trim() ?? '';
+  }
+
+  static String extractLocationFromOrderText(String text, String fallback) {
+    final branch = RegExp(
+      r'branch\s*(\d+)(?:\s*[-–]\s*([A-Za-z .]+))?',
+      caseSensitive: false,
+    ).firstMatch(text);
+    final rtc = RegExp(
+      r'(regional trial court[^\n,]{0,80})',
+      caseSensitive: false,
+    ).firstMatch(text);
+    final region = RegExp(
+      r'(\d+(?:st|nd|rd|th)\s+judicial region)',
+      caseSensitive: false,
+    ).firstMatch(text);
+    final city = branch?.group(2)?.trim() ?? '';
+    final parts = <String>[];
+    if (branch != null) parts.add('Branch ${branch.group(1)}');
+    if (rtc != null) {
+      var court = rtc.group(1)!.replaceAll(RegExp(r'\s+'), ' ').trim();
+      if (region != null && !court.toLowerCase().contains('judicial')) {
+        court = '$court, ${region.group(1)}';
+      }
+      if (city.isNotEmpty && !court.toLowerCase().contains(city.toLowerCase())) {
+        court = '$court, $city';
+      }
+      if (parts.isNotEmpty) return '${parts.first} — $court';
+      return court;
+    }
+    if (parts.isNotEmpty) {
+      if (city.isNotEmpty) return '${parts.first} — $city';
+      return fallback.isNotEmpty ? fallback : parts.first;
+    }
+    return fallback;
+  }
+
+  /// True when a stored summary was sliced mid-word (`…` / `...`).
+  static bool summaryLooksCutOff(String summary) {
+    final t = summary.trim();
+    return t.endsWith('…') || t.endsWith('...') || t.endsWith('..');
+  }
+
+  static String extractSummaryFromOrderText(String text) {
+    final wherefore = RegExp(r'WHEREFORE\b', caseSensitive: false).firstMatch(text);
+    if (wherefore != null) {
+      var chunk = text.substring(wherefore.start);
+      final stop = RegExp(
+        r'\b(?:SO ORDERED|Page\s+\d+)\b',
+        caseSensitive: false,
+      ).firstMatch(chunk);
+      if (stop != null && stop.start > 15) {
+        chunk = chunk.substring(0, stop.start);
+      }
+      chunk = chunk.replaceAll(RegExp(r'\s+'), ' ').trim();
+      const max = 420;
+      if (chunk.length > max) {
+        final dot = chunk.lastIndexOf('.', max);
+        if (dot >= 40) chunk = chunk.substring(0, dot + 1).trim();
+      }
+      return chunk;
+    }
+    final reset = RegExp(
+      r'(?:reset|set|scheduled)[\s\S]{10,280}?(?:morning|afternoon|a\.m\.|p\.m\.)',
+      caseSensitive: false,
+    ).firstMatch(text);
+    if (reset != null) {
+      return reset.group(0)!.replaceAll(RegExp(r'\s+'), ' ').trim();
+    }
+    return '';
   }
 
   static String? _groupKeyForRow(Map<String, dynamic> r) {
@@ -740,25 +1073,205 @@ class HearingCalendarFields {
     };
   }
 
+  static const _monthNumbers = {
+    'january': 1,
+    'jan': 1,
+    'february': 2,
+    'feb': 2,
+    'march': 3,
+    'mar': 3,
+    'april': 4,
+    'apr': 4,
+    'may': 5,
+    'june': 6,
+    'jun': 6,
+    'july': 7,
+    'jul': 7,
+    'august': 8,
+    'aug': 8,
+    'september': 9,
+    'sept': 9,
+    'sep': 9,
+    'october': 10,
+    'oct': 10,
+    'november': 11,
+    'nov': 11,
+    'december': 12,
+    'dec': 12,
+  };
+
+  static String _monthPhrase(String month, String day, String year) {
+    final n = _monthNumbers[month.toLowerCase().replaceAll('.', '')];
+    const names = [
+      '',
+      'January',
+      'February',
+      'March',
+      'April',
+      'May',
+      'June',
+      'July',
+      'August',
+      'September',
+      'October',
+      'November',
+      'December',
+    ];
+    if (n == null) return '$month $day, $year';
+    return '${names[n]} $day, $year';
+  }
+
+  static const _monthToken =
+      r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)';
+
+  /// Year for OCR lines that say "October 28" with no year.
+  static DateTime _yearHint(Map<String, dynamic> hd) {
+    final created = hd['createdAt'];
+    if (created is Timestamp) return created.toDate();
+    if (created is DateTime) return created;
+    final updated = hd['updatedAt'];
+    if (updated is Timestamp) return updated.toDate();
+    if (updated is DateTime) return updated;
+    return DateTime.now();
+  }
+
+  static DateTime _dayWithHint(int month, int day, DateTime hint) {
+    var candidate = DateTime(hint.year, month, day);
+    if (candidate.isBefore(hint.subtract(const Duration(days: 60)))) {
+      candidate = DateTime(hint.year + 1, month, day);
+    }
+    return candidate;
+  }
+
+  /// Date the order actually sets ("reset the pre-trial on October 28"),
+  /// not the signing line ("Done in open court this 8th day of September").
+  static DateTime? nextSetHearingDate(Map<String, dynamic> hd) {
+    final blobs = <String>[
+      hearingFieldAsString(hd, 'hearingDate'),
+      hearingFieldAsString(hd, 'fullText'),
+      hearingFieldAsString(hd, 'message'),
+      hearingFieldAsString(hd, 'summary'),
+      hearingFieldAsString(hd, 'hearingTime'),
+    ];
+    final withYear = RegExp(
+      '(?:reset|set|schedul\\w*|next hearing)\\b[^\\n.]{0,80}?\\bon\\s+'
+      '$_monthToken\\.?\\s+'
+      r'(\d{1,2}),?\s+(\d{4})',
+      caseSensitive: false,
+    );
+    final withoutYear = RegExp(
+      '(?:reset|set|schedul\\w*|next hearing|hearing)\\b[^\\n.]{0,80}?\\bon\\s+'
+      '$_monthToken\\.?\\s+'
+      r'(\d{1,2})(?!\s*,?\s*\d{4})',
+      caseSensitive: false,
+    );
+    final hint = _yearHint(hd);
+    for (final blob in blobs) {
+      if (blob.isEmpty) continue;
+      final dated = withYear.firstMatch(blob);
+      if (dated != null) {
+        final phrase = _monthPhrase(dated.group(1)!, dated.group(2)!, dated.group(3)!);
+        final day = _parseHearingDateString(phrase);
+        if (day != null) {
+          final window = blob.substring(
+            dated.end,
+            (dated.end + 48) > blob.length ? blob.length : dated.end + 48,
+          );
+          return _clockOnDay(day, window);
+        }
+      }
+      final loose = withoutYear.firstMatch(blob);
+      if (loose != null) {
+        final month = _monthNumbers[loose.group(1)!.toLowerCase().replaceAll('.', '')];
+        final dayNum = int.tryParse(loose.group(2)!);
+        if (month != null && dayNum != null) {
+          final day = _dayWithHint(month, dayNum, hint);
+          final window = blob.substring(
+            loose.end,
+            (loose.end + 48) > blob.length ? blob.length : loose.end + 48,
+          );
+          return _clockOnDay(day, window);
+        }
+      }
+    }
+    return null;
+  }
+
+  static DateTime _clockOnDay(DateTime day, String window) {
+    final lower = window.toLowerCase();
+    final match = RegExp(r'(\d{1,2})(?::(\d{2}))?').firstMatch(lower);
+    if (match == null) {
+      return DateTime(day.year, day.month, day.day, 8, 30);
+    }
+    var hour = int.tryParse(match.group(1)!) ?? 8;
+    final minute = int.tryParse(match.group(2) ?? '') ?? 0;
+    final afternoon = lower.contains('pm') ||
+        lower.contains('afternoon') ||
+        lower.contains('evening');
+    final morning = lower.contains('am') || lower.contains('morning');
+    if (afternoon && hour < 12) hour += 12;
+    if (morning && hour == 12) hour = 0;
+    return DateTime(day.year, day.month, day.day, hour, minute);
+  }
+
+  /// "{branch} · Hearing {Month D, YYYY}" line used under Order / notice.
+  static String pushHearingWhenLine(Map<String, dynamic> hd) {
+    final branch = hearingFieldAsString(hd, 'courtBranch');
+    final when = nextSetHearingDate(hd);
+    final dateLabel = when != null
+        ? DateFormat('MMMM d, yyyy').format(when)
+        : hearingFieldAsString(hd, 'hearingDate');
+    final kind = _hearingKindLabel(hd);
+    final whenText = dateLabel.isEmpty ? '' : '$kind $dateLabel';
+    return [
+      if (branch.isNotEmpty) branch,
+      if (whenText.isNotEmpty) whenText,
+    ].join(' · ');
+  }
+
+  /// Same locked body as the hearing push. Do not shorten this.
+  static String pushHearingContext(Map<String, dynamic> hd) {
+    return HearingNotificationFormatter.buildPopupBody(hd);
+  }
+
+  static String _hearingKindLabel(Map<String, dynamic> hd) {
+    final blob = [
+      hearingFieldAsString(hd, 'fullText'),
+      hearingFieldAsString(hd, 'summary'),
+      hearingFieldAsString(hd, 'hearingTime'),
+    ].join(' ').toLowerCase();
+    if (blob.contains('pre-trial') || blob.contains('pretrial')) {
+      return 'Pre-trial';
+    }
+    if (blob.contains('arraignment')) return 'Arraignment';
+    if (blob.contains('mediation')) return 'Mediation';
+    return 'Hearing';
+  }
+
   /// Calendar cell date: prefer AI `hearingDate` / `hearingTime` (e.g. April 22 → day 22),
   /// not upload `createdAt` or stale `hearingDateTime`.
   static DateTime? resolveEventDate(Map<String, dynamic> hd) {
     try {
-      final normalized = normalizeHearingDoc(hd);
-      final hearingDateStr = hearingFieldAsString(normalized, 'hearingDate');
+      final reset = nextSetHearingDate(hd);
+      if (reset != null) return reset;
 
+      final normalized = normalizeHearingDoc(hd);
       final fromFields = _scheduleFromHearingFields(normalized);
       if (fromFields != null) return fromFields;
+
+      // Stored hearing timestamp wins over the first date in the OCR blob
+      // (signing lines like "this 8th day of September" used to move rows).
+      final hts = normalized['hearingDateTime'] ??
+          hd['hearingDateTime'] ??
+          hd['eventDate'];
+      if (hts is Timestamp) return hts.toDate();
+      if (hts is DateTime) return hts;
 
       final fromOrderText = _dateFromHearingOrderText(normalized);
       if (fromOrderText != null) return fromOrderText;
 
-      // Do not fall back to createdAt when a hearing date string exists but failed parse.
+      final hearingDateStr = hearingFieldAsString(normalized, 'hearingDate');
       if (hearingDateStr.isNotEmpty) return null;
-
-      final hts = normalized['hearingDateTime'];
-      if (hts is Timestamp) return hts.toDate();
-      if (hts is DateTime) return hts;
 
       final fullText = (hd['fullText'] as String?)?.trim() ?? '';
       if (fullText.isNotEmpty && _isCourtOrderText(fullText)) {
@@ -774,19 +1287,6 @@ class HearingCalendarFields {
         if (parsed != null) return parsed;
       }
 
-      if (isCourtImportRow(hd)) {
-        final created = hd['createdAt'];
-        if (created is Timestamp) return created.toDate();
-        if (created is DateTime) return created;
-      }
-
-      final caseId = (hd['caseId'] as String?)?.trim() ?? '';
-      if (caseId.isNotEmpty) {
-        final created = hd['createdAt'];
-        if (created is Timestamp) return created.toDate();
-        if (created is DateTime) return created;
-      }
-
       return null;
     } catch (_) {
       return resolveEventDateFromHearingDateField(hd);
@@ -798,6 +1298,7 @@ class HearingCalendarFields {
     if (dateStr.isEmpty) return null;
 
     DateTime? day = _parseHearingDateString(dateStr);
+    day ??= _parseMonthDayNoYear(dateStr, _yearHint(hd));
     if (day == null) return null;
 
     final timeStr = hearingFieldAsString(hd, 'hearingTime');
@@ -811,9 +1312,15 @@ class HearingCalendarFields {
       return DateTime(day.year, day.month, day.day, 8, 30);
     }
     var hour = int.tryParse(match.group(1)!) ?? 8;
-    if (lower.contains('pm') && hour < 12) hour += 12;
-    if (lower.contains('am') && hour == 12) hour = 0;
-    return DateTime(day.year, day.month, day.day, hour, 30);
+    final minuteMatch = RegExp(r'(\d{1,2})\s*:\s*(\d{2})').firstMatch(lower);
+    final minute = int.tryParse(minuteMatch?.group(2) ?? '') ?? 30;
+    final afternoon = lower.contains('pm') ||
+        lower.contains('afternoon') ||
+        lower.contains('evening');
+    final morning = lower.contains('am') || lower.contains('morning');
+    if (afternoon && hour < 12) hour += 12;
+    if (morning && hour == 12) hour = 0;
+    return DateTime(day.year, day.month, day.day, hour, minute);
   }
 
   /// Fallback when [resolveEventDate] misses but `hearingDate` string is set.
@@ -882,6 +1389,18 @@ class HearingCalendarFields {
     return null;
   }
 
+  static DateTime? _parseMonthDayNoYear(String dateStr, DateTime hint) {
+    final m = RegExp(
+      r'(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec)\.?\s+(\d{1,2})\b',
+      caseSensitive: false,
+    ).firstMatch(dateStr.replaceAll(RegExp(r'\s+'), ' ').trim());
+    if (m == null) return null;
+    final month = _monthNumbers[m.group(1)!.toLowerCase().replaceAll('.', '')];
+    final day = int.tryParse(m.group(2)!);
+    if (month == null || day == null) return null;
+    return _dayWithHint(month, day, hint);
+  }
+
   /// Parses "on April 22, 2026" style lines from court order OCR text.
   static DateTime? _dateFromHearingOrderText(Map<String, dynamic> hd) {
     final blobs = <String>[
@@ -893,26 +1412,222 @@ class HearingCalendarFields {
     final re = RegExp(
       r'(?i)(?:on\s+)?(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),?\s+(\d{4})',
     );
+    final yearless = RegExp(
+      r'(?i)(?:on\s+)?(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})\b(?!\s*,?\s*\d{4})',
+    );
+    final hint = _yearHint(hd);
     for (final blob in blobs) {
       if (blob.isEmpty) continue;
       final m = re.firstMatch(blob);
-      if (m == null) continue;
-      final phrase = '${m.group(1)} ${m.group(2)}, ${m.group(3)}';
-      final day = _parseHearingDateString(phrase);
-      if (day == null) continue;
-      return _scheduleFromHearingFields({
-        ...hd,
-        'hearingDate': phrase,
-      });
+      if (m != null) {
+        final phrase = '${m.group(1)} ${m.group(2)}, ${m.group(3)}';
+        final day = _parseHearingDateString(phrase);
+        if (day != null) {
+          return _scheduleFromHearingFields({
+            ...hd,
+            'hearingDate': phrase,
+          });
+        }
+      }
+      final loose = yearless.firstMatch(blob);
+      if (loose != null) {
+        final month = _monthNumbers[loose.group(1)!.toLowerCase()];
+        final dayNum = int.tryParse(loose.group(2)!);
+        if (month != null && dayNum != null) {
+          final day = _dayWithHint(month, dayNum, hint);
+          return _scheduleFromHearingFields({
+            ...hd,
+            'hearingDate': DateFormat('MMMM d, yyyy').format(day),
+          });
+        }
+      }
     }
     return null;
   }
 
   static bool isCourtImportRow(Map<String, dynamic> hd) {
-    final cn = (hd['caseNo'] as String?)?.trim() ?? '';
-    final ft = (hd['fullText'] as String?)?.trim() ?? '';
+    final cn = asDisplayString(hd['caseNo']);
+    final ft = asDisplayString(hd['fullText']);
     return cn.isNotEmpty && ft.isNotEmpty;
   }
+
+  static final _legalNoticeToken = RegExp(
+    r'(hearing|court|trial|arraignment|mediation|conference|motion|'
+    r'order|versus|\bvs\b|branch|people|appointment|reminder|calendar|'
+    r'pre-?trial|promulgation|status|inquest|bail|plea|wherefore|'
+    r'spec(?:ial)?\.?\s*case|crim(?:inal)?\.?\s*case)',
+    caseSensitive: false,
+  );
+
+  static final _noticeStopword = RegExp(
+    r'^(hearing|scheduled|updated|message|notice|court|order|event|'
+    r'reminder|calendar|activity|new)$',
+    caseSensitive: false,
+  );
+
+  /// Keyboard-mash / test titles (e.g. sbajshsahxsax) — not a real hearing notice.
+  static bool isGibberishNoticeText(String raw) {
+    final t = raw.trim();
+    if (t.isEmpty) return false;
+    if (_legalNoticeToken.hasMatch(t)) return false;
+    final words = t
+        .split(RegExp(r'[^a-zA-Z0-9]+'))
+        .where((w) => w.isNotEmpty)
+        .toList();
+    if (words.isEmpty) return false;
+    if (words.length == 1 && _isGibberishToken(words.first)) return true;
+    final significant = words
+        .where((w) => w.length >= 8 && !_noticeStopword.hasMatch(w))
+        .toList();
+    if (significant.isEmpty) return false;
+    return significant.every(_isGibberishToken);
+  }
+
+  static bool _isGibberishToken(String raw) {
+    if (RegExp(r'\d').hasMatch(raw)) return false;
+    final s = raw.toLowerCase().replaceAll(RegExp(r'[^a-z]'), '');
+    if (s.length < 8) return false;
+    if (_legalNoticeToken.hasMatch(s)) return false;
+    if (RegExp(r'(.)\1{2,}').hasMatch(s)) return true;
+    if (RegExp(r'(.{2,5})\1').hasMatch(s)) return true;
+    if (!RegExp(r'[aeiou]').hasMatch(s)) return true;
+    if (RegExp(r'[^aeiou]{4,}').hasMatch(s)) return true;
+    return false;
+  }
+
+  /// Promotional / test / misclassified rows (not a court order).
+  static bool isNonCourtHearingSpam(Map<String, dynamic> d) {
+    if (isEatingHearingJunk(d)) return true;
+    if (isOutOfSystemPumpedNotice(d)) return true;
+    final source = '${d['source'] ?? ''}'.toLowerCase();
+    final activity = '${d['activityType'] ?? ''}'.toLowerCase();
+    final fromN8n = source == 'n8n' ||
+        activity == 'court_import' ||
+        source.contains('n8n');
+    final blob = [
+      d['title'],
+      d['caseTitle'],
+      d['summary'],
+      d['fullText'],
+      d['message'],
+      d['subject'],
+      d['description'],
+      d['activityType'],
+      d['body'],
+      d['notes'],
+    ].whereType<Object>().map((e) => '$e'.toLowerCase()).join(' ');
+    final compact = blob.replaceAll(RegExp(r'[^a-z0-9]+'), ' ');
+    if (blob.contains('blasttv') ||
+        blob.contains('voucher code') ||
+        blob.contains('voucher redemption') ||
+        blob.contains('enjoy your 30-day') ||
+        blob.contains('[ai hearing (eating)]') ||
+        blob.contains('hearing (eating)') ||
+        compact.contains('ai hearing eating') ||
+        compact.contains('hearing eating') ||
+        blob.contains('cursor.com') ||
+        blob.contains('cursor.sh') ||
+        blob.contains('cursor team') ||
+        blob.contains('anysphere') ||
+        blob.contains('browser layout editor') ||
+        blob.contains('browser-based layout editor') ||
+        blob.contains('writing and fixing code faster') ||
+        blob.contains('try debug mode') ||
+        blob.contains('changelog/2-2') ||
+        blob.contains('dear developer') ||
+        blob.contains('firebase.google.com')) {
+      return true;
+    }
+    final caseNo = asDisplayString(d['caseNo']);
+    final caseNoKey = caseNo.toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+    final placeholderCaseNo = caseNoKey.isEmpty ||
+        caseNoKey == 'court order' ||
+        caseNoKey == 'court hearing' ||
+        caseNoKey == 'hearing' ||
+        caseNoKey == 'order' ||
+        caseNoKey == 'n/a' ||
+        caseNoKey == 'none';
+    final importedText = asDisplayString(d['fullText']).isNotEmpty
+        ? asDisplayString(d['fullText'])
+        : asDisplayString(d['message']);
+    final importedCourtRow =
+        !placeholderCaseNo && caseNo.isNotEmpty && importedText.isNotEmpty;
+    // Real n8n / court-order import — show unless promo junk above.
+    if (fromN8n && !placeholderCaseNo) return false;
+    if (importedCourtRow) return false;
+    if (placeholderCaseNo) return true;
+    if (_isCourtOrderText(blob) ||
+        blob.contains('regional trial court') ||
+        blob.contains('wherefore') ||
+        blob.contains('so ordered') ||
+        blob.contains('people of the philippines') ||
+        blob.contains('in open court')) {
+      return false;
+    }
+    if (compact.contains('eating') &&
+        !compact.contains('court') &&
+        !compact.contains('branch') &&
+        !compact.contains('versus')) {
+      return true;
+    }
+    final fullText = asDisplayString(d['fullText']);
+    if (fullText.length > 160 && _isCourtOrderText(fullText)) {
+      return false;
+    }
+    final title = [
+      d['title'],
+      d['caseTitle'],
+    ].whereType<Object>().map((e) => '$e'.trim()).firstWhere(
+          (s) => s.isNotEmpty,
+          orElse: () => '',
+        );
+    final body = [
+      d['description'],
+      d['message'],
+      d['summary'],
+      d['body'],
+    ].whereType<Object>().map((e) => '$e'.trim()).firstWhere(
+          (s) => s.isNotEmpty,
+          orElse: () => '',
+        );
+    if (title.isNotEmpty && isGibberishNoticeText(title)) return true;
+    if (body.isNotEmpty && isGibberishNoticeText(body)) return true;
+    return false;
+  }
+
+  /// Test mash like "[AI] Hearing (eating)" — never a real court order.
+  static bool isEatingHearingJunk(Map<String, dynamic> d) {
+    final blob = [
+      d['title'],
+      d['caseTitle'],
+      d['action'],
+      d['details'],
+      d['summary'],
+      d['fullText'],
+      d['message'],
+      d['subject'],
+      d['description'],
+      d['activityType'],
+      d['body'],
+      d['notes'],
+    ].whereType<Object>().map((e) => '$e'.toLowerCase()).join(' ');
+    final compact = blob.replaceAll(RegExp(r'[^a-z0-9]+'), ' ');
+    if (blob.contains('[ai hearing (eating)]') ||
+        blob.contains('hearing (eating)') ||
+        compact.contains('ai hearing eating') ||
+        compact.contains('hearing eating')) {
+      return true;
+    }
+    return compact.contains('eating') &&
+        compact.contains('hearing') &&
+        !compact.contains('court') &&
+        !compact.contains('branch') &&
+        !compact.contains('versus');
+  }
+
+  /// Staff work diary: hide email-ingest test hearings.
+  static bool isJunkWorkLog(Map<String, dynamic> log) =>
+      isEatingHearingJunk(log);
 
   static bool _isCourtOrderText(String text) {
     final t = text.toLowerCase();
@@ -1034,7 +1749,14 @@ class HearingCalendarFields {
       parts.add(t);
     }
 
-    add(clientName);
+    final parties = splitHearingPartyNames(clientName);
+    if (parties.isEmpty) {
+      add(clientName);
+    } else {
+      for (final p in parties) {
+        add(p);
+      }
+    }
     add(caseTitle);
     add(courtBranch);
     add(senderName);

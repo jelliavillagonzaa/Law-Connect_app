@@ -34,13 +34,23 @@ dependencies:
   latlong2: ^0.9.1
   syncfusion_flutter_pdf: ^33.1.44
   path_provider: ^2.1.5
+  open_filex: ^4.7.0
   supabase_flutter: ^2.12.2
   firebase_app_check: ^0.3.2+10
+  google_fonts: ^6.2.1
 
 flutter:
   uses-material-design: true
   assets:
-    - assets/
+    - assets/logo.png
+    - assets/Landingpage.png
+    - assets/data/misamis_occidental_addresses.json
+  fonts:
+    - family: NotoSans
+      fonts:
+        - asset: assets/fonts/NotoSans-Regular.ttf
+        - asset: assets/fonts/NotoSans-Bold.ttf
+          weight: 700
 
 dev_dependencies:
   flutter_test:
@@ -48,10 +58,12 @@ dev_dependencies:
   flutter_lints: ^5.0.0
   flutter_launcher_icons: ^0.13.1
 
-flutter_icons:
+flutter_launcher_icons:
   android: true
   ios: false
-  image_path: "web/icons/logo.png"
+  image_path: "assets/launcher_icon.png"
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "assets/launcher_icon.png"
 
 
 

@@ -8,6 +8,7 @@ import 'email_otp_service.dart';
 import 'sms_service.dart';
 import 'staff_application_service.dart';
 import 'firestore_mirror_helper.dart';
+import 'system_settings_service.dart';
 
 /// Service to handle staff authentication and data retrieval
 /// Staff are stored in 'users' collection with role='staff'
@@ -138,17 +139,18 @@ class StaffAuthService {
       }
 
       final emailOtpService = EmailOtpService();
-      final sent = await emailOtpService.sendOtp(
+      final sent = await emailOtpService.sendOtpDetailed(
         email: trimmedEmail,
         otp: otp,
         name: name.isEmpty ? 'Staff' : name,
       );
 
-      if (!sent) {
+      if (!sent.emailSent) {
         return {
           'success': false,
           'message':
-              'Could not send the code. Check your email settings and try again.',
+              sent.error ??
+              'Could not send the code to Gmail. Check inbox/spam and try again.',
         };
       }
 
@@ -360,13 +362,20 @@ class StaffAuthService {
       // Staff can login directly with the provided password
 
       // Optional: Welcome SMS (best-effort; do not fail staff creation)
-      if (phone != null && phone.trim().isNotEmpty) {
+      final welcomeSettings = await SystemSettingsService.instance.load();
+      if (welcomeSettings.emailNotifications &&
+          phone != null &&
+          phone.trim().isNotEmpty) {
         try {
           final sms = SmsService();
+          final welcome = welcomeSettings.applyTemplate(
+            welcomeSettings.welcomeEmail,
+            'Welcome to Law Connect, $name! Your staff account is ready. Please login using your email.',
+            {'name': name},
+          );
           await sms.queueSms(
             to: phone,
-            body:
-                'Welcome to Law Connect, $name! Your staff account is ready. Please login using your email.',
+            body: welcome,
             userId: staffId,
             meta: {'type': 'welcome', 'role': 'staff'},
           );

@@ -163,7 +163,7 @@ class _BackupSettingsScreenState extends State<BackupSettingsScreen> {
     }
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F4F4),
+      backgroundColor: AppTheme.lightGray,
       appBar: AppBar(
         title: const Text(
           'Backup & Recover',

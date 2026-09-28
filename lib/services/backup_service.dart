@@ -1,6 +1,8 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
+import 'system_settings_service.dart';
+
 /// Pending backup rows + total restored count (same source as the admin Backup UI).
 class BackupUiSnapshot {
   const BackupUiSnapshot({
@@ -65,6 +67,8 @@ class BackupService {
     String? deletedBy,
   }) async {
     try {
+      final settings = await SystemSettingsService.instance.load();
+      if (!settings.autoBackup) return;
       await _firestore.collection('backups').add({
         'collection': collection,
         'documentId': documentId,

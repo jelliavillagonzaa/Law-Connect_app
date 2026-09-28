@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 
 import '../../theme/app_theme.dart';
 import '../../widgets/bottom_navigation_bar_5tabs.dart';
+import '../../widgets/client/client_notification_bell_button.dart';
 
 /// Lightweight placeholder while the full client dashboard library loads on web.
 class ClientDashboardWebShell extends StatelessWidget {
@@ -20,14 +21,8 @@ class ClientDashboardWebShell extends StatelessWidget {
       appBar: AppBar(
         backgroundColor: AppTheme.royalBlue,
         title: const Text('Dashboard'),
-        actions: [
-          IconButton(
-            onPressed: null,
-            icon: Icon(
-              Icons.notifications_outlined,
-              color: Colors.white.withValues(alpha: 0.7),
-            ),
-          ),
+        actions: const [
+          ClientNotificationBellButton(),
         ],
       ),
       body: SafeArea(
@@ -99,26 +94,6 @@ class ClientDashboardWebShell extends StatelessWidget {
                 ],
               ),
               const SizedBox(height: 28),
-              Center(
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: AppTheme.royalBlue.withValues(alpha: 0.8),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Text(
-                      'Loading your dashboard…',
-                      style: TextStyle(color: Colors.grey[600], fontSize: 14),
-                    ),
-                  ],
-                ),
-              ),
             ],
           ),
         ),

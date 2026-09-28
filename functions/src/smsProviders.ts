@@ -1,4 +1,5 @@
 import twilio from "twilio";
+import { sendPhilSms } from "./philsmsClient";
 import {
   sendViaSemaphore,
   sendViaSemaphoreOtp,
@@ -43,6 +44,8 @@ export type SmsProviderConfig = {
   twilioFromNumber: string;
   semaphoreApiKey: string;
   semaphoreSenderName: string;
+  philsmsApiToken?: string;
+  philsmsSenderId?: string;
 };
 
 export type SmsSendOptions = {
@@ -67,8 +70,8 @@ async function sendViaTwilioIfConfigured(
 }
 
 /**
- * Sends SMS via Semaphore when SEMAPHORE_API_KEY is set (Philippines).
- * Twilio is only used when Semaphore is not configured — never as fallback.
+ * Sends SMS via PhilSMS when PHILSMS_API_TOKEN is set, otherwise Semaphore.
+ * Twilio is only used when neither PH provider is configured.
  */
 export async function sendSmsWithConfiguredProviders(
   cfg: SmsProviderConfig,
@@ -81,6 +84,24 @@ export async function sendSmsWithConfiguredProviders(
   providerNetworkStatus?: string;
   providerRawResponse?: string;
 }> {
+  const philToken = (cfg.philsmsApiToken ?? "").trim();
+  if (philToken && !opts?.otpCode?.trim()) {
+    const phil = await sendPhilSms(
+      {
+        apiToken: philToken,
+        senderId: (cfg.philsmsSenderId ?? "").trim() || "PhilSMS",
+      },
+      to,
+      body,
+    );
+    if (phil.ok) {
+      return {
+        provider: "philsms",
+        providerMessageId: "philsms",
+      };
+    }
+  }
+
   const semKey = cfg.semaphoreApiKey.trim();
   if (semKey) {
     const otpCode = opts?.otpCode?.trim();
@@ -124,6 +145,6 @@ export async function sendSmsWithConfiguredProviders(
   if (twilio) return twilio;
 
   throw new Error(
-    "No SMS provider configured. Set SEMAPHORE_API_KEY (recommended for PH) in functions/.env.jurislink-app and deploy onSmsRequestSend.",
+    "No SMS provider configured. Set PHILSMS_API_TOKEN or SEMAPHORE_API_KEY and deploy onSmsRequestSend.",
   );
 }

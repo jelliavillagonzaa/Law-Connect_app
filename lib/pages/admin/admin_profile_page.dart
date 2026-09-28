@@ -62,7 +62,7 @@ class _AdminProfilePageState extends State<AdminProfilePage> {
           children: [
             // Profile Picture
             ProfilePictureWidget(
-              photoUrl: null,
+              photoUrl: _userProfile?['photoUrl'] as String?,
               userName: _isLoading
                   ? 'Admin'
                   : (_userProfile?['name'] ??

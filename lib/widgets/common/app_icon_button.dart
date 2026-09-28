@@ -11,6 +11,8 @@ class AppIconButton extends StatelessWidget {
   final int badgeCount;
   final Color iconColor;
   final Color? backgroundColor;
+  final Color badgeColor;
+  final Color badgeTextColor;
   final double iconSize;
   final EdgeInsetsGeometry? margin;
 
@@ -22,6 +24,8 @@ class AppIconButton extends StatelessWidget {
     this.badgeCount = 0,
     this.iconColor = Colors.white,
     this.backgroundColor,
+    this.badgeColor = Colors.white,
+    this.badgeTextColor = AppTheme.royalBlue,
     this.iconSize = 24,
     this.margin,
   });
@@ -77,15 +81,15 @@ class AppIconButton extends StatelessWidget {
               top: 2,
               child: Container(
                 padding: const EdgeInsets.all(4),
-                decoration: const BoxDecoration(
-                  color: Colors.white,
+                decoration: BoxDecoration(
+                  color: badgeColor,
                   shape: BoxShape.circle,
                 ),
                 constraints: const BoxConstraints(minWidth: 18, minHeight: 18),
                 child: Text(
                   badgeCount > 99 ? '99+' : '$badgeCount',
-                  style: const TextStyle(
-                    color: AppTheme.royalBlue,
+                  style: TextStyle(
+                    color: badgeTextColor,
                     fontSize: 10,
                     fontWeight: FontWeight.bold,
                   ),

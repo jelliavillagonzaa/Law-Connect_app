@@ -7,6 +7,12 @@ import '../../models/case_model.dart';
 import '../../models/user_model.dart';
 import '../../screens/attorney/attorney_create_task_screen.dart';
 import '../../widgets/maps/oroquieta_map_viewer.dart';
+import '../../widgets/case/case_details_download_button.dart';
+import '../../utils/case_details_export.dart';
+import '../../utils/case_status_filter.dart';
+import '../../utils/case_history.dart';
+import '../../utils/case_result.dart';
+import '../../utils/currency.dart';
 import '../../theme/app_theme.dart';
 
 class CaseDetailPage extends StatefulWidget {
@@ -24,10 +30,14 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
   UserModel? _clientUser;
   UserModel? _attorneyUser;
   Map<String, dynamic>? _attorneyProfileData; // Full attorney profile data
+  late Future<CaseModel?> _caseFuture;
+  late final Future<String?> _roleFuture;
 
   @override
   void initState() {
     super.initState();
+    _caseFuture = _caseService.getCase(widget.caseId);
+    _roleFuture = _getUserRole();
     _loadUserInfo();
   }
 
@@ -66,19 +76,49 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
           });
         }
       }
+
+      await _syncOpenCaseFromStaffTasks(caseModel);
     }
   }
 
-  Future<void> _updateCaseStatus(String newStatus) async {
+  /// If an Open case already has a staff task, treat work as started.
+  Future<void> _syncOpenCaseFromStaffTasks(CaseModel caseModel) async {
+    if (!CaseStatusFilter.isOpen(caseModel.status)) return;
+    final existing = await _firestore
+        .collection('tasks')
+        .where('caseId', isEqualTo: caseModel.id)
+        .limit(1)
+        .get();
+    if (existing.docs.isEmpty) return;
+    await _caseService.updateCaseStatus(caseModel.id, 'in_progress');
+    if (!mounted) return;
+    setState(() {
+      _caseFuture = _caseService.getCase(widget.caseId);
+    });
+  }
+
+  Future<void> _updateCaseStatus(
+    String newStatus, {
+    String? caseResult,
+  }) async {
     try {
-      await _caseService.updateCaseStatus(widget.caseId, newStatus);
+      await _caseService.updateCaseStatus(
+        widget.caseId,
+        newStatus,
+        caseResult: caseResult,
+      );
+      final movedClosed = CaseStatusFilter.isCompleted(newStatus);
       Get.snackbar(
         'Success',
-        'Case status updated to $newStatus',
+        movedClosed
+            ? 'Case moved to Closed cases'
+            : 'Case status updated to ${CaseStatusFilter.statusLabel(newStatus)}',
         backgroundColor: Colors.green,
         colorText: Colors.white,
       );
-      setState(() {}); // Refresh
+      setState(() {
+        _caseFuture = _caseService.getCase(widget.caseId);
+      });
     } catch (e) {
       Get.snackbar(
         'Error',
@@ -87,6 +127,65 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
         colorText: Colors.white,
       );
     }
+  }
+
+  Future<void> _confirmCompleteCase() async {
+    String? selected;
+    final result = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setLocal) {
+            return AlertDialog(
+              title: const Text('Mark this case completed?'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'It will leave My Cases and move to Closed cases.',
+                    ),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Result',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    for (final value in CaseResult.values)
+                      RadioListTile<String>(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        title: Text(CaseResult.label(value)),
+                        value: value,
+                        groupValue: selected,
+                        onChanged: (v) => setLocal(() => selected = v),
+                      ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: selected == null
+                      ? null
+                      : () => Navigator.pop(dialogContext, selected),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green,
+                    foregroundColor: Colors.white,
+                  ),
+                  child: const Text('Mark completed'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    if (result == null) return;
+    await _updateCaseStatus('completed', caseResult: result);
   }
 
   Future<String?> _getUserRole() async {
@@ -190,13 +289,31 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
       appBar: AppBar(
         title: const Text('Case Details'),
         actions: [
+          FutureBuilder<CaseModel?>(
+            future: _caseFuture,
+            builder: (context, caseSnapshot) {
+              if (!caseSnapshot.hasData || caseSnapshot.data == null) {
+                return const SizedBox.shrink();
+              }
+              final caseModel = caseSnapshot.data!;
+              return CaseDetailsDownloadButton(
+                exportData: CaseDetailsExportData(
+                  caseModel: caseModel,
+                  clientName: _clientUser?.name,
+                  clientEmail: _clientUser?.email,
+                  attorneyName: _attorneyUser?.name,
+                  attorneyEmail: _attorneyUser?.email,
+                ),
+              );
+            },
+          ),
           FutureBuilder<String?>(
-            future: _getUserRole(),
+            future: _roleFuture,
             builder: (context, roleSnapshot) {
               if (roleSnapshot.hasData) {
                 final role = roleSnapshot.data;
                 return FutureBuilder<CaseModel?>(
-                  future: _caseService.getCase(widget.caseId),
+                  future: _caseFuture,
                   builder: (context, caseSnapshot) {
                     if (caseSnapshot.hasData) {
                       final caseModel = caseSnapshot.data!;
@@ -204,7 +321,8 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
                           role == 'attorney' &&
                           caseModel.attorneyId ==
                               FirebaseAuth.instance.currentUser?.uid;
-                      if (isAttorney || role == 'admin') {
+                      if ((isAttorney || role == 'admin') &&
+                          !CaseStatusFilter.isCompleted(caseModel.status)) {
                         return IconButton(
                           icon: const Icon(Icons.edit),
                           onPressed: _editCaseDetails,
@@ -222,10 +340,10 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
         ],
       ),
       body: FutureBuilder<CaseModel?>(
-        future: _caseService.getCase(widget.caseId),
+        future: _caseFuture,
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
+            return const SizedBox.expand();
           }
 
           if (snapshot.hasError || snapshot.data == null) {
@@ -267,7 +385,9 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
                                 borderRadius: BorderRadius.circular(12),
                               ),
                               child: Text(
-                                caseModel.status.toUpperCase(),
+                                CaseStatusFilter.statusLabel(
+                                  caseModel.status,
+                                ).toUpperCase(),
                                 style: const TextStyle(
                                   color: Colors.white,
                                   fontSize: 12,
@@ -279,6 +399,18 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
                         ),
                         const SizedBox(height: 16),
                         _buildInfoRow('Case Type', caseModel.caseType),
+                        if (caseModel.opposingParty != null &&
+                            caseModel.opposingParty!.trim().isNotEmpty)
+                          _buildInfoRow(
+                            'Opposing Party',
+                            caseModel.opposingParty!,
+                          ),
+                        if (CaseStatusFilter.isCompleted(caseModel.status) &&
+                            CaseResult.label(caseModel.caseResult).isNotEmpty)
+                          _buildInfoRow(
+                            'Result',
+                            CaseResult.label(caseModel.caseResult),
+                          ),
                         _buildInfoRow(
                           'Created',
                           '${caseModel.createdAt.day}/${caseModel.createdAt.month}/${caseModel.createdAt.year}',
@@ -304,7 +436,7 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
                     ),
                   ),
                 ),
-                if (caseModel.progress != null)
+                if (_historyEvents(caseModel).isNotEmpty)
                   Card(
                     child: Padding(
                       padding: const EdgeInsets.all(16),
@@ -312,20 +444,14 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           const Text(
-                            'Progress Updates',
+                            'Case History',
                             style: TextStyle(
                               fontSize: 18,
                               fontWeight: FontWeight.bold,
                             ),
                           ),
-                          const SizedBox(height: 8),
-                          ...caseModel.progress!.entries.map((entry) {
-                            return ListTile(
-                              leading: const Icon(Icons.update),
-                              title: Text(entry.key),
-                              subtitle: Text(entry.value.toString()),
-                            );
-                          }),
+                          const SizedBox(height: 12),
+                          ..._historyEvents(caseModel).map(_buildHistoryRow),
                         ],
                       ),
                     ),
@@ -366,12 +492,21 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
                       ),
                     ),
                   ),
-                // Attorney Additional Details (for clients to view)
-                if (_attorneyUser != null && _attorneyProfileData != null)
-                  _buildAttorneyAdditionalDetails(),
+                // Attorney profile details — clients only
+                FutureBuilder<String?>(
+                  future: _roleFuture,
+                  builder: (context, roleSnapshot) {
+                    if (roleSnapshot.data == 'client' &&
+                        _attorneyUser != null &&
+                        _attorneyProfileData != null) {
+                      return _buildAttorneyAdditionalDetails();
+                    }
+                    return const SizedBox.shrink();
+                  },
+                ),
                 // Status Update and Create Task (for attorneys only, NOT admins)
                 FutureBuilder<String?>(
-                  future: _getUserRole(),
+                  future: _roleFuture,
                   builder: (context, roleSnapshot) {
                     if (roleSnapshot.hasData) {
                       final role = roleSnapshot.data;
@@ -379,117 +514,13 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
                       if (role == 'attorney' &&
                           caseModel.attorneyId ==
                               FirebaseAuth.instance.currentUser?.uid) {
+                        final hasAssignedStaff = _caseHasAssignedStaff(caseModel);
                         return Column(
                           children: [
-                            // Create Task Button
-                            Card(
-                              child: Padding(
-                                padding: const EdgeInsets.all(16),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    const Text(
-                                      'Task Management',
-                                      style: TextStyle(
-                                        fontSize: 18,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 16),
-                                    ElevatedButton.icon(
-                                      onPressed: () async {
-                                        final result = await Navigator.push(
-                                          context,
-                                          MaterialPageRoute(
-                                            builder: (_) =>
-                                                AttorneyCreateTaskScreen(
-                                                  caseId: caseModel.id,
-                                                  caseTitle:
-                                                      caseModel.caseTitle,
-                                                ),
-                                          ),
-                                        );
-                                        if (result == true) {
-                                          // Task created successfully
-                                          Get.snackbar(
-                                            'Success',
-                                            'Task created successfully!',
-                                            backgroundColor: Colors.green,
-                                            colorText: Colors.white,
-                                          );
-                                        }
-                                      },
-                                      icon: const Icon(Icons.add_task),
-                                      label: const Text(
-                                        'Create Task for Staff',
-                                      ),
-                                      style: ElevatedButton.styleFrom(
-                                        backgroundColor: AppTheme.royalBlue,
-                                        foregroundColor: Colors.white,
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 24,
-                                          vertical: 12,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 16),
-                            // Status Update
-                            Card(
-                              child: Padding(
-                                padding: const EdgeInsets.all(16),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    const Text(
-                                      'Update Status',
-                                      style: TextStyle(
-                                        fontSize: 18,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 16),
-                                    Wrap(
-                                      spacing: 8,
-                                      runSpacing: 8,
-                                      children: [
-                                        if (caseModel.status != 'accepted')
-                                          ElevatedButton(
-                                            onPressed: () =>
-                                                _updateCaseStatus('accepted'),
-                                            child: const Text(
-                                              'Mark as Accepted',
-                                            ),
-                                          ),
-                                        if (caseModel.status != 'in_progress')
-                                          ElevatedButton(
-                                            onPressed: () => _updateCaseStatus(
-                                              'in_progress',
-                                            ),
-                                            child: const Text(
-                                              'Mark as In Progress',
-                                            ),
-                                          ),
-                                        if (caseModel.status != 'completed')
-                                          ElevatedButton(
-                                            onPressed: () =>
-                                                _updateCaseStatus('completed'),
-                                            style: ElevatedButton.styleFrom(
-                                              backgroundColor: Colors.green,
-                                            ),
-                                            child: const Text(
-                                              'Mark as Completed',
-                                            ),
-                                          ),
-                                      ],
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
+                            if (!CaseStatusFilter.isCompleted(caseModel.status) &&
+                                !hasAssignedStaff)
+                              _buildCreateTaskCard(caseModel),
+                            ..._buildAttorneyStatusUpdate(caseModel),
                           ],
                         );
                       }
@@ -505,6 +536,165 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
     );
   }
 
+  List<CaseHistoryEvent> _historyEvents(CaseModel caseModel) {
+    return CaseHistory.fromCase(caseModel);
+  }
+
+  Widget _buildHistoryRow(CaseHistoryEvent event) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(top: 2),
+            child: Icon(Icons.circle, size: 10, color: AppTheme.royalBlue),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  event.label,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                if (event.dateLabel.isNotEmpty)
+                  Text(
+                    event.dateLabel,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      color: AppTheme.mutedText,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  bool _caseHasAssignedStaff(CaseModel caseModel) {
+    final staffId = caseModel.staffId?.trim() ?? '';
+    if (staffId.isNotEmpty) return true;
+    final assigned = caseModel.staffAssigned ?? const <String>[];
+    return assigned.any((id) => id.trim().isNotEmpty);
+  }
+
+  Widget _buildCreateTaskCard(CaseModel caseModel) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Task Management',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 16),
+            ElevatedButton.icon(
+              onPressed: () async {
+                final result = await Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => AttorneyCreateTaskScreen(
+                      caseId: caseModel.id,
+                      caseTitle: caseModel.caseTitle,
+                    ),
+                  ),
+                );
+                if (result == true) {
+                  setState(() {
+                    _caseFuture = _caseService.getCase(widget.caseId);
+                  });
+                  Get.snackbar(
+                    'Success',
+                    'Task created successfully!',
+                    backgroundColor: Colors.green,
+                    colorText: Colors.white,
+                  );
+                }
+              },
+              icon: const Icon(Icons.add_task),
+              label: const Text('New Staff Task'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppTheme.royalBlue,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 24,
+                  vertical: 12,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Draft → Open. Open cases move to In progress when a staff task is created.
+  /// Attorney marks completed when the case is done.
+  List<Widget> _buildAttorneyStatusUpdate(CaseModel caseModel) {
+    final status = caseModel.status;
+    if (CaseStatusFilter.isCompleted(status)) {
+      return const [];
+    }
+
+    final String actionLabel;
+    final String nextStatus;
+    if (CaseStatusFilter.isDraft(status)) {
+      actionLabel = 'Open case';
+      nextStatus = CaseStatusFilter.openStoredStatus;
+    } else {
+      actionLabel = 'Mark completed';
+      nextStatus = 'completed';
+    }
+
+    return [
+      const SizedBox(height: 16),
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Case tracking',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Current: ${CaseStatusFilter.statusLabel(status)}',
+                style: TextStyle(color: Colors.grey[700]),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton(
+                onPressed: nextStatus == 'completed'
+                    ? _confirmCompleteCase
+                    : () => _updateCaseStatus(nextStatus),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: nextStatus == 'completed'
+                      ? Colors.green
+                      : AppTheme.royalBlue,
+                  foregroundColor: Colors.white,
+                ),
+                child: Text(actionLabel),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ];
+  }
+
   Widget _buildInfoRow(String label, String value) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
@@ -518,18 +708,11 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
   }
 
   Color _getStatusColor(String status) {
-    switch (status) {
-      case 'pending':
-        return Colors.orange;
-      case 'accepted':
-        return Colors.blue;
-      case 'in_progress':
-        return Colors.purple;
-      case 'completed':
-        return Colors.green;
-      default:
-        return Colors.grey;
-    }
+    if (CaseStatusFilter.isDraft(status)) return const Color(0xFFC9A227);
+    if (CaseStatusFilter.isOpen(status)) return Colors.orange;
+    if (CaseStatusFilter.isInProgress(status)) return Colors.purple;
+    if (CaseStatusFilter.isCompleted(status)) return Colors.green;
+    return Colors.grey;
   }
 
   /// Builds the Attorney Additional Details section for clients to view
@@ -701,7 +884,7 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
                             ),
                           if (profile['consultationFee'] != null)
                             Text(
-                              'Consultation Fee: ₱${profile['consultationFee']}',
+                              'Consultation Fee: ${Currency.symbol}${profile['consultationFee']}',
                               style: TextStyle(
                                 fontSize: isDesktop ? 16 : 14,
                                 fontWeight: FontWeight.w600,

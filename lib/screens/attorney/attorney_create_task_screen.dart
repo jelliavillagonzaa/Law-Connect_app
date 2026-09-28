@@ -6,6 +6,9 @@ import '../../services/task_service.dart';
 import '../../services/case_service.dart';
 import '../../models/case_model.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/task_priority.dart';
+import '../../utils/case_status_filter.dart';
+import '../../widgets/common/dropdown_helpers.dart';
 
 class AttorneyCreateTaskScreen extends StatefulWidget {
   final String? caseId; // Optional: pre-fill case if coming from case detail
@@ -29,7 +32,7 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
   String? _selectedStaffId;
   String? _selectedCaseId;
   DateTime? _selectedDueDate;
-  int? _selectedPriority; // 1=Urgent, 2=High, 3=Normal, 4=Low
+  int? _selectedPriority = TaskPriority.normal;
   bool _isLoading = false;
   bool _isLoadingStaff = true;
   bool _isLoadingCases = true;
@@ -101,7 +104,9 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
       casesStream.listen((cases) {
         if (mounted) {
           setState(() {
-            _casesList = cases;
+            _casesList = cases
+                .where((c) => !CaseStatusFilter.isCompleted(c.status))
+                .toList();
             _isLoadingCases = false;
           });
         }
@@ -172,7 +177,7 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
         assignedTo: _selectedStaffId!,
         caseId: _selectedCaseId,
         dueDate: _selectedDueDate,
-        priority: _selectedPriority,
+        priority: TaskPriority.coerce(_selectedPriority),
       );
 
       if (mounted) {
@@ -216,7 +221,7 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Create Task'),
+        title: const Text('New Staff Task'),
         backgroundColor: AppTheme.royalBlue,
         foregroundColor: Colors.white,
       ),
@@ -231,8 +236,8 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
               TextFormField(
                 controller: _titleController,
                 decoration: InputDecoration(
-                  labelText: 'Task Title *',
-                  hintText: 'e.g., Draft Motion for Case 123',
+                  labelText: 'Task *',
+                  hintText: 'Short name for the list',
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),
@@ -242,7 +247,7 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
                 ),
                 validator: (value) {
                   if (value == null || value.trim().isEmpty) {
-                    return 'Please enter a task title';
+                    return 'Please enter a task';
                   }
                   return null;
                 },
@@ -253,7 +258,7 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
               TextFormField(
                 controller: _descriptionController,
                 decoration: InputDecoration(
-                  labelText: 'Description *',
+                  labelText: 'Instructions *',
                   hintText: 'What exactly needs to be done?',
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(12),
@@ -265,7 +270,7 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
                 maxLines: 5,
                 validator: (value) {
                   if (value == null || value.trim().isEmpty) {
-                    return 'Please enter a description';
+                    return 'Please enter instructions';
                   }
                   return null;
                 },
@@ -274,7 +279,8 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
 
               // Assign To Staff Dropdown
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
                 decoration: BoxDecoration(
                   color: Colors.white,
                   borderRadius: BorderRadius.circular(12),
@@ -286,11 +292,13 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
                         child: Center(child: CircularProgressIndicator()),
                       )
                     : DropdownButtonFormField<String>(
+                        isExpanded: true,
                         initialValue: _selectedStaffId,
                         decoration: const InputDecoration(
-                          labelText: 'Assign To Staff *',
+                          labelText: 'Assign Staff *',
                           border: InputBorder.none,
                           prefixIcon: Icon(Icons.person),
+                          isDense: true,
                         ),
                         hint: const Text('Select staff member'),
                         items: _staffList.isEmpty
@@ -304,12 +312,26 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
                             : _staffList.map((staff) {
                                 return DropdownMenuItem<String>(
                                   value: staff['id'] as String,
-                                  child: Text(
+                                  child: dropdownEllipsisText(
                                     staff['name'] as String,
-                                    style: const TextStyle(fontSize: 16),
+                                    fontSize: 16,
                                   ),
                                 );
                               }).toList(),
+                        selectedItemBuilder: (context) {
+                          if (_staffList.isEmpty) {
+                            return [
+                              dropdownSelectedLabel(
+                                'No staff members available',
+                              ),
+                            ];
+                          }
+                          return dropdownSelectedLabels(
+                            _staffList
+                                .map((staff) => staff['name'] as String)
+                                .toList(),
+                          );
+                        },
                         onChanged: _staffList.isEmpty
                             ? null
                             : (value) {
@@ -329,7 +351,8 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
 
               // Link to Case Dropdown (Optional)
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
                 decoration: BoxDecoration(
                   color: Colors.white,
                   borderRadius: BorderRadius.circular(12),
@@ -341,11 +364,13 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
                         child: Center(child: CircularProgressIndicator()),
                       )
                     : DropdownButtonFormField<String>(
+                        isExpanded: true,
                         initialValue: _selectedCaseId,
                         decoration: const InputDecoration(
-                          labelText: 'Link to Case (Optional)',
+                          labelText: 'Case',
                           border: InputBorder.none,
                           prefixIcon: Icon(Icons.folder),
+                          isDense: true,
                         ),
                         hint: const Text('Select a case'),
                         items: [
@@ -356,13 +381,20 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
                           ..._casesList.map((caseModel) {
                             return DropdownMenuItem<String>(
                               value: caseModel.id,
-                              child: Text(
+                              child: dropdownEllipsisText(
                                 caseModel.caseTitle,
-                                style: const TextStyle(fontSize: 16),
-                                overflow: TextOverflow.ellipsis,
+                                fontSize: 16,
                               ),
                             );
                           }),
+                        ],
+                        selectedItemBuilder: (context) => [
+                          dropdownSelectedLabel('None'),
+                          ...dropdownSelectedLabels(
+                            _casesList
+                                .map((caseModel) => caseModel.caseTitle)
+                                .toList(),
+                          ),
                         ],
                         onChanged: (value) {
                           setState(() {
@@ -392,7 +424,7 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             const Text(
-                              'Due Date & Time (Optional)',
+                              'Due',
                               style: TextStyle(
                                 fontSize: 12,
                                 color: Colors.grey,
@@ -442,7 +474,7 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     const Text(
-                      'Priority (Optional)',
+                      'Priority',
                       style: TextStyle(fontSize: 12, color: Colors.grey),
                     ),
                     const SizedBox(height: 12),
@@ -450,10 +482,9 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
                       spacing: 8,
                       runSpacing: 8,
                       children: [
-                        _buildPriorityChip(1, 'Urgent', Colors.orange), // Professional warning color
-                        _buildPriorityChip(2, 'High', Colors.orange),
-                        _buildPriorityChip(3, 'Normal', Colors.blue),
-                        _buildPriorityChip(4, 'Low', Colors.grey),
+                        _buildPriorityChip(TaskPriority.high, 'High'),
+                        _buildPriorityChip(TaskPriority.normal, 'Normal'),
+                        _buildPriorityChip(TaskPriority.low, 'Low'),
                       ],
                     ),
                   ],
@@ -485,7 +516,7 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
                         ),
                       )
                     : const Text(
-                        'Create Task',
+                        'Create Staff Task',
                         style: TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.bold,
@@ -499,14 +530,15 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
     );
   }
 
-  Widget _buildPriorityChip(int priority, String label, Color color) {
-    final isSelected = _selectedPriority == priority;
+  Widget _buildPriorityChip(int priority, String label) {
+    final color = TaskPriority.color(priority);
+    final isSelected = TaskPriority.coerce(_selectedPriority) == priority;
     return FilterChip(
       label: Text(label),
       selected: isSelected,
-      onSelected: (selected) {
+      onSelected: (_) {
         setState(() {
-          _selectedPriority = selected ? priority : null;
+          _selectedPriority = priority;
         });
       },
       selectedColor: color.withValues(alpha: 0.2),

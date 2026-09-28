@@ -1,0 +1,13 @@
+---
+description: Never create Listenable.merge inside build — causes web _dependents.isEmpty
+globs: lib/screens/staff/staff_calendar_screen.dart,lib/screens/attorney/appointment_calendar_view.dart,lib/widgets/common/lazy_indexed_stack.dart,lib/widgets/common/stable_merged_listenable_builder.dart
+alwaysApply: false
+---
+
+# Listenable.merge and Flutter web
+
+Do not call `Listenable.merge([...])` inside `build()`. That creates a new listenable every frame and Flutter web hits:
+
+`Assertion failed: _dependents.isEmpty is not true` (`framework.dart` InheritedElement.debugDeactivated).
+
+Use `StableMergedListenableBuilder` (cached merge) instead. Keep `LazyIndexedStack` children in `KeyedSubtree` so adding a tab does not deactivate existing calendars.

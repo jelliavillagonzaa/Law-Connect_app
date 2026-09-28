@@ -5,7 +5,10 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../theme/app_theme.dart';
 import '../../services/enhanced_appointment_service.dart';
 import '../../services/auth_service.dart';
+import '../../utils/currency.dart';
 import '../../widgets/maps/oroquieta_map_viewer.dart';
+import '../../widgets/common/schedule_full_dialog.dart';
+import '../../models/user_model.dart';
 
 /// Step 2 of the client appointment flow:
 /// After selecting an attorney, the client fills in preferred date/time/type.
@@ -36,7 +39,7 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
   final TextEditingController _notesController = TextEditingController();
   bool _isSubmitting = false;
   Map<String, dynamic>? _attorneyProfileData;
-  bool _isLoadingProfile = true;
+  bool _isLoadingProfile = false;
 
   @override
   void initState() {
@@ -52,10 +55,18 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
 
   Future<void> _loadAttorneyProfile() async {
     try {
-      final attorneyDoc = await _firestore
-          .collection('users')
-          .doc(widget.attorneyId)
-          .get();
+      DocumentSnapshot<Map<String, dynamic>> attorneyDoc;
+      final ref = _firestore.collection('users').doc(widget.attorneyId);
+      try {
+        attorneyDoc = await ref
+            .get(const GetOptions(source: Source.cache))
+            .timeout(const Duration(seconds: 1));
+        if (!attorneyDoc.exists) {
+          attorneyDoc = await ref.get().timeout(const Duration(seconds: 1));
+        }
+      } catch (_) {
+        attorneyDoc = await ref.get().timeout(const Duration(seconds: 1));
+      }
       if (attorneyDoc.exists && mounted) {
         setState(() {
           _attorneyProfileData = attorneyDoc.data();
@@ -145,7 +156,25 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
     });
 
     try {
-      final clientName = user.displayName ?? user.email ?? 'Client';
+      var clientName = user.displayName?.trim() ?? '';
+      try {
+        final profileDoc = await _firestore
+            .collection('users')
+            .doc(user.uid)
+            .get();
+        if (profileDoc.exists && profileDoc.data() != null) {
+          final resolved = UserModel.resolveDisplayName(profileDoc.data()!);
+          if (resolved.trim().isNotEmpty &&
+              !resolved.contains('@') &&
+              resolved.toLowerCase() != 'user' &&
+              resolved.toLowerCase() != 'client') {
+            clientName = resolved.trim();
+          }
+        }
+      } catch (_) {}
+      if (clientName.isEmpty || clientName.contains('@')) {
+        clientName = user.email ?? 'Client';
+      }
 
       final result = await _appointmentService.createAppointment(
         clientId: user.uid,
@@ -175,6 +204,8 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
         );
         // Pop back to previous screen (usually dashboard or appointments)
         Get.back(result: true);
+      } else if (EnhancedAppointmentService.isScheduleFull(result)) {
+        await showScheduleFullDialog(context, date: dateTime);
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -228,17 +259,19 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
                       const SizedBox(height: 8),
                       Text(
                         'Choose a preferred date, time, and type of meeting. '
-                        'Your attorney will review and confirm the appointment.',
+                        'This request is sent to ${widget.attorneyName}, '
+                        'who will review and confirm it.',
                         style: AppTheme.bodySmall.copyWith(
                           color: AppTheme.textSecondary,
                         ),
                       ),
                       const SizedBox(height: 24),
-                      // Attorney Additional Details
-                      if (_attorneyProfileData != null && !_isLoadingProfile)
+                      _buildAttorneyHeader(),
+                      if (_attorneyProfileData != null && !_isLoadingProfile) ...[
+                        const SizedBox(height: 12),
                         _buildAttorneyAdditionalDetails(),
-                      if (_attorneyProfileData != null && !_isLoadingProfile)
-                        const SizedBox(height: 24),
+                      ],
+                      const SizedBox(height: 24),
 
                       // Date field
                       Text(
@@ -388,7 +421,7 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
 
                       // Notes
                       Text(
-                        'Notes (optional)',
+                        'Notes',
                         style: AppTheme.bodyMedium.copyWith(
                           fontWeight: FontWeight.w600,
                         ),
@@ -453,6 +486,53 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildAttorneyHeader() {
+    final name = widget.attorneyName.trim().isEmpty
+        ? 'Attorney'
+        : widget.attorneyName.trim();
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppTheme.borderGray),
+      ),
+      child: Row(
+        children: [
+          CircleAvatar(
+            backgroundColor: AppTheme.royalBlue.withOpacity(0.1),
+            child: Text(
+              name.substring(0, 1).toUpperCase(),
+              style: const TextStyle(
+                color: AppTheme.royalBlue,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  name,
+                  style: AppTheme.bodyLarge.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  'Your request goes to this attorney.',
+                  style: AppTheme.caption,
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -676,7 +756,7 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
                 ),
               if (profile['consultationFee'] != null)
                 Text(
-                  'Consultation Fee: ₱${profile['consultationFee']}',
+                  'Consultation Fee: ${Currency.symbol}${profile['consultationFee']}',
                   style: TextStyle(
                     fontSize: isWeb ? 14 : 13,
                     fontWeight: FontWeight.w600,

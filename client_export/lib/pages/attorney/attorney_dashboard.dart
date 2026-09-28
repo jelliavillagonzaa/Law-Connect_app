@@ -14,6 +14,8 @@ import '../../models/case_model.dart';
 import '../../models/user_model.dart';
 import '../../models/appointment_model.dart';
 import '../../widgets/common/case_card.dart';
+import '../../widgets/case/case_status_filter_button.dart';
+import '../../utils/case_status_filter.dart';
 import '../../widgets/admin/stat_card.dart';
 import '../../widgets/attorney/attorney_thin_nav_rail.dart';
 import '../../theme/app_theme.dart';
@@ -61,6 +63,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
   // Upcoming confirmed/scheduled appointments
   List<AppointmentModel> _upcomingAppointments = [];
   int _unreadCount = 0;
+  String _caseStatusFilter = CaseStatusFilter.all;
 
   @override
   void initState() {
@@ -1224,66 +1227,83 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
           );
         }
 
-        final cases = snapshot.data ?? [];
+        final cases = CaseStatusFilter.apply(
+          snapshot.data ?? [],
+          _caseStatusFilter,
+        );
 
-        if (cases.isEmpty) {
-          return Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(Icons.folder_open, size: 64, color: Colors.grey),
-                const SizedBox(height: 16),
-                Text(
-                  'No assigned cases yet',
-                  style: TextStyle(fontSize: 18, color: Colors.grey),
-                ),
-              ],
-            ),
-          );
-        }
-
-        if (isMobile) {
-          // Mobile: Vertical list
-          return ListView.builder(
-            padding: const EdgeInsets.all(16),
-            itemCount: cases.length,
-            itemBuilder: (context, index) {
-              return Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: CaseCard(
-                  caseModel: cases[index],
-                  onTap: () {
-                    Get.to(() => CaseDetailPage(caseId: cases[index].id));
+        final list = Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Align(
+              alignment: Alignment.centerRight,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+                child: CaseStatusFilterButton(
+                  selected: _caseStatusFilter,
+                  iconColor: AppTheme.royalBlue,
+                  onSelected: (value) {
+                    setState(() => _caseStatusFilter = value);
                   },
                 ),
-              );
-            },
-          );
-        } else {
-          // Desktop: Grid view
-          return SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            child: GridView.builder(
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 3,
-                crossAxisSpacing: 16,
-                mainAxisSpacing: 16,
-                childAspectRatio: 0.85,
               ),
-              itemCount: cases.length,
-              itemBuilder: (context, index) {
-                return CaseCard(
-                  caseModel: cases[index],
-                  onTap: () {
-                    Get.to(() => CaseDetailPage(caseId: cases[index].id));
-                  },
-                );
-              },
             ),
-          );
-        }
+            Expanded(
+              child: cases.isEmpty
+                  ? Center(
+                      child: Text(
+                        _caseStatusFilter == CaseStatusFilter.all
+                            ? 'No assigned cases yet'
+                            : 'No ${CaseStatusFilter.label(_caseStatusFilter).toLowerCase()} cases',
+                        style: const TextStyle(fontSize: 18, color: Colors.grey),
+                      ),
+                    )
+                  : isMobile
+                      ? ListView.builder(
+                          padding: const EdgeInsets.all(16),
+                          itemCount: cases.length,
+                          itemBuilder: (context, index) {
+                            return Padding(
+                              padding: const EdgeInsets.only(bottom: 12),
+                              child: CaseCard(
+                                caseModel: cases[index],
+                                onTap: () {
+                                  Get.to(() =>
+                                      CaseDetailPage(caseId: cases[index].id));
+                                },
+                              ),
+                            );
+                          },
+                        )
+                      : SingleChildScrollView(
+                          padding: const EdgeInsets.all(24),
+                          child: GridView.builder(
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            gridDelegate:
+                                const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 3,
+                              crossAxisSpacing: 16,
+                              mainAxisSpacing: 16,
+                              childAspectRatio: 0.85,
+                            ),
+                            itemCount: cases.length,
+                            itemBuilder: (context, index) {
+                              return CaseCard(
+                                caseModel: cases[index],
+                                onTap: () {
+                                  Get.to(() =>
+                                      CaseDetailPage(caseId: cases[index].id));
+                                },
+                              );
+                            },
+                          ),
+                        ),
+            ),
+          ],
+        );
+
+        return list;
       },
     );
   }

@@ -1,0 +1,19 @@
+EmailJS OTP template setup
+==========================
+
+1. Open EmailJS dashboard -> Email Templates -> One-Time Password -> Content
+2. Select ALL existing content and delete it
+3. Open emailjs-otp-template.html in this folder
+4. Copy ALL lines from that file (no comments at the top)
+5. Paste into EmailJS Content editor
+6. Click Save
+
+Logo URL (must stay live):
+  https://jurislink-app.web.app/email-logo.png
+
+Template variables used by the app:
+  {{passcode}}  - 6-digit OTP
+  {{time}}      - expiration time
+  {{email}}     - recipient (set in Settings -> To Email)
+
+Do NOT use cid:logo.png — it breaks in Gmail.

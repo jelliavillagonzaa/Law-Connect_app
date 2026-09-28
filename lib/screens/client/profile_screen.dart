@@ -8,8 +8,7 @@ import '../../widgets/primary_button.dart';
 import '../../widgets/secondary_button.dart';
 import '../../models/user_model.dart';
 import '../../services/firestore_service.dart';
-import '../../services/auth_service.dart';
-import '../../pages/client/client_landing_page.dart';
+import '../../routes/portal_navigation.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -22,11 +21,25 @@ class _ProfileScreenState extends State<ProfileScreen> {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirestoreService _firestoreService = FirestoreService();
   UserModel? _currentUser;
-  bool _isLoading = true;
+
+  UserModel? _fallbackFromAuth() {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return null;
+    return UserModel(
+      id: user.uid,
+      role: 'client',
+      name: user.displayName ?? 'Client',
+      email: user.email ?? '',
+      photoUrl: user.photoURL,
+      createdAt: user.metadata.creationTime ?? DateTime.now(),
+      isVerified: user.emailVerified,
+    );
+  }
 
   @override
   void initState() {
     super.initState();
+    _currentUser = _fallbackFromAuth();
     _loadUserData();
   }
 
@@ -34,27 +47,29 @@ class _ProfileScreenState extends State<ProfileScreen> {
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) {
-        setState(() => _isLoading = false);
+        if (mounted) setState(() {});
         return;
       }
 
-      await AuthService().syncStaffRoleFromStaffApplication(
-        uid: user.uid,
-        email: user.email ?? '',
-      );
-      final userDoc = await _firestore.collection('users').doc(user.uid).get();
+      final userRef = _firestore.collection('users').doc(user.uid);
+      DocumentSnapshot<Map<String, dynamic>> userDoc;
+      try {
+        userDoc = await userRef
+            .get(const GetOptions(source: Source.cache))
+            .timeout(const Duration(seconds: 1));
+        if (!userDoc.exists) {
+          userDoc = await userRef.get().timeout(const Duration(seconds: 1));
+        }
+      } catch (_) {
+        userDoc = await userRef.get().timeout(const Duration(seconds: 1));
+      }
       if (userDoc.exists && mounted) {
         setState(() {
           _currentUser = UserModel.fromFirestore(userDoc.data()!, user.uid);
-          _isLoading = false;
         });
-      } else {
-        setState(() => _isLoading = false);
       }
-    } catch (e) {
-      if (mounted) {
-        setState(() => _isLoading = false);
-      }
+    } catch (_) {
+      if (mounted) setState(() {});
     }
   }
 
@@ -302,22 +317,13 @@ class _ProfileScreenState extends State<ProfileScreen> {
       try {
         await FirebaseAuth.instance.signOut();
       } finally {
-        // Navigate to splash screen (which will route appropriately)
-        Get.offAll(() => const ClientLandingPage());
+        navigateAfterLogout();
       }
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_isLoading) {
-      return Scaffold(
-        backgroundColor: AppTheme.lightBackground,
-        appBar: AppBar(title: const Text('Profile')),
-        body: const Center(child: CircularProgressIndicator()),
-      );
-    }
-
     final user = FirebaseAuth.instance.currentUser;
     if (user == null || _currentUser == null) {
       return Scaffold(

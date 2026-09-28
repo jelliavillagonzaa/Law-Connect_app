@@ -19,6 +19,7 @@ import 'pages/auth/otp_verification.dart';
 import 'routes/deferred_route_loaders.dart';
 import 'services/notification_service.dart';
 import 'services/fcm_service.dart';
+import 'screens/client/chat_screen.dart';
 import 'firebase_messaging_handler.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'supabase/supabase_bootstrap.dart';
@@ -42,8 +43,8 @@ Future<void> _initDeferredServices() async {
   if (!kIsWeb) {
     FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
     unawaited(NotificationService().initialize().catchError((_) {}));
-    unawaited(FCMService().initialize().catchError((_) {}));
   }
+  unawaited(FCMService().initialize().catchError((_) {}));
 }
 
 Future<void> _bootstrap() async {
@@ -52,15 +53,21 @@ Future<void> _bootstrap() async {
   installQuietErrorHandlers();
   Get.config(enableLog: false);
 
-  // Firebase must be ready before runApp — LoginPage/AuthService use it on first frame.
-  await initializeFirebaseInBackground();
+  if (kIsWeb) {
+    // Paint the landing page immediately — Firebase + dashboard chunks
+    // warm in the background so the first screen is never a blank wait.
+    runApp(const LawConnectApp());
+    unawaited(() async {
+      await initializeFirebaseInBackground();
+      unawaited(_initDeferredServices());
+      prefetchAllPortalDashboards();
+    }());
+    return;
+  }
 
+  await initializeFirebaseInBackground();
   runApp(const LawConnectApp());
   unawaited(_initDeferredServices());
-  if (kIsWeb) {
-    unawaited(DeferredClientDashboard.prefetch());
-    unawaited(DeferredClientNotificationsScreen.prefetch());
-  }
 }
 
 Future<void> main() async {
@@ -82,7 +89,10 @@ class LawConnectApp extends StatelessWidget {
           : (text, {bool isError = false}) {},
       initialBinding: BindingsBuilder(() {
         Get.lazyPut<AuthController>(() => AuthController(), fenix: true);
-        Get.lazyPut<SupabaseService>(() => SupabaseService.instance, fenix: true);
+        Get.lazyPut<SupabaseService>(
+          () => SupabaseService.instance,
+          fenix: true,
+        );
       }),
       getPages: [
         GetPage(name: '/', page: () => const ClientLandingPage()),
@@ -101,7 +111,11 @@ class LawConnectApp extends StatelessWidget {
           name: '/AttorneyLanding',
           page: () => const AttorneyLandingPage(),
         ),
-        GetPage(name: '/LoginPage', page: () => const LoginPage()),
+        GetPage(
+          name: '/LoginPage',
+          page: () =>
+              kIsWeb ? const ClientLandingPage() : const LoginPage(),
+        ),
         GetPage(name: '/Signup', page: () => const SignupPage()),
         GetPage(name: '/ClientSignup', page: () => const SignupPage()),
         GetPage(
@@ -127,6 +141,18 @@ class LawConnectApp extends StatelessWidget {
         GetPage(
           name: '/ClientNotifications',
           page: () => const DeferredClientNotificationsScreen(),
+        ),
+        GetPage(
+          name: '/ChatMessage',
+          page: () {
+            final args = Get.arguments;
+            final map = args is Map ? args : const <String, dynamic>{};
+            return ChatScreen(
+              otherUserId: '${map['senderId'] ?? ''}',
+              otherUserName: '${map['senderName'] ?? 'Message'}',
+              conversationId: map['chatId']?.toString(),
+            );
+          },
         ),
       ],
       unknownRoute: GetPage(

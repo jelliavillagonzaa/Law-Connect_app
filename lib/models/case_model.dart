@@ -7,13 +7,15 @@ class CaseModel {
   final String caseTitle;
   final String caseType;
   final String caseDescription;
-  final String status; // "pending" | "accepted" | "in_progress" | "completed"
+  final String status; // pending (Open) | under_review (Draft) | in_progress | completed
   final DateTime createdAt;
   final DateTime updatedAt;
   final List<String>? documents; // URLs to Firebase Storage
   final Map<String, dynamic>? progress; // Case progress updates
   final String? staffId; // Assigned staff member
   final List<String>? staffAssigned; // Multiple staff members (paralegal, secretary, etc.)
+  final String? opposingParty;
+  final String? caseResult; // won | lost | settled | dismissed
   final DateTime? hearingDate; // First hearing date
   final bool isArchived;
   final DateTime? archivedAt;
@@ -32,6 +34,8 @@ class CaseModel {
     this.progress,
     this.staffId,
     this.staffAssigned,
+    this.opposingParty,
+    this.caseResult,
     this.hearingDate,
     this.isArchived = false,
     this.archivedAt,
@@ -57,9 +61,13 @@ class CaseModel {
       staffAssigned: data['staffAssigned'] != null
           ? List<String>.from(data['staffAssigned'])
           : null,
-      hearingDate: data['hearingDate'] != null
-          ? (data['hearingDate'] as Timestamp).toDate()
+      opposingParty: (data['opposingParty'] as String?)?.trim().isNotEmpty == true
+          ? (data['opposingParty'] as String).trim()
           : null,
+      caseResult: (data['caseResult'] as String?)?.trim().isNotEmpty == true
+          ? (data['caseResult'] as String).trim().toLowerCase()
+          : null,
+      hearingDate: _parseDate(data['hearingDate']),
       isArchived: data['isArchived'] == true,
       archivedAt: (data['archivedAt'] as Timestamp?)?.toDate(),
     );
@@ -79,10 +87,24 @@ class CaseModel {
       if (progress != null) 'progress': progress,
       if (staffId != null) 'staffId': staffId,
       if (staffAssigned != null) 'staffAssigned': staffAssigned,
+      if (opposingParty != null && opposingParty!.trim().isNotEmpty)
+        'opposingParty': opposingParty!.trim(),
+      if (caseResult != null && caseResult!.trim().isNotEmpty)
+        'caseResult': caseResult!.trim().toLowerCase(),
       if (hearingDate != null) 'hearingDate': Timestamp.fromDate(hearingDate!),
       'isArchived': isArchived,
       if (archivedAt != null) 'archivedAt': Timestamp.fromDate(archivedAt!),
     };
+  }
+
+  static DateTime? _parseDate(dynamic value) {
+    if (value == null) return null;
+    if (value is Timestamp) return value.toDate();
+    if (value is DateTime) return value;
+    if (value is String && value.isNotEmpty) {
+      return DateTime.tryParse(value);
+    }
+    return null;
   }
 }
 

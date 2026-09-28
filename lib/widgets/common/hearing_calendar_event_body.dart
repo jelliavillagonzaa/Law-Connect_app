@@ -156,3 +156,17 @@ bool isFirestoreSyncedHearingCalendarRow(Map<String, dynamic> ev) {
   }
   return isAiSyncedCalendarEvent(ev);
 }
+
+bool isManualAttorneyCalendarHearing(Map<String, dynamic> ev) {
+  if ((ev['source'] as String?) == 'attorney_manual') return true;
+  return (ev['appointmentId'] as String?)?.trim().isNotEmpty == true;
+}
+
+/// Stale or synced court hearing row in `calendar_events` — never render on grid.
+/// The calendar must show court hearings from the live `hearings` collection only.
+bool isMirroredCourtHearingCalendarEvent(Map<String, dynamic> ev) {
+  if ((ev['eventType'] as String?)?.toLowerCase() != 'hearing') {
+    return false;
+  }
+  return !isManualAttorneyCalendarHearing(ev);
+}

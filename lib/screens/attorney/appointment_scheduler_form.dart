@@ -1,11 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../models/appointment_model.dart';
 import '../../services/enhanced_appointment_service.dart';
 import '../../services/auth_service.dart';
 import '../../services/case_service.dart';
+import '../../services/client_directory_service.dart';
 import '../../models/case_model.dart';
+import '../../widgets/common/schedule_full_dialog.dart';
 
 class AppointmentSchedulerForm extends StatefulWidget {
   final String? clientId;
@@ -35,12 +36,16 @@ class AppointmentSchedulerForm extends StatefulWidget {
 }
 
 class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
+  static const String _otherClientValue = '__other__';
+
   final _formKey = GlobalKey<FormState>();
   final _notesController = TextEditingController();
+  final _otherClientNameController = TextEditingController();
   final EnhancedAppointmentService _appointmentService =
       EnhancedAppointmentService();
   final CaseService _caseService = CaseService();
   final AuthService _authService = AuthService();
+  final ClientDirectoryService _clientDirectory = ClientDirectoryService();
 
   DateTime? _selectedDate;
   TimeOfDay? _selectedTime;
@@ -61,7 +66,7 @@ class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
   bool _isLoadingClients = false;
 
   // Color constants – match global attorney UI (royal blue header, light grey bg)
-  static const Color primaryRed = Color(0xFF1A4D8F); // Royal Blue
+  static const Color primaryRed = Color(0xFF1A3A6C);
 
   @override
   void initState() {
@@ -101,98 +106,9 @@ class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
 
     setState(() => _isLoadingClients = true);
     try {
-      final clientIds = <String>{};
-      final clientsMap = <String, Map<String, dynamic>>{};
-
-      // 1. Get clients from cases
-      final casesSnapshot = await FirebaseFirestore.instance
-          .collection('cases')
-          .where('attorneyId', isEqualTo: currentUser.uid)
-          .get();
-
-      for (var caseDoc in casesSnapshot.docs) {
-        final caseData = caseDoc.data();
-        final clientId = caseData['clientId'] as String?;
-        if (clientId != null &&
-            clientId.trim().isNotEmpty &&
-            !clientIds.contains(clientId)) {
-          clientIds.add(clientId);
-        }
-      }
-
-      // 2. Get clients from appointments (in case there are appointments without cases)
-      final appointmentsSnapshot = await FirebaseFirestore.instance
-          .collection('appointments')
-          .where('attorneyId', isEqualTo: currentUser.uid)
-          .get();
-
-      for (var aptDoc in appointmentsSnapshot.docs) {
-        final aptData = aptDoc.data();
-        final clientId = aptData['clientId'] as String?;
-        if (clientId != null && !clientIds.contains(clientId)) {
-          clientIds.add(clientId);
-        }
-      }
-
-      // 3. Get client details for all unique client IDs
-      for (final clientId in clientIds) {
-        if (clientId.trim().isEmpty) continue;
-        try {
-          final clientDoc = await FirebaseFirestore.instance
-              .collection('users')
-              .doc(clientId)
-              .get();
-          if (clientDoc.exists) {
-            final clientData = clientDoc.data()!;
-            final role = clientData['role'] as String?;
-            // Only include users with role 'client'
-            if (role == 'client') {
-              // Try multiple possible field names for full name
-              final name = clientData['name'] as String? ?? '';
-              final fullName =
-                  clientData['fullName'] as String? ??
-                  clientData['full_name'] as String? ??
-                  '';
-
-              // For verified clients, prioritize fullName
-              final isVerified = clientData['isVerified'] as bool? ?? false;
-
-              // Build display name: prefer fullName, especially for verified clients
-              String displayName;
-              if (fullName.isNotEmpty && fullName.trim().isNotEmpty) {
-                // If fullName exists, use it
-                displayName = fullName.trim();
-              } else if (name.isNotEmpty && name.trim().isNotEmpty) {
-                // If no fullName, use name
-                displayName = name.trim();
-              } else {
-                // Fallback
-                displayName = 'Client';
-              }
-
-              // Store all information
-              clientsMap[clientId] = {
-                'id': clientId,
-                'name': name,
-                'fullName': fullName,
-                'displayName': displayName,
-                'email': clientData['email'] ?? '',
-                'isVerified': isVerified,
-              };
-            }
-          }
-        } catch (e) {
-          print('Error loading client $clientId: $e');
-        }
-      }
-
-      // Sort clients by display name
-      final clientsList = clientsMap.values.toList();
-      clientsList.sort((a, b) {
-        final nameA = (a['displayName'] as String? ?? '').toLowerCase();
-        final nameB = (b['displayName'] as String? ?? '').toLowerCase();
-        return nameA.compareTo(nameB);
-      });
+      final clientsList = await _clientDirectory.loadSignedUpClients(
+        ensureClientId: widget.clientId,
+      );
 
       if (mounted) {
         setState(() {
@@ -315,12 +231,25 @@ class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
     // Get client info
     String clientId = widget.clientId ?? _selectedClientId ?? '';
     String clientName = widget.clientName ?? _selectedClientName ?? 'Client';
+    if (_selectedClientId == _otherClientValue) {
+      clientId = '';
+      clientName = _otherClientNameController.text.trim();
+      if (clientName.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Please enter the client name')),
+        );
+        setState(() => _isLoading = false);
+        return;
+      }
+    }
 
     // Validate client selection for hearing in court
-    if (_appointmentType == 'hearing_court' && clientId.isEmpty) {
+    if (_appointmentType == 'hearing_court' &&
+        clientId.isEmpty &&
+        clientName.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Please select a client for court hearing'),
+          content: Text('Please select or type a client for court hearing'),
         ),
       );
       setState(() => _isLoading = false);
@@ -366,6 +295,8 @@ class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('Appointment updated successfully')),
           );
+        } else if (EnhancedAppointmentService.isScheduleFull(result)) {
+          await showScheduleFullDialog(context, date: appointmentDateTime);
         } else {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -421,6 +352,8 @@ class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('Appointment created successfully')),
           );
+        } else if (EnhancedAppointmentService.isScheduleFull(result)) {
+          await showScheduleFullDialog(context, date: appointmentDateTime);
         } else {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -437,6 +370,7 @@ class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
   @override
   void dispose() {
     _notesController.dispose();
+    _otherClientNameController.dispose();
     super.dispose();
   }
 
@@ -445,7 +379,7 @@ class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
     final isWeb = MediaQuery.of(context).size.width > 600;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF5F5F5),
+      backgroundColor: const Color(0xFFF8FAFC),
       appBar: AppBar(
         backgroundColor: primaryRed,
         title: Text(
@@ -484,7 +418,7 @@ class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
 
                   // Case Selection (if client is provided)
                   if (widget.clientId != null) ...[
-                    _buildSectionTitle('Related Case (Optional)'),
+                    _buildSectionTitle('Related Case'),
                     const SizedBox(height: 8),
                     _buildCaseSelector(),
                     const SizedBox(height: 24),
@@ -498,11 +432,7 @@ class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
 
                   // Client Selection (for all appointment types when no client is pre-selected)
                   if (widget.clientId == null) ...[
-                    _buildSectionTitle(
-                      _appointmentType == 'hearing_court'
-                          ? 'Select Client *'
-                          : 'Select Client (Optional)',
-                    ),
+                    _buildSectionTitle('Select Client'),
                     const SizedBox(height: 8),
                     _buildClientSelector(),
                     const SizedBox(height: 24),
@@ -515,7 +445,7 @@ class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
                   const SizedBox(height: 24),
 
                   // Notes
-                  _buildSectionTitle('Notes (Optional)'),
+                  _buildSectionTitle('Notes'),
                   const SizedBox(height: 8),
                   _buildNotesField(),
                   const SizedBox(height: 32),
@@ -639,7 +569,7 @@ class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
       child: DropdownButtonHideUnderline(
         child: DropdownButton<String>(
           value: _selectedCaseId,
-          hint: const Text('Select a case (optional)'),
+          hint: const Text('Select a case'),
           isExpanded: true,
           items: [
             const DropdownMenuItem<String>(value: null, child: Text('None')),
@@ -716,102 +646,127 @@ class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
       );
     }
 
-    if (_attorneyClients.isEmpty) {
-      return Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: Colors.grey[100],
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.grey[300]!),
-        ),
-        child: Column(
-          children: [
-            const Text(
-              'No clients available',
-              style: TextStyle(color: Colors.grey),
-            ),
-            const SizedBox(height: 8),
-            TextButton.icon(
-              onPressed: () {
-                _loadAttorneyClients();
-              },
-              icon: const Icon(Icons.refresh, size: 18),
-              label: const Text('Refresh'),
-              style: TextButton.styleFrom(foregroundColor: primaryRed),
-            ),
-          ],
-        ),
-      );
-    }
+    final selectedId = _selectedClientId;
+    final hasSelected = selectedId != null &&
+        (selectedId == _otherClientValue ||
+            _attorneyClients.any((c) => c['id'] == selectedId));
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: _selectedClientId != null ? primaryRed : Colors.grey[300]!,
-          width: _selectedClientId != null ? 2 : 1,
-        ),
-      ),
-      child: DropdownButtonHideUnderline(
-        child: DropdownButton<String>(
-          value: _selectedClientId,
-          hint: Text(
-            'Select a client *',
-            style: TextStyle(color: Colors.grey[600]),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: hasSelected ? primaryRed : Colors.grey[300]!,
+              width: hasSelected ? 2 : 1,
+            ),
           ),
-          isExpanded: true,
-          icon: Icon(Icons.arrow_drop_down, color: primaryRed),
-          style: const TextStyle(fontSize: 16, color: Colors.black87),
-          items: _attorneyClients.map((client) {
-            // Always use displayName which prioritizes fullName from Firestore
-            final displayName =
-                client['displayName'] as String? ??
-                client['fullName'] as String? ??
-                client['name'] as String? ??
-                'Client';
-            final isVerified = client['isVerified'] as bool? ?? false;
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<String>(
+              value: hasSelected ? selectedId : null,
+              hint: Text(
+                'Select a client',
+                style: TextStyle(color: Colors.grey[600]),
+              ),
+              isExpanded: true,
+              icon: Icon(Icons.arrow_drop_down, color: primaryRed),
+              style: const TextStyle(fontSize: 16, color: Colors.black87),
+              items: [
+                ..._attorneyClients.map((client) {
+                  final displayName =
+                      client['displayName'] as String? ??
+                      client['fullName'] as String? ??
+                      client['name'] as String? ??
+                      'Client';
+                  final isVerified = client['isVerified'] as bool? ?? false;
 
-            return DropdownMenuItem<String>(
-              value: client['id'] as String,
-              child: Row(
-                children: [
-                  if (isVerified)
-                    Icon(Icons.verified, size: 16, color: primaryRed),
-                  if (isVerified) const SizedBox(width: 4),
-                  Expanded(
-                    child: Text(
-                      displayName,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w500,
-                      ),
+                  return DropdownMenuItem<String>(
+                    value: client['id'] as String,
+                    child: Row(
+                      children: [
+                        if (isVerified)
+                          Icon(Icons.verified, size: 16, color: primaryRed),
+                        if (isVerified) const SizedBox(width: 4),
+                        Expanded(
+                          child: Text(
+                            displayName,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                }),
+                const DropdownMenuItem<String>(
+                  value: _otherClientValue,
+                  child: Text(
+                    'Other',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
-                ],
-              ),
-            );
-          }).toList(),
-          onChanged: (value) {
-            if (value != null) {
-              setState(() {
-                _selectedClientId = value;
-                final selectedClient = _attorneyClients.firstWhere(
-                  (c) => c['id'] == value,
-                );
-                // Always use displayName which prioritizes fullName from Firestore
-                _selectedClientName =
-                    selectedClient['displayName'] as String? ??
-                    selectedClient['fullName'] as String? ??
-                    selectedClient['name'] as String? ??
-                    'Client';
-              });
-            }
-          },
+                ),
+              ],
+              onChanged: (value) {
+                if (value == null) return;
+                setState(() {
+                  _selectedClientId = value;
+                  if (value == _otherClientValue) {
+                    _selectedClientName =
+                        _otherClientNameController.text.trim();
+                    return;
+                  }
+                  final selectedClient = _attorneyClients.firstWhere(
+                    (c) => c['id'] == value,
+                    orElse: () => const {},
+                  );
+                  _selectedClientName =
+                      selectedClient['displayName'] as String? ??
+                      selectedClient['fullName'] as String? ??
+                      selectedClient['name'] as String? ??
+                      'Client';
+                });
+              },
+            ),
+          ),
         ),
-      ),
+        if (_selectedClientId == _otherClientValue) ...[
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: _otherClientNameController,
+            textCapitalization: TextCapitalization.words,
+            decoration: InputDecoration(
+              hintText: 'Type client name',
+              filled: true,
+              fillColor: Colors.white,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: BorderSide(color: Colors.grey[300]!),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: BorderSide(color: Colors.grey[300]!),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: const BorderSide(color: primaryRed, width: 2),
+              ),
+              contentPadding: const EdgeInsets.all(16),
+            ),
+            onChanged: (value) {
+              _selectedClientName = value.trim();
+            },
+          ),
+        ],
+      ],
     );
   }
 
@@ -827,18 +782,22 @@ class _AppointmentSchedulerFormState extends State<AppointmentSchedulerForm> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // Attorney always gets notified (no checkbox, just info)
-          Container(
+          Padding(
             padding: const EdgeInsets.symmetric(vertical: 8),
             child: Row(
               children: [
                 Icon(Icons.check_circle, color: primaryRed, size: 20),
                 const SizedBox(width: 8),
-                const Text(
-                  'Attorney (You) - Always notified',
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w500,
-                    color: Colors.black87,
+                const Expanded(
+                  child: Text(
+                    'Attorney (You) - Always notified',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                      color: Colors.black87,
+                    ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
                   ),
                 ),
               ],

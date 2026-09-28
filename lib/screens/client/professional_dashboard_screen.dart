@@ -20,7 +20,6 @@ class _ProfessionalDashboardScreenState extends State<ProfessionalDashboardScree
   String _selectedFilter = 'All';
   List<CaseModel> _allCases = [];
   List<CaseModel> _filteredCases = [];
-  bool _isLoading = true;
   
   // Summary counts
   int _totalCases = 0;
@@ -31,7 +30,7 @@ class _ProfessionalDashboardScreenState extends State<ProfessionalDashboardScree
   String? _currentUserId;
 
   // Color constants
-  static const Color primaryRed = Color(0xFF1A4D8F); // Royal Blue
+  static const Color primaryRed = Color(0xFF1A3A6C);
 
   @override
   void initState() {
@@ -48,14 +47,10 @@ class _ProfessionalDashboardScreenState extends State<ProfessionalDashboardScree
         });
         _loadCases();
       } else {
-        setState(() {
-          _isLoading = false;
-        });
+        setState(() {});
       }
-    } catch (e) {
-      setState(() {
-        _isLoading = false;
-      });
+    } catch (_) {
+      if (mounted) setState(() {});
     }
   }
 
@@ -67,12 +62,9 @@ class _ProfessionalDashboardScreenState extends State<ProfessionalDashboardScree
         _allCases = cases;
         _updateSummaryCounts();
         _applyFilter();
-        _isLoading = false;
       });
     }).onError((error) {
-      setState(() {
-        _isLoading = false;
-      });
+      if (mounted) setState(() {});
     });
   }
 
@@ -167,7 +159,7 @@ class _ProfessionalDashboardScreenState extends State<ProfessionalDashboardScree
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF5F5F5),
+      backgroundColor: const Color(0xFFF8FAFC),
       body: SafeArea(
         child: Column(
           children: [
@@ -176,32 +168,25 @@ class _ProfessionalDashboardScreenState extends State<ProfessionalDashboardScree
             
             // Content
             Expanded(
-              child: _isLoading
-                  ? const Center(child: CircularProgressIndicator())
-                  : RefreshIndicator(
-                      onRefresh: () async {
-                        _loadCases();
-                      },
-                      child: SingleChildScrollView(
-                        physics: const AlwaysScrollableScrollPhysics(),
-                        padding: const EdgeInsets.all(16),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            // Summary Cards
-                            _buildSummaryCards(),
-                            const SizedBox(height: 24),
-                            
-                            // Filter Chips
-                            _buildFilterChips(),
-                            const SizedBox(height: 16),
-                            
-                            // Cases List
-                            _buildCasesList(),
-                          ],
-                        ),
-                      ),
-                    ),
+              child: RefreshIndicator(
+                onRefresh: () async {
+                  _loadCases();
+                },
+                child: SingleChildScrollView(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      _buildSummaryCards(),
+                      const SizedBox(height: 24),
+                      _buildFilterChips(),
+                      const SizedBox(height: 16),
+                      _buildCasesList(),
+                    ],
+                  ),
+                ),
+              ),
             ),
           ],
         ),
@@ -244,7 +229,7 @@ class _ProfessionalDashboardScreenState extends State<ProfessionalDashboardScree
             child: Container(
               height: 40,
               decoration: BoxDecoration(
-                color: const Color(0xFFF5F5F5),
+                color: const Color(0xFFF8FAFC),
                 borderRadius: BorderRadius.circular(20),
               ),
               child: TextField(

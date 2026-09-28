@@ -1,3 +1,5 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+
 class UserModel {
   final String id;
   final String role; // "client" | "attorney" | "admin" | "staff"
@@ -70,6 +72,13 @@ class UserModel {
     }
 
     final displayName = UserModel.resolveDisplayName(data);
+    DateTime createdAt = DateTime.now();
+    final rawCreatedAt = data['createdAt'];
+    if (rawCreatedAt is Timestamp) {
+      createdAt = rawCreatedAt.toDate();
+    } else if (rawCreatedAt is DateTime) {
+      createdAt = rawCreatedAt;
+    }
 
     return UserModel(
       id: id,
@@ -82,9 +91,9 @@ class UserModel {
       email: data['email'] ?? '',
       photoUrl: data['photoUrl'],
       specialization: specialization,
-      ratingAverage: data['ratingAverage']?.toDouble(),
-      createdAt: data['createdAt']?.toDate() ?? DateTime.now(),
-      isAvailable: data['isAvailable'],
+      ratingAverage: (data['ratingAverage'] as num?)?.toDouble(),
+      createdAt: createdAt,
+      isAvailable: data['isAvailable'] is bool ? data['isAvailable'] as bool : null,
       // Ensure phone values are always treated as strings, even if stored as numbers
       phone: (data['phone'] ?? data['phoneNumber'])?.toString(),
       phoneNumber: data['phoneNumber']?.toString(),

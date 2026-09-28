@@ -29,5 +29,8 @@ class SupabaseConfig {
       _envKey.isNotEmpty ? _envKey : kDevSupabaseAnonKey;
 
   static bool get isConfigured =>
-      projectUrl.isNotEmpty && publishableAnonKey.isNotEmpty;
+      projectUrl.isNotEmpty &&
+      publishableAnonKey.isNotEmpty &&
+      !publishableAnonKey.startsWith('PASTE_') &&
+      !publishableAnonKey.startsWith('YOUR_');
 }

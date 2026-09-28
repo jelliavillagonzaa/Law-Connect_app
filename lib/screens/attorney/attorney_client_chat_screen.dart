@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:get/get.dart';
+import 'dart:async' show StreamSubscription, unawaited;
 import '../../services/chat_service.dart';
+import '../../services/chat_session.dart';
 import '../../models/message_model.dart';
 import '../../theme/app_theme.dart';
 
@@ -29,10 +31,12 @@ class _AttorneyClientChatScreenState extends State<AttorneyClientChatScreen> {
   bool _isLoading = true;
   bool _hasScrolledToBottom = false;
   bool _canSend = false;
+  StreamSubscription<List<MessageModel>>? _messagesSub;
 
   @override
   void initState() {
     super.initState();
+    ChatSession.open(widget.chatId);
     _initializeChat();
     _messageController.addListener(() {
       final canSend = _messageController.text.trim().isNotEmpty;
@@ -53,11 +57,20 @@ class _AttorneyClientChatScreenState extends State<AttorneyClientChatScreen> {
 
     try {
       setState(() => _isLoading = false);
-      _chatService.markMessagesAsSeen(widget.chatId, user.uid);
+      unawaited(_chatService.markMessagesAsSeen(widget.chatId, user.uid));
+      _listenForSeenUpdates(widget.chatId, user.uid);
     } catch (e) {
       setState(() => _isLoading = false);
       print('Error initializing chat: $e');
     }
+  }
+
+  void _listenForSeenUpdates(String chatId, String userId) {
+    _messagesSub?.cancel();
+    _messagesSub = _chatService.getMessagesWithNotifications(chatId).listen(
+      (_) => _chatService.markMessagesAsSeenDebounced(chatId, userId),
+      onError: (_) {},
+    );
   }
 
   Future<void> _sendMessage() async {
@@ -100,6 +113,8 @@ class _AttorneyClientChatScreenState extends State<AttorneyClientChatScreen> {
 
   @override
   void dispose() {
+    ChatSession.close(widget.chatId);
+    _messagesSub?.cancel();
     _messageController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -137,7 +152,7 @@ class _AttorneyClientChatScreenState extends State<AttorneyClientChatScreen> {
     }
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF5F5F5),
+      backgroundColor: const Color(0xFFF8FAFC),
       appBar: AppBar(
         backgroundColor: Colors.white,
         elevation: 0,
@@ -160,8 +175,9 @@ class _AttorneyClientChatScreenState extends State<AttorneyClientChatScreen> {
             child: StreamBuilder<List<MessageModel>>(
               stream: _chatService.getMessages(widget.chatId),
               builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
+                if (snapshot.connectionState == ConnectionState.waiting &&
+                    !snapshot.hasData) {
+                  return const SizedBox.shrink();
                 }
 
                 if (snapshot.hasError) {

@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../theme/app_theme.dart';
 import '../../services/chat_service.dart';
+import '../../services/chat_session.dart';
 import '../../models/message_model.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -31,15 +33,22 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _hasError = false;
   String? _errorMessage;
   String _displayName = '';
+  StreamSubscription<List<MessageModel>>? _messagesSub;
 
   // Color palette
-  static const Color primaryColor = Color(0xFF0D3559);
-  static const Color backgroundColor = Color(0xFFF6F7FB);
+  static const Color primaryColor = AppTheme.royalBlue;
+  static const Color backgroundColor = AppTheme.lightGray;
 
   @override
   void initState() {
     super.initState();
-    _initializeChat();
+    _displayName = widget.otherUserName;
+    if (widget.conversationId != null && widget.conversationId!.isNotEmpty) {
+      _conversationId = widget.conversationId;
+      ChatSession.open(_conversationId);
+      _isInitializing = false;
+    }
+    unawaited(_initializeChat());
   }
 
   /// Show error dialog with proper styling
@@ -128,7 +137,8 @@ class _ChatScreenState extends State<ChatScreen> {
         final otherUserDoc = await _firestore
             .collection('users')
             .doc(widget.otherUserId)
-            .get();
+            .get(const GetOptions(source: Source.cache))
+            .timeout(const Duration(seconds: 1));
         if (otherUserDoc.exists) {
           final userData = otherUserDoc.data();
           final otherUserRole = userData?['role'];
@@ -146,14 +156,16 @@ class _ChatScreenState extends State<ChatScreen> {
       String? conversationId;
 
       // If conversationId is provided, use it
-      if (widget.conversationId != null) {
+      if (widget.conversationId != null && widget.conversationId!.isNotEmpty) {
         conversationId = widget.conversationId;
       } else {
         // Otherwise, create or get conversation
-        conversationId = await _chatService.getOrCreateChat(
-          user.uid,
-          widget.otherUserId,
-        );
+        conversationId = await _chatService
+            .getOrCreateChat(
+              user.uid,
+              widget.otherUserId,
+            )
+            .timeout(const Duration(seconds: 2));
       }
 
       if (mounted) {
@@ -162,10 +174,12 @@ class _ChatScreenState extends State<ChatScreen> {
           _isInitializing = false;
           _hasError = false;
         });
+        ChatSession.open(conversationId);
 
         // Mark messages as seen
         if (conversationId != null) {
           _chatService.markMessagesAsSeen(conversationId, user.uid);
+          _listenForSeenUpdates(conversationId, user.uid);
         }
       }
     } catch (e) {
@@ -180,6 +194,14 @@ class _ChatScreenState extends State<ChatScreen> {
         _showErrorDialog(context, _errorMessage!);
       }
     }
+  }
+
+  void _listenForSeenUpdates(String chatId, String userId) {
+    _messagesSub?.cancel();
+    _messagesSub = _chatService.getMessagesWithNotifications(chatId).listen(
+      (_) => _chatService.markMessagesAsSeenDebounced(chatId, userId),
+      onError: (_) {},
+    );
   }
 
   Future<void> _sendMessage() async {
@@ -664,6 +686,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    ChatSession.close(_conversationId);
+    _messagesSub?.cancel();
     _messageController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -674,7 +698,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final user = FirebaseAuth.instance.currentUser;
 
     // Loading state
-    if (_isInitializing) {
+    if (_isInitializing && _conversationId == null) {
       return Scaffold(
         backgroundColor: backgroundColor,
         appBar: AppBar(
@@ -684,7 +708,7 @@ class _ChatScreenState extends State<ChatScreen> {
             style: const TextStyle(color: Colors.white),
           ),
         ),
-        body: const Center(child: CircularProgressIndicator()),
+        body: const SizedBox.expand(),
       );
     }
 
@@ -771,7 +795,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     return Scaffold(
       backgroundColor: const Color(
-        0xFFF5F5F5,
+        0xFFF8FAFC,
       ), // Light gray background like in the image
       appBar: AppBar(
         backgroundColor: Colors.white,
@@ -796,8 +820,9 @@ class _ChatScreenState extends State<ChatScreen> {
                 _conversationId!,
               ),
               builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
+                if (snapshot.connectionState == ConnectionState.waiting &&
+                    !snapshot.hasData) {
+                  return const SizedBox.shrink();
                 }
 
                 if (snapshot.hasError) {

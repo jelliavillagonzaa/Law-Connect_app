@@ -3,7 +3,7 @@ import 'package:get/get.dart';
 import '../../theme/app_theme.dart';
 import '../../services/auth_service.dart';
 import '../../controllers/auth_controller.dart';
-import '../../pages/client/client_landing_page.dart';
+import '../../routes/portal_navigation.dart';
 
 class HomeDashboardScreen extends StatelessWidget {
   const HomeDashboardScreen({super.key});
@@ -60,14 +60,12 @@ class HomeDashboardScreen extends StatelessWidget {
           await authService.logout();
         }
 
-        // Navigate to splash screen (which will route appropriately)
         if (context.mounted) {
-          Get.offAll(() => const ClientLandingPage());
+          navigateAfterLogout();
         }
       } catch (e) {
-        // Even if logout fails, navigate to splash screen
         if (context.mounted) {
-          Get.offAll(() => const ClientLandingPage());
+          navigateAfterLogout();
         }
       }
     }
@@ -97,34 +95,41 @@ class HomeDashboardScreen extends StatelessWidget {
               ),
               const SizedBox(height: 16),
 
-              // Overview Cards Grid
-              GridView.count(
-                shrinkWrap: true,
-                physics: const NeverScrollableScrollPhysics(),
-                crossAxisCount: 3,
-                crossAxisSpacing: 12,
-                mainAxisSpacing: 12,
-                childAspectRatio: 1.0,
-                children: [
-                  _buildOverviewCard(
-                    icon: Icons.folder_copy_rounded,
-                    title: 'Active Cases',
-                    value: '9',
-                    color: AppTheme.navy,
-                  ),
-                  _buildOverviewCard(
-                    icon: Icons.calendar_today_rounded,
-                    title: 'Appointments',
-                    value: '9',
-                    color: AppTheme.gold,
-                  ),
-                  _buildOverviewCard(
-                    icon: Icons.chat_bubble_outline_rounded,
-                    title: 'Unread Messages',
-                    value: '0',
-                    color: AppTheme.success,
-                  ),
-                ],
+              IntrinsicHeight(
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Expanded(
+                      child: _buildOverviewCard(
+                        icon: Icons.folder_copy_rounded,
+                        title: 'Active Cases',
+                        value: '9',
+                        color: AppTheme.inkBlue,
+                        backgroundColor: AppTheme.pastelBlueGray,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _buildOverviewCard(
+                        icon: Icons.calendar_today_rounded,
+                        title: 'Appointments',
+                        value: '9',
+                        color: AppTheme.inkGold,
+                        backgroundColor: AppTheme.pastelBeige,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _buildOverviewCard(
+                        icon: Icons.chat_bubble_outline_rounded,
+                        title: 'Unread Messages',
+                        value: '0',
+                        color: AppTheme.inkGreen,
+                        backgroundColor: AppTheme.pastelMint,
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ],
           ),
@@ -249,41 +254,47 @@ class HomeDashboardScreen extends StatelessWidget {
     required String title,
     required String value,
     required Color color,
+    Color? backgroundColor,
   }) {
     return Container(
-      padding: const EdgeInsets.all(16),
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(8, 10, 8, 10),
       decoration: BoxDecoration(
-        color: AppTheme.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: color.withOpacity(0.2), width: 1),
+        color: backgroundColor ?? AppTheme.pastelBlueGray,
+        borderRadius: BorderRadius.circular(16),
         boxShadow: [
           BoxShadow(
             color: Colors.black.withOpacity(0.05),
-            blurRadius: 4,
+            blurRadius: 8,
             offset: const Offset(0, 2),
           ),
         ],
       ),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
-        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          Icon(icon, size: 32, color: color),
-          const SizedBox(height: 12),
+          Icon(icon, size: 22, color: color),
+          const SizedBox(height: 6),
           Text(
             value,
-            style: AppTheme.heading3.copyWith(
+            style: AppTheme.heading4.copyWith(
               color: AppTheme.textPrimary,
               fontWeight: FontWeight.bold,
+              height: 1.1,
             ),
           ),
           const SizedBox(height: 4),
           Text(
             title,
-            style: AppTheme.bodySmall.copyWith(color: AppTheme.textSecondary),
+            style: AppTheme.bodySmall.copyWith(
+              color: AppTheme.textSecondary,
+              fontSize: 11,
+              height: 1.15,
+            ),
             textAlign: TextAlign.center,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
+            softWrap: true,
           ),
         ],
       ),

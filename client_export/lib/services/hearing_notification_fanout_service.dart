@@ -80,7 +80,6 @@ class HearingNotificationFanoutService {
   /// Always merged into the reminders inbox (not only the recent-200 cap).
   static const _inboxHearingNotificationTypes = [
     'hearing_activity',
-    'hearing_activity_update',
   ];
 
   static const _inboxAppointmentNotificationTypes = [
@@ -1539,13 +1538,14 @@ class HearingNotificationFanoutService {
 
   /// Wrong rows for clients (email queue / "New court notice"), not court hearing orders.
   static bool shouldRemoveClientNotification(Map<String, dynamic> data) {
+    if (isHearingRecordUpdateNotification(data)) return true;
+
     final title = (data['title'] as String? ?? '').toLowerCase().trim();
     final type = (data['type'] as String? ?? '').toLowerCase();
     final hid = (data['hearingDocId'] as String?)?.trim() ?? '';
 
     // Real court hearing rows (with hearing doc link) — repair title, do not delete.
-    if (hid.isNotEmpty &&
-        (type == 'hearing_activity' || type == 'hearing_activity_update')) {
+    if (hid.isNotEmpty && type == 'hearing_activity') {
       return false;
     }
 
@@ -1554,12 +1554,11 @@ class HearingNotificationFanoutService {
     if (_isWrongClientCourtNoticeTitle(title)) return true;
 
     // hearing_activity noise without a linked hearing doc.
-    if ((type == 'hearing_activity' || type == 'hearing_activity_update') &&
-        hid.isEmpty) {
+    if (type == 'hearing_activity' && hid.isEmpty) {
       return true;
     }
 
-    if (type == 'hearing_activity' || type == 'hearing_activity_update') {
+    if (type == 'hearing_activity') {
       return false;
     }
     if (hid.isNotEmpty) return false;
@@ -2158,15 +2157,6 @@ class HearingNotificationFanoutService {
     final type = 'hearing_activity';
 
     if (skipInAppWrites) {
-      await HearingSmsAlertService.instance.sendAlertsForHearing(
-        hearingDocId: doc.id,
-        hearingData: d,
-        recipientUserIds: recipientList,
-        title: title,
-        body: body,
-        summary: summary,
-        caseLabel: caseLabel,
-      );
       return;
     }
 
@@ -2356,6 +2346,7 @@ class HearingNotificationFanoutService {
 
     for (final doc in notifDocs) {
       var data = Map<String, dynamic>.from(doc.data());
+      if (isHearingRecordUpdateNotification(data)) continue;
       if (hearingsOnly && clientCourtEmailSpamNotification(data)) continue;
       final type = data['type'] as String? ?? '';
       if (!allNotificationTypes) {
@@ -3356,10 +3347,19 @@ bool _hearingTypeForBell(String type) {
   final t = type.toLowerCase();
   // Court-email ingest alerts belong in the general inbox, not hearing reminders.
   if (t == 'court_email_ingest' || t.startsWith('court_')) return false;
+  if (t == 'hearing_activity_update') return false;
   return t.contains('hearing') ||
       t == 'appointment_scheduled' ||
       t == 'appointment_3day_reminder' ||
       t == 'appointment_sameday_reminder';
+}
+
+/// Extra "Hearing record updated" inbox rows. The hearing already lives in `hearings`.
+bool isHearingRecordUpdateNotification(Map<String, dynamic> data) {
+  final type = (data['type'] as String? ?? '').toLowerCase();
+  if (type == 'hearing_activity_update') return true;
+  final title = (data['title'] as String? ?? '').trim().toLowerCase();
+  return title.startsWith('hearing record updated');
 }
 
 /// Used by attorney UI to count rows that should light the reminders bell.
@@ -3369,18 +3369,20 @@ bool hearingOrAppointmentBellType(String type) => _hearingTypeForBell(type);
 bool clientHearingInboxType(String type) {
   final t = type.toLowerCase();
   if (t == 'court_email_ingest' || t.startsWith('court_')) return false;
+  if (t == 'hearing_activity_update') return false;
   return t.contains('hearing');
 }
 
 /// Email-ingest spam shown as "New court notice" — not real court hearing orders.
 bool clientCourtEmailSpamNotification(Map<String, dynamic> data) {
+  if (isHearingRecordUpdateNotification(data)) return true;
+
   final type = (data['type'] as String? ?? '').toLowerCase();
   final hid = (data['hearingDocId'] as String?)?.trim() ?? '';
   final title = (data['title'] as String? ?? '').toLowerCase().trim();
 
   // Linked `hearings/{id}` row — keep and repair title in UI (not email-queue spam).
-  if (hid.isNotEmpty &&
-      (type == 'hearing_activity' || type == 'hearing_activity_update')) {
+  if (hid.isNotEmpty && type == 'hearing_activity') {
     return false;
   }
 
@@ -3392,8 +3394,7 @@ bool clientCourtEmailSpamNotification(Map<String, dynamic> data) {
   if (type.startsWith('court_') && !type.contains('hearing')) return true;
 
   // Email queue rows typed as hearing_activity but not linked to a hearing doc.
-  if ((type == 'hearing_activity' || type == 'hearing_activity_update') &&
-      hid.isEmpty) {
+  if (type == 'hearing_activity' && hid.isEmpty) {
     return true;
   }
 

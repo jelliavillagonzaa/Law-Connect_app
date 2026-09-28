@@ -40,6 +40,7 @@ class SafeNetworkAvatar extends StatelessWidget {
           height: size,
           fit: BoxFit.cover,
           gaplessPlayback: true,
+          webHtmlElementStrategy: WebHtmlElementStrategy.prefer,
           errorBuilder: (_, __, ___) => _letterChild(letter),
           loadingBuilder: (context, child, progress) {
             if (progress == null) return child;

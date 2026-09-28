@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import '../services/email_otp_service.dart';
 import '../services/admin_service.dart';
+import '../services/calendar_session_cleanup.dart';
 class AuthController extends GetxController {
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -651,6 +652,7 @@ class AuthController extends GetxController {
   // LOGOUT
   // ==============================
   Future<void> logout() async {
+    CalendarSessionCleanup.onLogout();
     await _auth.signOut();
     // TODO: Replace with actual route when screens are created
     // Get.offAllNamed('/login');

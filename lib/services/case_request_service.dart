@@ -1,6 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import '../models/case_request_model.dart';
+import 'attorney_request_notify.dart';
 import 'fcm_service.dart';
 import 'firestore_mirror_helper.dart';
 
@@ -64,35 +65,30 @@ class CaseRequestService {
         debugPrint('✅ Case request created: $requestId');
       }
 
-      // Send notification to attorney(s)
-      if (attorneyId != null) {
-        // Send to specific attorney
-        await _sendRequestNotificationToAttorney(attorneyId, clientName, subject);
+      // Notify attorney(s): FCM + in-app + SMS
+      List<String> attorneyIds;
+      if (attorneyId != null && attorneyId.isNotEmpty) {
+        attorneyIds = [attorneyId];
       } else {
-        // Send to all attorneys (or you can implement a broadcast)
-        // For now, we'll just save the notification in Firestore
-        // Attorneys will see it in their dashboard
-        await _createInAppNotificationForAllAttorneys(clientName, subject, requestId);
+        attorneyIds = await AttorneyRequestNotify.allAttorneyIds();
       }
 
-      // Also create in-app notification
-      final notifData = <String, dynamic>{
-        'userId': attorneyId ?? 'all_attorneys',
-        'type': 'case_request',
-        'title': 'New Case Request',
-        'message': '$clientName: $subject',
-        'data': {
+      final smsSubject = subject.trim().isEmpty ? 'a request' : subject.trim();
+      await AttorneyRequestNotify.notifyAttorneys(
+        attorneyIds: attorneyIds,
+        title: 'New Case Request',
+        message: '$clientName: $subject',
+        smsBody: 'Law Connect: New request from $clientName: $smsSubject.',
+        type: 'case_request',
+        data: {
           'requestId': requestId,
           'clientId': clientId,
           'clientName': clientName,
         },
-        'isRead': false,
-        'createdAt': FieldValue.serverTimestamp(),
-      };
-      await HybridDatastore.add(collection: 'notifications', data: notifData);
+      );
 
       if (kDebugMode) {
-        debugPrint('✅ Notifications sent');
+        debugPrint('✅ Notifications sent to ${attorneyIds.length} attorney(s)');
         debugPrint('═══════════════════════════════════════');
       }
 
@@ -111,67 +107,6 @@ class CaseRequestService {
         'success': false,
         'message': 'Failed to create request: $e',
       };
-    }
-  }
-
-  /// Send FCM notification to specific attorney
-  Future<void> _sendRequestNotificationToAttorney(
-    String attorneyId,
-    String clientName,
-    String subject,
-  ) async {
-    try {
-      await _fcmService.sendNotificationToUser(
-        userId: attorneyId,
-        title: 'New Case Request',
-        body: '$clientName: $subject',
-        data: {
-          'type': 'case_request',
-          'clientName': clientName,
-        },
-      );
-    } catch (e) {
-      if (kDebugMode) {
-        debugPrint('⚠️ Failed to send FCM to attorney: $e');
-      }
-    }
-  }
-
-  /// Create in-app notification for all attorneys
-  Future<void> _createInAppNotificationForAllAttorneys(
-    String clientName,
-    String subject,
-    String requestId,
-  ) async {
-    try {
-      // Get all attorneys
-      final attorneysSnapshot = await _firestore
-          .collection('users')
-          .where('role', isEqualTo: 'attorney')
-          .get();
-
-      // Create notification for each attorney
-      final batch = _firestore.batch();
-      for (var doc in attorneysSnapshot.docs) {
-        final notificationRef = _firestore.collection('notifications').doc();
-        batch.set(notificationRef, {
-          'userId': doc.id,
-          'type': 'case_request',
-          'title': 'New Case Request',
-          'message': '$clientName: $subject',
-          'data': {
-            'requestId': requestId,
-            'clientName': clientName,
-          },
-          'isRead': false,
-          'createdAt': FieldValue.serverTimestamp(),
-        });
-      }
-      await batch.commit();
-    } catch (e) {
-      if (kDebugMode) {
-        debugPrint('⚠️ Failed to create notifications for attorneys: $e');
-      }
     }
   }
 

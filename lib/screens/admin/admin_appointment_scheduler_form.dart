@@ -5,6 +5,7 @@ import '../../models/appointment_model.dart';
 import '../../services/enhanced_appointment_service.dart';
 import '../../services/case_service.dart';
 import '../../models/case_model.dart';
+import '../../widgets/common/schedule_full_dialog.dart';
 
 class AdminAppointmentSchedulerForm extends StatefulWidget {
   final String? clientId;
@@ -58,7 +59,7 @@ class _AdminAppointmentSchedulerFormState
   bool _isLoadingAttorneys = false;
 
   // Color constants
-  static const Color primaryRed = Color(0xFF1A4D8F); // Royal Blue
+  static const Color primaryRed = Color(0xFF1A3A6C);
 
   @override
   void initState() {
@@ -323,9 +324,10 @@ class _AdminAppointmentSchedulerFormState
     }
 
     try {
+      Map<String, dynamic> result;
       if (widget.existingAppointment != null) {
         // Update existing appointment
-        await _appointmentService.updateAppointment(
+        result = await _appointmentService.updateAppointment(
           widget.existingAppointment!.id,
           appointmentDateTime: appointmentDateTime,
           appointmentType: _appointmentType,
@@ -353,7 +355,7 @@ class _AdminAppointmentSchedulerFormState
           }
         }
 
-        await _appointmentService.createAppointment(
+        result = await _appointmentService.createAppointment(
           clientId: clientId,
           clientName: clientName,
           attorneyId: attorneyId,
@@ -368,7 +370,9 @@ class _AdminAppointmentSchedulerFormState
         );
       }
 
-      if (mounted) {
+      if (!mounted) return;
+
+      if (result['success'] == true) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
@@ -380,6 +384,17 @@ class _AdminAppointmentSchedulerFormState
           ),
         );
         Navigator.pop(context, true);
+      } else if (EnhancedAppointmentService.isScheduleFull(result)) {
+        setState(() => _isLoading = false);
+        await showScheduleFullDialog(context, date: appointmentDateTime);
+      } else {
+        setState(() => _isLoading = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(result['message'] ?? 'Failed to save appointment'),
+            backgroundColor: Colors.red,
+          ),
+        );
       }
     } catch (e) {
       if (mounted) {
@@ -399,7 +414,7 @@ class _AdminAppointmentSchedulerFormState
     final isWeb = MediaQuery.of(context).size.width > 600;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF5F5F5),
+      backgroundColor: const Color(0xFFF8FAFC),
       appBar: AppBar(
         backgroundColor: primaryRed,
         title: Text(

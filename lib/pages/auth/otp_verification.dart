@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:get/get.dart';
-import 'package:url_launcher/url_launcher.dart';
 import '../../services/auth_service.dart';
 import '../../services/firestore_service.dart';
 import '../../theme/app_theme.dart';
@@ -18,6 +18,8 @@ class OtpVerificationPage extends StatefulWidget {
 class _OtpVerificationPageState extends State<OtpVerificationPage> {
   final AuthService _authService = AuthService();
   final FirestoreService _firestoreService = FirestoreService();
+  final GlobalKey<OtpInputFieldState> _otpFieldKey =
+      GlobalKey<OtpInputFieldState>();
   bool _isChecking = false;
   bool _isResending = false;
   bool _isSendingCode = false;
@@ -76,6 +78,7 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
       _userEmail = user.email;
       _userDisplayName = data?.name;
     });
+    await _sendOtpToEmail();
   }
 
   Future<void> _sendOtpToEmail() async {
@@ -143,6 +146,8 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
       );
       if (!mounted) return;
       if (otpResult['success'] != true) {
+        _otpFieldKey.currentState?.clear();
+        setState(() => _enteredOtp = '');
         Get.snackbar(
           'Verification',
           otpResult['message'] ?? 'Invalid code',
@@ -300,7 +305,10 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
       body: Container(
         color: AppTheme.lightGray,
         child: SafeArea(
-          child: SingleChildScrollView(
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 480),
+              child: SingleChildScrollView(
             padding: const EdgeInsets.all(24),
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
@@ -382,37 +390,18 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
                   ),
                 ),
                 const SizedBox(height: 8),
-                // Email address (clickable - opens Gmail)
                 if (_userEmail != null)
                   GestureDetector(
                     onTap: () async {
-                      // Open Gmail app or web
-                      final gmailUrl = Uri.parse('https://mail.google.com/mail/u/0/#inbox');
-                      final gmailAppUrl = Uri.parse('googlegmail://');
-                      
-                      try {
-                        // Try to open Gmail app first
-                        if (await canLaunchUrl(gmailAppUrl)) {
-                          await launchUrl(gmailAppUrl);
-                        } else if (await canLaunchUrl(gmailUrl)) {
-                          // Fallback to Gmail web
-                          await launchUrl(gmailUrl, mode: LaunchMode.externalApplication);
-                        } else {
-                          Get.snackbar(
-                            'Info',
-                            'Please open your email app manually',
-                            backgroundColor: AppTheme.royalBlue,
-                            colorText: Colors.white,
-                          );
-                        }
-                      } catch (e) {
-                        Get.snackbar(
-                          'Error',
-                          'Could not open email app: $e',
-                          backgroundColor: Colors.red,
-                          colorText: Colors.white,
-                        );
-                      }
+                      await Clipboard.setData(ClipboardData(text: _userEmail!));
+                      if (!mounted) return;
+                      Get.snackbar(
+                        'Copied',
+                        'Email copied. Stay here and enter the 6-digit code.',
+                        backgroundColor: AppTheme.royalBlue,
+                        colorText: Colors.white,
+                        duration: const Duration(seconds: 2),
+                      );
                     },
                     child: Container(
                       padding: const EdgeInsets.symmetric(vertical: 8),
@@ -423,8 +412,6 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
                           fontSize: 16,
                           fontWeight: FontWeight.bold,
                           color: AppTheme.royalBlue,
-                          decoration: TextDecoration.underline,
-                          decorationColor: AppTheme.royalBlue,
                         ),
                       ),
                     ),
@@ -465,7 +452,7 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        'Tap “Send code” to get a 6-digit code by email, then enter it below.',
+                        'We send a 6-digit code to your email. Enter it below — this screen stays open until you verify or go back to login.',
                         style: AppTheme.cardDetailStyle.copyWith(fontSize: 13),
                       ),
                       const SizedBox(height: 16),
@@ -497,6 +484,7 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
                       ),
                       const SizedBox(height: 20),
                       OtpInputField(
+                        key: _otpFieldKey,
                         onChanged: (value) {
                           setState(() => _enteredOtp = value);
                         },
@@ -610,7 +598,7 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
                 TextButton(
                   onPressed: () async {
                     await _authService.logout();
-                    Get.back();
+                    Get.offAllNamed('/LoginPage');
                   },
                   style: TextButton.styleFrom(
                     foregroundColor: AppTheme.royalBlue,
@@ -623,6 +611,8 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
                   ),
                 ),
               ],
+            ),
+          ),
             ),
           ),
         ),

@@ -60,10 +60,10 @@ class _SendRequestScreenState extends State<SendRequestScreen> {
         return;
       }
 
-      // Get client's attorney if not provided
+      // Prefer assigned attorney from any active case (not only accepted)
       String? attorneyId = widget.attorneyId;
       if (attorneyId == null) {
-        attorneyId = await _caseService.getClientAttorneyId(user.uid);
+        attorneyId = await _caseService.findAttorneyIdForClient(user.uid);
       }
 
       final result = await _requestService.createCaseRequest(

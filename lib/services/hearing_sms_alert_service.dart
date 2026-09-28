@@ -6,7 +6,11 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config/philsms_config.dart';
+import '../config/semaphore_config.dart';
+import '../utils/hearing_sms_formatter.dart';
+import 'hearing_party_names.dart';
 import 'philsms_service.dart';
+import 'semaphore_service.dart';
 
 /// PhilSMS alerts for `hearings` collection — **not** tied to Firestore `notifications` writes.
 ///
@@ -82,6 +86,14 @@ class HearingSmsAlertService {
     }
   }
 
+  /// Skip only after a provider actually delivered the intake SMS.
+  ///
+  /// Push is sent first. `philsmsIntakeSent` is claimed before the text goes
+  /// out, so that flag alone must not hide a failed SMS.
+  static bool _cloudFunctionsSendsIntakeSms(Map<String, dynamic> data) {
+    return data['philsmsLastSentAt'] != null;
+  }
+
   /// Standalone path: `hearings` doc added/updated → SMS (if content digest is new).
   Future<void> _onHearingDocumentChanged(
     DocumentSnapshot<Map<String, dynamic>> doc,
@@ -91,6 +103,7 @@ class HearingSmsAlertService {
     if (data == null || !PhilSmsHearingAlertConfig.isSmsEligibleHearing(data)) {
       return;
     }
+    if (_cloudFunctionsSendsIntakeSms(data)) return;
 
     final clientUids = await _resolveClientUidsByName(data);
     await sendAlertsForHearing(
@@ -110,13 +123,19 @@ class HearingSmsAlertService {
     String? summary,
     String? caseLabel,
   }) async {
-    if (!PhilSmsConfig.isConfigured) {
+    if (!PhilSmsConfig.isConfigured && !SemaphoreConfig.isConfigured) {
       if (kDebugMode) {
-        debugPrint('HearingSmsAlertService: PhilSMS not configured');
+        debugPrint('HearingSmsAlertService: PhilSMS and Semaphore not configured');
       }
       return;
     }
     if (!PhilSmsHearingAlertConfig.isSmsEligibleHearing(hearingData)) return;
+    if (_cloudFunctionsSendsIntakeSms(hearingData)) return;
+
+    final intakeKey = 'hearing_sms_intake_$hearingDocId';
+    if (await _alreadySent(intakeKey)) return;
+    await _markSent(intakeKey);
+    var delivered = false;
 
     final digestKey =
         PhilSmsHearingAlertConfig.digestForDocument(hearingDocId, hearingData);
@@ -134,9 +153,8 @@ class HearingSmsAlertService {
     Future<void> sendToPhone(
       String phone,
       String smsDigestKey,
-      String roleLabel, {
-      String reminderNote = '',
-    }) async {
+      String roleLabel,
+    ) async {
       final normalized = PhilSmsService.normalizeRecipient(phone);
       if (normalized.length < 11) {
         if (kDebugMode) {
@@ -149,37 +167,49 @@ class HearingSmsAlertService {
       if (!phonesAlreadySent.add(normalized)) return;
       if (await _alreadySent(smsDigestKey)) return;
 
-      final smsText = _buildSmsText(
-        roleLabel: roleLabel,
+      final smsText = HearingSmsFormatter.build(
         caseNo: caseNo,
         caseTitle: caseTitle,
         clientName: clientName,
         hearingDate: hearingDate,
         hearingTime: hearingTime,
         location: location,
-        reminderNote: reminderNote,
       );
 
-      final result = await PhilSmsService.instance.sendSmsWithResult(
-        to: phone,
-        message: smsText,
-      );
-      if (kDebugMode) {
-        debugPrint(
-          'HearingSmsAlertService [$roleLabel] → …${normalized.substring(normalized.length - 4)}: '
-          '${result.success ? "ok" : result.errorMessage ?? "failed"}',
+      var philOk = false;
+      if (!kIsWeb && PhilSmsConfig.isConfigured) {
+        final result = await PhilSmsService.instance.sendSmsWithResult(
+          to: phone,
+          message: smsText,
         );
+        philOk = result.success;
+        if (kDebugMode) {
+          debugPrint(
+            'HearingSmsAlertService PhilSMS [$roleLabel] → …${normalized.substring(normalized.length - 4)}: '
+            '${result.success ? "ok" : result.errorMessage ?? "failed"}',
+          );
+        }
       }
-      if (result.success) await _markSent(smsDigestKey);
-    }
 
-    for (final target in PhilSmsConfig.configuredFirmSmsTargets) {
-      final normalized = PhilSmsService.normalizeRecipient(target.phone);
-      await sendToPhone(
-        target.phone,
-        '${digestKey}_cfg_$normalized',
-        target.roleLabel,
-      );
+      var semOk = false;
+      if (SemaphoreConfig.isConfigured) {
+        final sem = await SemaphoreService.instance.sendSmsWithResult(
+          to: phone,
+          message: smsText,
+        );
+        semOk = sem.success;
+        if (kDebugMode) {
+          debugPrint(
+            'HearingSmsAlertService Semaphore [$roleLabel] → …${normalized.substring(normalized.length - 4)}: '
+            '${sem.success ? "ok" : sem.errorMessage ?? "failed"}',
+          );
+        }
+      }
+
+      if (philOk || semOk) {
+        delivered = true;
+        await _markSent(smsDigestKey);
+      }
     }
 
     for (final uid in clientUids) {
@@ -189,7 +219,9 @@ class HearingSmsAlertService {
       await sendToPhone(phone, '${digestKey}_client_${uid}_$normalized', 'Client');
     }
 
-    for (final uid in recipientUserIds) {
+    final firmUserIds = await _activeAttorneyAndStaffIds();
+    final smsUserIds = <String>{...recipientUserIds, ...firmUserIds};
+    for (final uid in smsUserIds) {
       if (clientUids.contains(uid)) continue;
       final phone = await _resolvePhoneForUser(uid);
       if (phone == null || phone.isEmpty) {
@@ -202,6 +234,8 @@ class HearingSmsAlertService {
       final normalized = PhilSmsService.normalizeRecipient(phone);
       await sendToPhone(phone, '${digestKey}_uid_${uid}_$normalized', roleLabel);
     }
+
+    if (!delivered) await _unmarkSent(intakeKey);
   }
 
   static String _formatSmsRole(String? role) {
@@ -265,22 +299,30 @@ class HearingSmsAlertService {
 
     for (final field in ['fullName', 'name', 'displayName']) {
       final stored = (userData[field] as String?)?.trim() ?? '';
-      if (stored.isNotEmpty && _clientNameExactMatch(stored, cn)) {
-        return true;
+      if (stored.isEmpty) continue;
+      if (_clientNameExactMatch(stored, cn)) return true;
+      for (final party in HearingPartyNames.split(cn)) {
+        if (_clientNameExactMatch(stored, party)) return true;
       }
     }
 
-    final hearingParts = _parseFirstLastFromHearing(cn);
-    if (hearingParts == null) return false;
-
+    final parties = HearingPartyNames.split(cn);
+    final candidates = parties.isEmpty ? [cn] : parties;
     String norm(String s) =>
         s.trim().replaceAll(RegExp(r'\s+'), ' ').toLowerCase();
     final signUpFirst = norm(userData['firstName']?.toString() ?? '');
     final signUpLast = norm(userData['lastName']?.toString() ?? '');
     if (signUpFirst.isEmpty || signUpLast.isEmpty) return false;
 
-    return signUpFirst == norm(hearingParts.first) &&
-        signUpLast == norm(hearingParts.last);
+    for (final party in candidates) {
+      final hearingParts = _parseFirstLastFromHearing(party);
+      if (hearingParts == null) continue;
+      if (signUpFirst == norm(hearingParts.first) &&
+          signUpLast == norm(hearingParts.last)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   static List<String> _clientNameQueryVariants(String raw) {
@@ -300,7 +342,7 @@ class HearingSmsAlertService {
     if (clientName.isEmpty) return const [];
 
     final matched = <String>{};
-    final variants = _clientNameQueryVariants(clientName);
+    final parties = HearingPartyNames.split(clientName);
     const fields = ['fullName', 'name', 'displayName'];
 
     void tryAdd(Map<String, dynamic> userData, String uid) {
@@ -312,49 +354,52 @@ class HearingSmsAlertService {
     }
 
     try {
-      for (final field in fields) {
-        for (final nm in variants) {
-          final q = await _db
-              .collection('users')
-              .where(field, isEqualTo: nm)
-              .where('role', isEqualTo: 'client')
-              .limit(10)
-              .get();
-          for (final doc in q.docs) {
-            tryAdd(doc.data(), doc.id);
+      final queryNames = parties.isEmpty ? [clientName] : parties;
+      for (final party in queryNames.take(12)) {
+        final variants = _clientNameQueryVariants(party);
+        for (final field in fields) {
+          for (final nm in variants) {
+            final q = await _db
+                .collection('users')
+                .where(field, isEqualTo: nm)
+                .where('role', isEqualTo: 'client')
+                .limit(10)
+                .get();
+            for (final doc in q.docs) {
+              tryAdd(doc.data(), doc.id);
+            }
+          }
+        }
+
+        final hearingParts = _parseFirstLastFromHearing(party);
+        if (hearingParts != null) {
+          for (final first in _clientNameQueryVariants(hearingParts.first)) {
+            for (final last in _clientNameQueryVariants(hearingParts.last)) {
+              try {
+                final q = await _db
+                    .collection('users')
+                    .where('role', isEqualTo: 'client')
+                    .where('firstName', isEqualTo: first)
+                    .where('lastName', isEqualTo: last)
+                    .limit(10)
+                    .get();
+                for (final doc in q.docs) {
+                  tryAdd(doc.data(), doc.id);
+                }
+              } catch (_) {}
+            }
           }
         }
       }
 
-      final hearingParts = _parseFirstLastFromHearing(clientName);
-      if (hearingParts != null) {
-        for (final first in _clientNameQueryVariants(hearingParts.first)) {
-          for (final last in _clientNameQueryVariants(hearingParts.last)) {
-            try {
-              final q = await _db
-                  .collection('users')
-                  .where('role', isEqualTo: 'client')
-                  .where('firstName', isEqualTo: first)
-                  .where('lastName', isEqualTo: last)
-                  .limit(10)
-                  .get();
-              for (final doc in q.docs) {
-                tryAdd(doc.data(), doc.id);
-              }
-            } catch (_) {}
-          }
-        }
-      }
-
-      if (matched.isEmpty) {
-        final cq = await _db
-            .collection('users')
-            .where('role', isEqualTo: 'client')
-            .limit(300)
-            .get();
-        for (final doc in cq.docs) {
-          tryAdd(doc.data(), doc.id);
-        }
+      final cq = await _db
+          .collection('users')
+          .where('role', isEqualTo: 'client')
+          .limit(300)
+          .get();
+      for (final doc in cq.docs) {
+        if (matched.contains(doc.id)) continue;
+        tryAdd(doc.data(), doc.id);
       }
     } catch (e) {
       if (kDebugMode) {
@@ -370,78 +415,60 @@ class HearingSmsAlertService {
     return matched.toList();
   }
 
+  /// Active attorney and staff accounts. Court SMS uses each profile phone.
+  Future<List<String>> _activeAttorneyAndStaffIds() async {
+    final ids = <String>{};
+    for (final role in const ['attorney', 'staff']) {
+      try {
+        final q = await _db
+            .collection('users')
+            .where('role', isEqualTo: role)
+            .limit(80)
+            .get();
+        for (final doc in q.docs) {
+          if (doc.data()['isActive'] == false) continue;
+          ids.add(doc.id);
+        }
+      } catch (e) {
+        if (kDebugMode) {
+          debugPrint('HearingSmsAlertService firm users ($role): $e');
+        }
+      }
+    }
+    return ids.toList();
+  }
+
   Future<String?> _resolvePhoneForUser(String uid) async {
     try {
       final snap = await _db.collection('users').doc(uid).get();
-      if (!snap.exists) {
-        return PhilSmsConfig.directPhoneForUserId(uid);
-      }
+      if (!snap.exists) return null;
       final data = snap.data() ?? {};
-      final role = (data['role'] as String?)?.toLowerCase().trim() ?? '';
       final profilePhone =
           (data['phoneNumber'] ?? data['phone'])?.toString().trim();
-
-      if (role == 'client') {
-        return (profilePhone != null && profilePhone.isNotEmpty)
-            ? profilePhone
-            : null;
-      }
-
-      if (role == 'attorney' ||
-          role == 'staff' ||
-          role.contains('paralegal')) {
-        final configured = PhilSmsConfig.directPhoneForStaffOrAttorney(
-          uid: uid,
-          role: role,
-        );
-        if (configured != null && configured.isNotEmpty) return configured;
-        return profilePhone;
-      }
-
-      return PhilSmsConfig.directPhoneForUserId(uid) ?? profilePhone;
+      if (profilePhone == null || profilePhone.isEmpty) return null;
+      return profilePhone;
     } catch (e) {
       if (kDebugMode) {
         debugPrint('HearingSmsAlertService phone lookup $uid: $e');
       }
-      return PhilSmsConfig.directPhoneForUserId(uid);
+      return null;
     }
   }
 
-  String _buildSmsText({
-    String roleLabel = '',
-    String caseNo = '',
-    String caseTitle = '',
-    String clientName = '',
-    String hearingDate = '',
-    String hearingTime = '',
-    String location = '',
-    String reminderNote = '',
-  }) {
-    final parts = <String>[PhilSmsHearingAlertConfig.smsBrandLabel];
-    if (reminderNote.isNotEmpty) parts.add(reminderNote);
-    if (roleLabel.isNotEmpty) parts.add('Role: $roleLabel');
-    if (caseNo.isNotEmpty) parts.add(caseNo);
-    if (caseTitle.isNotEmpty) parts.add(caseTitle);
-    if (clientName.isNotEmpty) parts.add('Client: $clientName');
-    if (location.isNotEmpty) {
-      parts.add(
-        location.length > 90
-            ? 'Location: ${location.substring(0, 87)}...'
-            : 'Location: $location',
-      );
-    }
-    if (hearingDate.isNotEmpty) parts.add('Date: $hearingDate');
-    if (hearingTime.isNotEmpty) parts.add('Time: $hearingTime');
-    var text = parts.join(' - ');
-    if (text.length > 480) text = '${text.substring(0, 477)}...';
-    return text;
-  }
 
   Future<bool> _alreadySent(String key) async {
     final prefs = await SharedPreferences.getInstance();
     final list = prefs.getStringList(PhilSmsHearingAlertConfig.smsDedupePrefsKey) ??
         [];
     return list.contains(key);
+  }
+
+  Future<void> _unmarkSent(String key) async {
+    final prefs = await SharedPreferences.getInstance();
+    final list = prefs.getStringList(PhilSmsHearingAlertConfig.smsDedupePrefsKey) ??
+        [];
+    if (!list.remove(key)) return;
+    await prefs.setStringList(PhilSmsHearingAlertConfig.smsDedupePrefsKey, list);
   }
 
   Future<void> _markSent(String key) async {

@@ -18,6 +18,11 @@ class AppTextField extends StatelessWidget {
   final Widget? suffixIcon;
   final bool readOnly;
   final Key? fieldKey;
+  final FocusNode? focusNode;
+  final TextInputAction? textInputAction;
+  final void Function(String)? onFieldSubmitted;
+  /// When false, the field uses a placeholder only (no reserved floating-label space).
+  final bool showFloatingLabel;
 
   const AppTextField({
     super.key,
@@ -36,6 +41,10 @@ class AppTextField extends StatelessWidget {
     this.prefixIcon,
     this.suffixIcon,
     this.readOnly = false,
+    this.focusNode,
+    this.textInputAction,
+    this.onFieldSubmitted,
+    this.showFloatingLabel = true,
   });
 
   @override
@@ -50,11 +59,18 @@ class AppTextField extends StatelessWidget {
       inputFormatters: inputFormatters,
       textCapitalization: textCapitalization,
       readOnly: readOnly,
+      focusNode: focusNode,
+      textInputAction: textInputAction,
+      onFieldSubmitted: onFieldSubmitted,
       validator: validator,
       onChanged: onChanged,
       decoration: InputDecoration(
-        labelText: label,
-        hintText: hint,
+        labelText: showFloatingLabel ? label : null,
+        hintText: hint ?? (showFloatingLabel ? null : label),
+        floatingLabelBehavior: showFloatingLabel
+            ? FloatingLabelBehavior.auto
+            : FloatingLabelBehavior.never,
+        isDense: !showFloatingLabel,
         prefixIcon: prefixIcon != null
             ? IconTheme(
                 data: const IconThemeData(color: AppTheme.royalBlue),

@@ -92,18 +92,18 @@ Future<Uint8List> buildPaymentHistoryReportPdf(
       final logoData = await rootBundle.load('assets/logo.png');
       g.drawImage(
         PdfBitmap(logoData.buffer.asUint8List()),
-        Rect.fromLTWH(0, y, 40, 40),
+        Rect.fromLTWH(0, y, 52, 52),
       );
     } catch (_) {
-      g.drawEllipse(Rect.fromLTWH(0, y, 40, 40), brush: PdfSolidBrush(navy));
+      g.drawEllipse(Rect.fromLTWH(0, y, 52, 52), brush: PdfSolidBrush(navy));
     }
 
     g.drawString(meta.firmName, fontBold,
-        bounds: Rect.fromLTWH(48, y, rightX - 56, 14));
+        bounds: Rect.fromLTWH(60, y, rightX - 68, 14));
     g.drawString(meta.firmAddress, fontSmall,
-        bounds: Rect.fromLTWH(48, y + 14, rightX - 56, 10));
+        bounds: Rect.fromLTWH(60, y + 16, rightX - 68, 10));
     g.drawString('${meta.firmPhone}  |  ${meta.firmEmail}', fontSmall,
-        bounds: Rect.fromLTWH(48, y + 26, rightX - 56, 10));
+        bounds: Rect.fromLTWH(60, y + 28, rightX - 68, 10));
 
     y += 64;
   }

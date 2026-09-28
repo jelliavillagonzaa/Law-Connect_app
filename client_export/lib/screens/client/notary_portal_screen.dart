@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import '../../theme/app_theme.dart';
+import '../../services/notary_service.dart';
 import '../../services/notary_service_config.dart';
+import '../../models/notary_request_model.dart';
 import 'notary_service_details_screen.dart';
 
 class NotaryPortalScreen extends StatefulWidget {
@@ -13,6 +16,7 @@ class NotaryPortalScreen extends StatefulWidget {
 
 class _NotaryPortalScreenState extends State<NotaryPortalScreen> {
   final TextEditingController _searchController = TextEditingController();
+  final NotaryService _notaryService = NotaryService();
   String _searchQuery = '';
 
   // Get notary services from config
@@ -102,6 +106,8 @@ class _NotaryPortalScreenState extends State<NotaryPortalScreen> {
             ),
           ),
 
+          _buildMyRequests(),
+
           // Services List
           Expanded(
             child: _filteredServices.isEmpty
@@ -133,6 +139,95 @@ class _NotaryPortalScreenState extends State<NotaryPortalScreen> {
                       return _buildServiceCard(service);
                     },
                   ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMyRequests() {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return const SizedBox.shrink();
+
+    return StreamBuilder<List<NotaryRequestModel>>(
+      stream: _notaryService.watchClientNotaryRequests(uid),
+      builder: (context, snapshot) {
+        final requests = snapshot.data ?? const <NotaryRequestModel>[];
+        if (requests.isEmpty) return const SizedBox.shrink();
+        final visible = requests.take(3).toList();
+
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Your requests',
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.black87,
+                ),
+              ),
+              const SizedBox(height: 8),
+              ...visible.map(_buildRequestStatusCard),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildRequestStatusCard(NotaryRequestModel request) {
+    Color color;
+    switch (request.status.toLowerCase()) {
+      case 'accepted':
+        color = Colors.blue;
+        break;
+      case 'declined':
+        color = Colors.red;
+        break;
+      case 'completed':
+        color = Colors.green;
+        break;
+      default:
+        color = Colors.orange;
+    }
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.grey[200]!),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              request.serviceType,
+              style: const TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              request.status.toUpperCase(),
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                color: color,
+              ),
+            ),
           ),
         ],
       ),
@@ -187,7 +282,7 @@ class _NotaryPortalScreenState extends State<NotaryPortalScreen> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      '${service['requiredDocs']} required document(s)',
+                      '${service['requiredDocs']} item(s) to bring',
                       style: TextStyle(
                         fontSize: 13,
                         color: Colors.grey[600],

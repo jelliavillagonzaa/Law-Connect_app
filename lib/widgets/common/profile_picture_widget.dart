@@ -12,6 +12,7 @@ class ProfilePictureWidget extends StatefulWidget {
   final String userName;
   final double size;
   final bool isEditable;
+  final bool? isOnline;
   final VoidCallback? onUpdated;
 
   const ProfilePictureWidget({
@@ -20,6 +21,7 @@ class ProfilePictureWidget extends StatefulWidget {
     required this.userName,
     this.size = 100,
     this.isEditable = false,
+    this.isOnline,
     this.onUpdated,
   });
 
@@ -156,38 +158,22 @@ class _ProfilePictureWidgetState extends State<ProfilePictureWidget> {
         });
       }
 
-      // Save to local storage in the background
       try {
-        await _profileService
+        final photoUrl = await _profileService
             .uploadProfilePicture(imageFile)
             .timeout(
-              const Duration(seconds: 10),
+              const Duration(seconds: 60),
               onTimeout: () {
-                throw Exception('Operation timed out');
+                throw Exception('Upload timed out. Check your internet and try again.');
               },
             );
 
         if (mounted) {
-          // The base64Image is already set from preview, just clear preview
           setState(() {
-            // Keep _localImageBase64 - it's already set from preview
-            _previewImageBytes = null; // Clear preview
+            _tempPhotoUrl = photoUrl;
+            _previewImageBytes = null;
             _isUploading = false;
           });
-
-          // Verify from storage to ensure consistency, but don't overwrite if we already have it
-          final storedImage = await _profileService.getLocalProfilePicture(
-            user.uid,
-          );
-          if (mounted) {
-            setState(() {
-              // Use stored version if available, otherwise keep what we have
-              if (storedImage != null && storedImage.isNotEmpty) {
-                _localImageBase64 = storedImage;
-              }
-              // Otherwise keep existing _localImageBase64
-            });
-          }
 
           // Call onUpdated callback to refresh parent widget
           if (widget.onUpdated != null) {
@@ -305,6 +291,7 @@ class _ProfilePictureWidgetState extends State<ProfilePictureWidget> {
         _tempPhotoUrl!,
         fit: BoxFit.cover,
         gaplessPlayback: true,
+        webHtmlElementStrategy: WebHtmlElementStrategy.prefer,
         errorBuilder: (_, __, ___) => _buildDefaultAvatar(),
         loadingBuilder: (context, child, loadingProgress) {
           if (loadingProgress == null) {
@@ -325,6 +312,7 @@ class _ProfilePictureWidgetState extends State<ProfilePictureWidget> {
         widget.photoUrl!,
         fit: BoxFit.cover,
         gaplessPlayback: true,
+        webHtmlElementStrategy: WebHtmlElementStrategy.prefer,
         errorBuilder: (_, __, ___) {
           // If network image fails, try loading local image as fallback
           _loadLocalImage();
@@ -363,6 +351,7 @@ class _ProfilePictureWidgetState extends State<ProfilePictureWidget> {
     }
 
     return Stack(
+      clipBehavior: Clip.none,
       children: [
         Container(
           width: widget.size,
@@ -394,27 +383,84 @@ class _ProfilePictureWidgetState extends State<ProfilePictureWidget> {
           Positioned(
             bottom: 0,
             right: 0,
-            child: GestureDetector(
-              onTap: _changeProfilePicture,
-              child: Container(
-                padding: EdgeInsets.all(widget.size * 0.08),
-                decoration: BoxDecoration(
-                  color: AppTheme.royalBlue,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: AppTheme.cleanWhite, width: 2.5),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.2),
-                      blurRadius: 8,
-                      offset: const Offset(0, 2),
+            child: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                GestureDetector(
+                  onTap: _changeProfilePicture,
+                  child: Container(
+                    padding: EdgeInsets.all(widget.size * 0.08),
+                    decoration: BoxDecoration(
+                      color: AppTheme.royalBlue,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: AppTheme.cleanWhite, width: 2.5),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.2),
+                          blurRadius: 8,
+                          offset: const Offset(0, 2),
+                        ),
+                      ],
                     ),
-                  ],
+                    child: Icon(
+                      Icons.camera_alt,
+                      color: AppTheme.cleanWhite,
+                      size: widget.size * 0.2,
+                    ),
+                  ),
                 ),
-                child: Icon(
-                  Icons.camera_alt,
-                  color: AppTheme.cleanWhite,
-                  size: widget.size * 0.2,
-                ),
+                if (widget.isOnline != null)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: -(widget.size * 0.05),
+                    child: Center(
+                      child: Container(
+                        width: widget.size * 0.12,
+                        height: widget.size * 0.12,
+                        decoration: BoxDecoration(
+                          color: widget.isOnline!
+                              ? const Color(0xFF4CAF50)
+                              : Colors.grey,
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: AppTheme.cleanWhite,
+                            width: 2.5,
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withValues(alpha: 0.15),
+                              blurRadius: 4,
+                              offset: const Offset(0, 1),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          )
+        else if (widget.isOnline != null)
+          Positioned(
+            bottom: widget.size * 0.04,
+            right: widget.size * 0.04,
+            child: Container(
+              width: widget.size * 0.12,
+              height: widget.size * 0.12,
+              decoration: BoxDecoration(
+                color: widget.isOnline!
+                    ? const Color(0xFF4CAF50)
+                    : Colors.grey,
+                shape: BoxShape.circle,
+                border: Border.all(color: AppTheme.cleanWhite, width: 2.5),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.15),
+                    blurRadius: 4,
+                    offset: const Offset(0, 1),
+                  ),
+                ],
               ),
             ),
           ),

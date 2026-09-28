@@ -37,15 +37,22 @@ class CustomBottomNavigationBar5Tabs extends StatelessWidget {
             mainAxisAlignment: MainAxisAlignment.spaceAround,
             children: [
               _buildNavItem(
-                icon: Icons.home_rounded,
+                icon: Icons.dashboard_outlined,
                 label: 'Dashboard',
                 index: 0,
                 activeColor: activeColor,
                 inactiveColor: inactiveColor,
               ),
               _buildNavItem(
-                icon: Icons.calendar_today_rounded,
-                label: 'Appts',
+                icon: Icons.folder_outlined,
+                label: 'Cases',
+                index: 1,
+                activeColor: activeColor,
+                inactiveColor: inactiveColor,
+              ),
+              _buildNavItem(
+                icon: Icons.calendar_today_outlined,
+                label: 'Appointments',
                 index: 2,
                 activeColor: activeColor,
                 inactiveColor: inactiveColor,
@@ -109,8 +116,10 @@ class CustomBottomNavigationBar5Tabs extends StatelessWidget {
               const SizedBox(height: 2),
               Text(
                 label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 style: TextStyle(
-                  fontSize: 11,
+                  fontSize: 10,
                   color: isActive ? activeColor : inactiveColor,
                   fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
                 ),

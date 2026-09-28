@@ -183,6 +183,17 @@ class FCMService {
   void _setupMessageHandlers() {
     // Handle foreground messages - SHOW LOCAL NOTIFICATION
     FirebaseMessaging.onMessage.listen((RemoteMessage message) async {
+      final incomingTitle = message.notification?.title ?? '';
+      final incomingType =
+          (message.data['type'] as String? ?? '').toLowerCase();
+      if (incomingType == 'hearing_activity_update' ||
+          incomingTitle.toLowerCase().startsWith('hearing record updated')) {
+        if (kDebugMode) {
+          debugPrint('⏭️ Skipping duplicate hearing-update push: $incomingTitle');
+        }
+        return;
+      }
+
       if (kDebugMode) {
         debugPrint(
           '📨 Foreground message received: ${message.notification?.title}',

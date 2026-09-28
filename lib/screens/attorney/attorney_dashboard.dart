@@ -42,8 +42,8 @@ class AttorneyDashboard extends StatelessWidget {
               title: 'My Clients',
               subtitle: 'View and manage your clients',
               icon: Icons.people_outlined,
-              iconColor: AppTheme.navy,
-              backgroundColor: AppTheme.navy.withOpacity(0.1),
+              iconColor: AppTheme.inkBlue,
+              backgroundColor: AppTheme.pastelBlueGray,
               onTap: () {
                 Get.to(() => const ClientListScreen());
               },
@@ -52,8 +52,8 @@ class AttorneyDashboard extends StatelessWidget {
               title: 'Cases',
               subtitle: 'Manage all your cases',
               icon: Icons.folder_outlined,
-              iconColor: AppTheme.gold,
-              backgroundColor: AppTheme.gold.withOpacity(0.1),
+              iconColor: AppTheme.inkGold,
+              backgroundColor: AppTheme.pastelBeige,
               onTap: () {
                 Get.to(() => const CaseListScreen());
               },
@@ -62,8 +62,8 @@ class AttorneyDashboard extends StatelessWidget {
               title: 'Messages',
               subtitle: 'Chat with clients',
               icon: Icons.message_outlined,
-              iconColor: AppTheme.success,
-              backgroundColor: AppTheme.success.withOpacity(0.1),
+              iconColor: AppTheme.inkGreen,
+              backgroundColor: AppTheme.pastelMint,
               onTap: () {
                 Get.to(() => const AttorneyChatScreen());
               },

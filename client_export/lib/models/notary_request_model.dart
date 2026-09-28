@@ -8,6 +8,8 @@ class NotaryRequestModel {
   final List<String> documents; // Legacy: URLs only
   final List<Map<String, String>>? documentsWithNames; // New: {name, url}
   final String? notes;
+  final DateTime? preferredDateTime;
+  final List<String> bringDocuments;
   final String status; // pending, accepted, declined, completed
   final DateTime createdAt;
   final DateTime? updatedAt;
@@ -23,6 +25,8 @@ class NotaryRequestModel {
     required this.documents,
     this.documentsWithNames,
     this.notes,
+    this.preferredDateTime,
+    this.bringDocuments = const [],
     required this.status,
     required this.createdAt,
     this.updatedAt,
@@ -67,6 +71,12 @@ class NotaryRequestModel {
       documents: documents,
       documentsWithNames: documentsWithNames,
       notes: data['notes'],
+      preferredDateTime: (data['preferredDateTime'] as Timestamp?)?.toDate(),
+      bringDocuments: data['bringDocuments'] is List
+          ? List<String>.from(
+              (data['bringDocuments'] as List).map((e) => e.toString()),
+            )
+          : const [],
       status: data['status'] ?? 'pending',
       createdAt: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
       updatedAt: (data['updatedAt'] as Timestamp?)?.toDate(),
@@ -87,6 +97,10 @@ class NotaryRequestModel {
 
     if (attorneyId != null) map['attorneyId'] = attorneyId;
     if (notes != null && notes!.isNotEmpty) map['notes'] = notes;
+    if (preferredDateTime != null) {
+      map['preferredDateTime'] = Timestamp.fromDate(preferredDateTime!);
+    }
+    if (bringDocuments.isNotEmpty) map['bringDocuments'] = bringDocuments;
     if (updatedAt != null) map['updatedAt'] = Timestamp.fromDate(updatedAt!);
     if (releaseDate != null) map['releaseDate'] = Timestamp.fromDate(releaseDate!);
     if (releaseTime != null) map['releaseTime'] = Timestamp.fromDate(releaseTime!);
@@ -102,6 +116,8 @@ class NotaryRequestModel {
     String? serviceType,
     List<String>? documents,
     String? notes,
+    DateTime? preferredDateTime,
+    List<String>? bringDocuments,
     String? status,
     DateTime? createdAt,
     DateTime? updatedAt,
@@ -116,6 +132,8 @@ class NotaryRequestModel {
       serviceType: serviceType ?? this.serviceType,
       documents: documents ?? this.documents,
       notes: notes ?? this.notes,
+      preferredDateTime: preferredDateTime ?? this.preferredDateTime,
+      bringDocuments: bringDocuments ?? this.bringDocuments,
       status: status ?? this.status,
       createdAt: createdAt ?? this.createdAt,
       updatedAt: updatedAt ?? this.updatedAt,

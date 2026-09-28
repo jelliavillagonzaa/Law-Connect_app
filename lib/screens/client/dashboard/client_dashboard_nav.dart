@@ -7,7 +7,7 @@ import '../notary_portal_screen.dart';
 import '../send_request_screen.dart';
 
 Future<void> openAttorneySelection() {
-  return Get.to(() => const AttorneySelectionScreen()) ?? Future.value();
+  return openRequestAppointmentFlow();
 }
 
 Future<void> openSendRequest() {

@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart' show kIsWeb, kDebugMode, debugPrint;
@@ -64,6 +65,30 @@ class NotaryService {
     }
   }
 
+  Future<XFile?> pickNotaryFile() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['pdf', 'jpg', 'jpeg', 'png'],
+        withData: true,
+      );
+      if (result == null || result.files.isEmpty) return null;
+      final file = result.files.first;
+      if (file.bytes != null && file.bytes!.isNotEmpty) {
+        return XFile.fromData(file.bytes!, name: file.name);
+      }
+      if (file.path != null && file.path!.isNotEmpty) {
+        return XFile(file.path!, name: file.name);
+      }
+      return null;
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('❌ Failed to pick notary file: $e');
+      }
+      return null;
+    }
+  }
+
   // Pick document (PDF or image)
   // Note: For PDF support, consider adding file_picker package
   // For now, this supports images which can be used for scanned documents
@@ -88,7 +113,10 @@ class NotaryService {
     required String serviceType,
     required List<String> documentUrls, // Kept for backward compatibility but not used
     String? notes,
-    List<Map<String, String>>? documentsWithNames, // Optional, not required
+    List<Map<String, String>>? documentsWithNames,
+    String? attorneyId,
+    DateTime? preferredDateTime,
+    List<String>? bringDocuments,
   }) async {
     try {
       final user = _auth.currentUser;
@@ -104,7 +132,10 @@ class NotaryService {
         'updatedAt': FieldValue.serverTimestamp(),
       };
 
-      // Only add documents if provided (for backward compatibility)
+      if (attorneyId != null && attorneyId.isNotEmpty) {
+        requestData['attorneyId'] = attorneyId;
+      }
+
       if (documentsWithNames != null && documentsWithNames.isNotEmpty) {
         requestData['documents'] = documentsWithNames;
         requestData['documentUrls'] = documentsWithNames.map((doc) => doc['url']).toList();
@@ -115,6 +146,12 @@ class NotaryService {
 
       if (notes != null && notes.isNotEmpty) {
         requestData['notes'] = notes;
+      }
+      if (preferredDateTime != null) {
+        requestData['preferredDateTime'] = Timestamp.fromDate(preferredDateTime);
+      }
+      if (bringDocuments != null && bringDocuments.isNotEmpty) {
+        requestData['bringDocuments'] = bringDocuments;
       }
 
       final docRef = await _firestore.collection('notary_requests').add(requestData);
@@ -134,6 +171,46 @@ class NotaryService {
       }
       return {'success': false, 'message': 'Failed to create request: ${e.toString()}'};
     }
+  }
+
+  Future<Map<String, dynamic>> updateNotaryDocuments({
+    required String requestId,
+    required List<Map<String, String>> documentsWithNames,
+  }) async {
+    try {
+      await _firestore.collection('notary_requests').doc(requestId).update({
+        'documents': documentsWithNames,
+        'documentUrls': documentsWithNames.map((doc) => doc['url']).toList(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+      return {'success': true};
+    } catch (e) {
+      return {
+        'success': false,
+        'message': 'Failed to save uploaded documents: ${e.toString()}',
+      };
+    }
+  }
+
+  Future<void> notifyNewNotaryRequest({
+    required String requestId,
+    required String serviceType,
+    String? attorneyId,
+    DateTime? preferredDateTime,
+  }) async {}
+
+  Stream<List<NotaryRequestModel>> watchClientNotaryRequests(String clientId) {
+    return _firestore
+        .collection('notary_requests')
+        .where('clientId', isEqualTo: clientId)
+        .snapshots()
+        .map((snapshot) {
+          final list = snapshot.docs
+              .map((doc) => NotaryRequestModel.fromFirestore(doc))
+              .toList();
+          list.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+          return list;
+        });
   }
 
   // Get client's notary requests

@@ -2,6 +2,7 @@ import 'dart:async' show runZoned, runZonedGuarded, ZoneSpecification;
 import 'dart:developer' as developer;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 
 /// Pass `--dart-define=VERBOSE_LOGS=true` to see full console output.
 const bool kVerboseAppLogs = bool.fromEnvironment('VERBOSE_LOGS');
@@ -27,19 +28,41 @@ void appLog(String message, {String name = 'law_connect'}) {
 
 bool isBenignFirestoreRuntimeError(Object? error) {
   if (error == null) return false;
-  final s = error.toString();
+  final typeName = error.runtimeType.toString();
+  // FirebaseException.toString() itself can throw on Flutter web.
+  if (typeName.contains('FirebaseException')) return true;
+  final s = safeErrorString(error);
   if (s.contains('permission-denied') || s.contains('PERMISSION_DENIED')) {
     return true;
   }
   if (s.contains('Timestamp') && s.contains('is not a subtype of type')) {
     return true;
   }
+  if (s.contains('JavaScriptObject')) return true;
+  if (typeName.contains('TypeError') && s.contains('FirebaseException')) {
+    return true;
+  }
   return false;
+}
+
+/// [FirebaseException.toString] can throw on Flutter web.
+String safeErrorString(Object? error) {
+  if (error == null) return '';
+  try {
+    final line = error.toString().split('\n').first.trim();
+    return line;
+  } catch (_) {
+    try {
+      return error.runtimeType.toString();
+    } catch (_) {
+      return 'Unknown error';
+    }
+  }
 }
 
 bool _isLayoutNoise(Object? error) {
   if (error == null) return false;
-  final s = error.toString();
+  final s = safeErrorString(error);
   return s.contains('Vertical viewport was given unbounded height') ||
       s.contains('RenderFlex children have non-zero flex') ||
       s.contains('BoxConstraints forces an infinite height') ||
@@ -49,7 +72,7 @@ bool _isLayoutNoise(Object? error) {
 }
 
 String _shortError(Object? error) {
-  final line = error.toString().split('\n').first.trim();
+  final line = safeErrorString(error);
   return line.length > 140 ? '${line.substring(0, 140)}…' : line;
 }
 
@@ -89,14 +112,40 @@ void _logErrorOnce(Object error, [StackTrace? stack]) {
 }
 
 void installQuietErrorHandlers() {
+  final previousErrorWidget = ErrorWidget.builder;
+  ErrorWidget.builder = (FlutterErrorDetails details) {
+    if (isBenignFirestoreRuntimeError(details.exception)) {
+      return const ColoredBox(color: Color(0xFFFFFFFF));
+    }
+    try {
+      return previousErrorWidget(details);
+    } catch (_) {
+      return const ColoredBox(
+        color: Color(0xFFFFFFFF),
+        child: Center(
+          child: Text(
+            'Could not load this screen. Press R once to restart.',
+            textAlign: TextAlign.center,
+            textDirection: TextDirection.ltr,
+            style: TextStyle(color: Color(0xFF1A3A6C), fontSize: 16),
+          ),
+        ),
+      );
+    }
+  };
+
   if (kVerboseAppLogs) return;
 
   FlutterError.onError = (FlutterErrorDetails details) {
-    _logErrorOnce(details.exception, details.stack);
+    try {
+      _logErrorOnce(details.exception, details.stack);
+    } catch (_) {}
   };
 
   PlatformDispatcher.instance.onError = (Object error, StackTrace stack) {
-    _logErrorOnce(error, stack);
+    try {
+      _logErrorOnce(error, stack);
+    } catch (_) {}
     return true;
   };
 }
@@ -117,7 +166,11 @@ Future<void> runQuietApp(Future<void> Function() body) async {
 
   final result = runZonedGuarded<Future<void>>(
     body,
-    (error, stack) => _logErrorOnce(error, stack),
+    (error, stack) {
+      try {
+        _logErrorOnce(error, stack);
+      } catch (_) {}
+    },
     zoneSpecification: _quietZoneSpec(),
   );
 

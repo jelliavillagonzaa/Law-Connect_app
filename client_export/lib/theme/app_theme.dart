@@ -2,13 +2,22 @@ import 'package:flutter/material.dart';
 
 class AppTheme {
   // Primary Colors
-  static const Color royalBlue = Color(0xFF1A4D8F);
-  static const Color deepNavy = Color(0xFF0F2E57);
+  static const Color royalBlue = Color(0xFF1A3A6C);
+  static const Color deepNavy = Color(0xFF0D2B4E);
 
   // Secondary Colors
   static const Color gold = Color(0xFFF1C40F);
   static const Color cleanWhite = Color(0xFFFFFFFF);
-  static const Color lightGray = Color(0xFFF4F4F4);
+  static const Color lightGray = Color(0xFFF8FAFC);
+
+  static const Color sidebarActive = Color(0xFFE7EFFC);
+  static const Color sidebarActiveText = Color(0xFF2C5282);
+  static const Color pastelBlueGray = Color(0xFFDEE5ED);
+  static const Color pastelMint = Color(0xFFE1EBE2);
+  static const Color pastelBeige = Color(0xFFE9E4D9);
+  static const Color pastelLavender = Color(0xFFE2E2EC);
+  static const Color pastelPink = Color(0xFFEDE2E0);
+  static const Color pastelSteel = Color(0xFFD8E0E8);
 
   // Text Colors
   static const Color darkText = Color(0xFF1C1C1C);
@@ -318,7 +327,7 @@ class AppTheme {
   static const Color textPrimary = darkText;
   static const Color textSecondary = mutedText;
   static const Color navy = deepNavy;
-  static const Color success = Colors.green;
+  static const Color success = Color(0xFF48BB78);
   static const Color white = cleanWhite;
   static const Color warning = Colors.orange;
 

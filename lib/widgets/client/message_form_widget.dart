@@ -463,7 +463,7 @@ class _MessageFormWidgetState extends State<MessageFormWidget> {
         Expanded(
           child: Container(
             decoration: const BoxDecoration(
-              color: Color(0xFFF5F5F5), // Light gray background
+              color: Color(0xFFF8FAFC),
             ),
             child: _staffId == null || _chatId == null
                 ? Center(

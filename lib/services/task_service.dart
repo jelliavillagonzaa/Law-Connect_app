@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io' show File;
 import 'dart:convert';
 import 'dart:typed_data';
@@ -6,14 +7,19 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, kIsWeb;
 import 'package:file_picker/file_picker.dart';
 import '../models/task_model.dart';
+import '../utils/case_status_filter.dart';
+import 'case_service.dart';
 import 'firestore_mirror_helper.dart';
 import 'local_attachment_service.dart';
+import 'fcm_service.dart';
+import 'staff_service.dart';
 
 class TaskService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirebaseAuth _auth = FirebaseAuth.instance;
   // Removed unused _storage field
   final LocalAttachmentService _localAttachmentService = LocalAttachmentService();
+  final FCMService _fcmService = FCMService();
 
   // Create task (attorney only)
   Future<Map<String, dynamic>> createTask({
@@ -55,6 +61,29 @@ class TaskService {
         return {'success': false, 'message': result.failureMessage};
       }
 
+      try {
+        await _notifyStaffTaskAssigned(
+          staffId: assignedTo,
+          taskId: result.id!,
+          title: title,
+          caseId: caseId,
+        );
+      } catch (e) {
+        if (kDebugMode) {
+          print('Failed to notify staff of new task: $e');
+        }
+      }
+
+      if (caseId != null && caseId.trim().isNotEmpty) {
+        try {
+          await _markLinkedOpenCaseInProgress(caseId);
+        } catch (e) {
+          if (kDebugMode) {
+            print('Failed to move linked case to in progress: $e');
+          }
+        }
+      }
+
       return {
         'success': true,
         'message': 'Task created successfully',
@@ -68,37 +97,71 @@ class TaskService {
     }
   }
 
-  // Get tasks assigned to a staff member
-  Stream<List<TaskModel>> getStaffTasks(String staffId) {
-    return _firestore
-        .collection('tasks')
-        .where('assignedTo', isEqualTo: staffId)
-        .snapshots()
-        .map((snapshot) {
-          final tasks = snapshot.docs
-              .map((doc) => TaskModel.fromFirestore(doc))
-              .toList();
-          // Sort by createdAt descending in memory
-          tasks.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-          return tasks;
-        });
+  Future<void> _markLinkedOpenCaseInProgress(String caseId) async {
+    final caseDoc = await _firestore.collection('cases').doc(caseId).get();
+    if (!caseDoc.exists) return;
+    final status = caseDoc.data()?['status'] as String?;
+    if (!CaseStatusFilter.isOpen(status)) return;
+    await CaseService().updateCaseStatus(caseId, 'in_progress');
   }
 
-  // Get tasks by status
+  Future<void> _notifyStaffTaskAssigned({
+    required String staffId,
+    required String taskId,
+    required String title,
+    String? caseId,
+  }) async {
+    String? caseTitle;
+    if (caseId != null && caseId.isNotEmpty) {
+      try {
+        final caseDoc = await _firestore.collection('cases').doc(caseId).get();
+        caseTitle = (caseDoc.data()?['caseTitle'] as String?)?.trim();
+      } catch (_) {}
+    }
+
+    final message = (caseTitle != null && caseTitle.isNotEmpty)
+        ? 'New task "$title" for case "$caseTitle".'
+        : 'New task "$title" was assigned to you.';
+
+    await HybridDatastore.add(
+      collection: 'notifications',
+      data: {
+        'userId': staffId,
+        'type': 'task_assigned',
+        'title': 'New Task Assigned',
+        'message': message,
+        'taskId': taskId,
+        if (caseId != null) 'caseId': caseId,
+        'isRead': false,
+        'createdAt': FieldValue.serverTimestamp(),
+      },
+    );
+
+    await _fcmService.sendNotificationToUser(
+      userId: staffId,
+      title: 'New Task Assigned',
+      body: message,
+      data: {
+        'type': 'task_assigned',
+        'taskId': taskId,
+        if (caseId != null) 'caseId': caseId,
+      },
+    );
+  }
+
+  Stream<List<TaskModel>> getStaffTasks(String staffId) {
+    return _streamSortedTasks(
+      _firestore.collection('tasks').where('assignedTo', isEqualTo: staffId),
+    );
+  }
+
   Stream<List<TaskModel>> getStaffTasksByStatus(String staffId, String status) {
-    return _firestore
-        .collection('tasks')
-        .where('assignedTo', isEqualTo: staffId)
-        .where('status', isEqualTo: status)
-        .snapshots()
-        .map((snapshot) {
-          final tasks = snapshot.docs
-              .map((doc) => TaskModel.fromFirestore(doc))
-              .toList();
-          // Sort by createdAt descending in memory
-          tasks.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-          return tasks;
-        });
+    return _streamSortedTasks(
+      _firestore
+          .collection('tasks')
+          .where('assignedTo', isEqualTo: staffId)
+          .where('status', isEqualTo: status),
+    );
   }
 
   // Update task details (for attorneys to edit task information)
@@ -180,6 +243,33 @@ class TaskService {
         return {'success': false, 'message': result.failureMessage};
       }
 
+      try {
+        final user = _auth.currentUser;
+        if (user != null) {
+          final userDoc =
+              await _firestore.collection('users').doc(user.uid).get();
+          final role =
+              (userDoc.data()?['role'] as String?)?.toLowerCase().trim() ?? '';
+          if (role == 'staff' ||
+              role == 'paralegal' ||
+              role.contains('assistant')) {
+            final taskDoc =
+                await _firestore.collection('tasks').doc(taskId).get();
+            final title = taskDoc.data()?['title'] as String? ?? 'Task';
+            await StaffService().logActivity(
+              action: 'Task updated',
+              details: 'Set "$title" to $status',
+              resourceType: 'task',
+              resourceId: taskId,
+            );
+          }
+        }
+      } catch (e) {
+        if (kDebugMode) {
+          print('Failed to log task activity: $e');
+        }
+      }
+
       // If task is completed, create a notification for the attorney
       if (status == 'completed') {
         try {
@@ -206,6 +296,17 @@ class TaskService {
                 collection: 'notifications',
                 data: notifData,
               );
+              try {
+                await _fcmService.sendNotificationToUser(
+                  userId: attorneyId,
+                  title: 'Task Completed',
+                  body: 'Task "$taskTitle" has been completed by staff',
+                  data: {
+                    'type': 'task_completed',
+                    'taskId': taskId,
+                  },
+                );
+              } catch (_) {}
             }
           }
         } catch (e) {
@@ -263,38 +364,80 @@ class TaskService {
     }
   }
 
-  // Get tasks for attorney (to see all tasks they assigned)
   Stream<List<TaskModel>> getAttorneyTasks(String attorneyId) {
-    return _firestore
-        .collection('tasks')
-        .where('attorneyId', isEqualTo: attorneyId)
-        .snapshots()
-        .map((snapshot) {
-          final tasks = snapshot.docs
-              .map((doc) => TaskModel.fromFirestore(doc))
-              .toList();
-          // Sort by createdAt descending in memory
-          tasks.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-          return tasks;
-        });
+    return _streamSortedTasks(
+      _firestore.collection('tasks').where('attorneyId', isEqualTo: attorneyId),
+    );
   }
 
-  // Get tasks for attorney filtered by status
   Stream<List<TaskModel>> getAttorneyTasksByStatus(
-      String attorneyId, String status) {
-    return _firestore
-        .collection('tasks')
-        .where('attorneyId', isEqualTo: attorneyId)
-        .where('status', isEqualTo: status)
+    String attorneyId,
+    String status,
+  ) {
+    return _streamSortedTasks(
+      _firestore
+          .collection('tasks')
+          .where('attorneyId', isEqualTo: attorneyId)
+          .where('status', isEqualTo: status),
+    );
+  }
+
+  Stream<List<TaskModel>> _streamSortedTasks(Query<Map<String, dynamic>> query) {
+    return query
         .snapshots()
-        .map((snapshot) {
+        .asyncMap((snapshot) async {
           final tasks = snapshot.docs
               .map((doc) => TaskModel.fromFirestore(doc))
               .toList();
-          // Sort by createdAt descending in memory
           tasks.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-          return tasks;
-        });
+          return _excludeClosedCaseTasks(tasks);
+        })
+        .transform(
+          StreamTransformer<List<TaskModel>, List<TaskModel>>.fromHandlers(
+            handleError: (error, stack, sink) {
+              sink.add(const <TaskModel>[]);
+            },
+          ),
+        );
+  }
+
+  /// Tasks on a completed case leave Staff Tasks; they stay on the case.
+  Future<List<TaskModel>> _excludeClosedCaseTasks(List<TaskModel> tasks) async {
+    try {
+      final ids = tasks
+          .map((task) => task.caseId?.trim() ?? '')
+          .where((id) => id.isNotEmpty)
+          .toSet()
+          .toList();
+      if (ids.isEmpty) return tasks;
+
+      final closedIds = <String>{};
+      for (var i = 0; i < ids.length; i += 10) {
+        final end = i + 10 > ids.length ? ids.length : i + 10;
+        final chunk = ids.sublist(i, end);
+        final snap = await _firestore
+            .collection('cases')
+            .where(FieldPath.documentId, whereIn: chunk)
+            .get();
+        for (final doc in snap.docs) {
+          final status = doc.data()['status']?.toString();
+          if (CaseStatusFilter.isCompleted(status)) {
+            closedIds.add(doc.id);
+          }
+        }
+      }
+
+      return tasks.where((task) {
+        final caseId = task.caseId?.trim() ?? '';
+        if (caseId.isEmpty) return true;
+        return !closedIds.contains(caseId);
+      }).toList();
+    } catch (e) {
+      if (kDebugMode) {
+        print('Failed to hide closed-case tasks: $e');
+      }
+      return tasks;
+    }
   }
 
   // Add attachment to task (stored in Firestore for sharing between staff and attorney)

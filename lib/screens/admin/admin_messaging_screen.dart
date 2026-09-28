@@ -32,8 +32,9 @@ class _AdminMessagingScreenState extends State<AdminMessagingScreen> {
           .limit(50)
           .snapshots(),
       builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Center(child: CircularProgressIndicator());
+        if (snapshot.connectionState == ConnectionState.waiting &&
+            !snapshot.hasData) {
+          return const SizedBox.shrink();
         }
 
         if (snapshot.hasError) {

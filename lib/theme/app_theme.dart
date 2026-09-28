@@ -1,21 +1,46 @@
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
-class AppTheme {
-  // Primary Colors
-  static const Color royalBlue = Color(0xFF1A4D8F);
-  static const Color deepNavy = Color(0xFF0F2E57);
+import '../utils/currency.dart';
 
-  // Secondary Colors
+class AppTheme {
+  /// App-wide font — includes the Philippine Peso sign (₱) on Android/iOS.
+  static const String fontFamily = Currency.fontFamily;
+
+  // Primary — Admin Dashboard navy
+  static const Color royalBlue = Color(0xFF1A3A6C);
+  static const Color deepNavy = Color(0xFF0D2B4E);
+
+  // Secondary
   static const Color gold = Color(0xFFF1C40F);
   static const Color cleanWhite = Color(0xFFFFFFFF);
-  static const Color lightGray = Color(0xFFF4F4F4);
+  static const Color lightGray = Color(0xFFF8FAFC);
 
-  // Text Colors
+  // Sidebar / selection
+  static const Color sidebarActive = Color(0xFFE7EFFC);
+  static const Color sidebarActiveText = Color(0xFF2C5282);
+
+  // Pastel stat cards
+  static const Color pastelBlueGray = Color(0xFFDEE5ED);
+  static const Color pastelMint = Color(0xFFE1EBE2);
+  static const Color pastelBeige = Color(0xFFE9E4D9);
+  static const Color pastelLavender = Color(0xFFE2E2EC);
+  static const Color pastelPink = Color(0xFFEDE2E0);
+  static const Color pastelSteel = Color(0xFFD8E0E8);
+
+  // Ink on pastel cards
+  static const Color inkBlue = Color(0xFF2C5282);
+  static const Color inkGreen = Color(0xFF3D6B4F);
+  static const Color inkGold = Color(0xFF8B7355);
+  static const Color inkPurple = Color(0xFF5A5478);
+  static const Color inkCoral = Color(0xFFA05A4A);
+  static const Color inkSteel = Color(0xFF3A5A78);
+
+  // Text
   static const Color darkText = Color(0xFF1C1C1C);
   static const Color mutedText = Color(0xFF6D6D6D);
 
-  // Border Colors
+  // Border
   static const Color borderGray = Color(0xFFE0E0E0);
 
   // Shadow
@@ -32,6 +57,8 @@ class AppTheme {
   static ThemeData get lightTheme {
     final theme = ThemeData(
       useMaterial3: true,
+      fontFamily: fontFamily,
+      fontFamilyFallback: const ['sans-serif'],
       colorScheme: ColorScheme.light(
         primary: royalBlue,
         secondary: gold,
@@ -65,7 +92,7 @@ class AppTheme {
         elevation: 2,
         shadowColor: shadowColor,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(14),
+          borderRadius: BorderRadius.circular(16),
         ),
         margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       ),
@@ -265,7 +292,7 @@ class AppTheme {
       // Chip Theme
       chipTheme: ChipThemeData(
         backgroundColor: lightGray,
-        selectedColor: gold.withOpacity(0.2),
+        selectedColor: sidebarActive,
         labelStyle: TextStyle(
           fontSize: 12,
           fontWeight: FontWeight.w500,
@@ -277,11 +304,12 @@ class AppTheme {
       ),
     );
 
-    // System fonts only — avoids blocking first paint on web/Android while
-    // Google Fonts downloads over the network.
     return theme.copyWith(
+      textTheme: theme.textTheme.apply(fontFamily: fontFamily),
+      primaryTextTheme: theme.primaryTextTheme.apply(fontFamily: fontFamily),
       appBarTheme: theme.appBarTheme.copyWith(
         titleTextStyle: const TextStyle(
+          fontFamily: fontFamily,
           fontSize: 20,
           fontWeight: FontWeight.bold,
           color: cleanWhite,
@@ -290,36 +318,39 @@ class AppTheme {
     );
   }
 
+  static TextStyle _withFont(TextStyle style) =>
+      style.copyWith(fontFamily: fontFamily);
+
   // Helper methods for common styles
-  static TextStyle get heading1 => TextStyle(
+  static TextStyle get heading1 => _withFont(TextStyle(
         fontSize: 32,
         fontWeight: FontWeight.bold,
         color: darkText,
-      );
+      ));
 
-  static TextStyle get bodyMedium => TextStyle(
+  static TextStyle get bodyMedium => _withFont(TextStyle(
         fontSize: 14,
         fontWeight: FontWeight.normal,
         color: darkText,
-      );
+      ));
 
   static Color get lightBackground => lightGray;
 
-  static TextStyle get cardTitleStyle => TextStyle(
+  static TextStyle get cardTitleStyle => _withFont(TextStyle(
         fontSize: 18,
         fontWeight: FontWeight.bold,
         color: royalBlue,
-      );
+      ));
 
-  static TextStyle get cardDetailStyle => TextStyle(
+  static TextStyle get cardDetailStyle => _withFont(TextStyle(
         fontSize: 14,
         fontWeight: FontWeight.normal,
         color: mutedText,
-      );
+      ));
 
   static BoxDecoration get cardDecoration => BoxDecoration(
         color: cleanWhite,
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(16),
         boxShadow: [
           BoxShadow(
             color: shadowColor,
@@ -344,7 +375,8 @@ class AppTheme {
   static const Color textPrimary = darkText;
   static const Color textSecondary = mutedText;
   static const Color navy = deepNavy;
-  static const Color success = Colors.green;
+  static const Color success = Color(0xFF48BB78);
+  static const Color successSoft = Color(0xFFD1FAE5);
   static const Color white = cleanWhite;
   static const Color warning = Colors.orange;
 

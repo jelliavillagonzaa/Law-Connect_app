@@ -1,9 +1,10 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../../models/lightweight_reminder_item.dart';
+import '../../services/hearing_calendar_fields.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/hearing_order_detail.dart';
 import 'hearing_notification_detail_panel.dart';
 
 /// Fast reminder card — list shows title/subtitle only; full body loads on expand.
@@ -30,6 +31,8 @@ class _LightweightReminderTileState extends State<LightweightReminderTile> {
   static IconData _iconForType(String type) {
     final t = type.toLowerCase();
     if (t.contains('hearing')) return Icons.gavel;
+    if (t == 'case_request') return Icons.mark_email_unread;
+    if (t.contains('task')) return Icons.task_alt;
     if (t.contains('appointment')) return Icons.event;
     return Icons.notifications_active;
   }
@@ -37,6 +40,8 @@ class _LightweightReminderTileState extends State<LightweightReminderTile> {
   static Color _colorForType(String type) {
     final t = type.toLowerCase();
     if (t.contains('hearing')) return AppTheme.royalBlue;
+    if (t == 'case_request') return Colors.deepOrange;
+    if (t.contains('task')) return Colors.indigo;
     if (t.contains('appointment')) return Colors.teal;
     return Colors.orange;
   }
@@ -45,16 +50,10 @@ class _LightweightReminderTileState extends State<LightweightReminderTile> {
     if (_detailData != null || _loadingDetail) return;
     setState(() => _loadingDetail = true);
     try {
-      final fs = FirebaseFirestore.instance;
-      final hearingId = widget.item.hearingDocId?.trim();
-      final notifId = widget.item.notificationDocId?.trim();
-      if (hearingId != null && hearingId.isNotEmpty) {
-        final doc = await fs.collection('hearings').doc(hearingId).get();
-        _detailData = doc.data();
-      } else if (notifId != null && notifId.isNotEmpty) {
-        final doc = await fs.collection('notifications').doc(notifId).get();
-        _detailData = doc.data();
-      }
+      _detailData = await loadHearingOrderDetail(
+        hearingDocId: widget.item.hearingDocId,
+        notificationDocId: widget.item.notificationDocId,
+      );
     } catch (_) {}
     if (mounted) setState(() => _loadingDetail = false);
   }
@@ -207,8 +206,14 @@ class _LightweightReminderTileState extends State<LightweightReminderTile> {
                           hearingDocId: item.hearingDocId,
                         )
                       : SelectableText(
-                          (_detailData?['message'] as String?)?.trim() ??
-                              item.subtitle,
+                          HearingCalendarFields.asDisplayString(
+                                _detailData?['message'],
+                              )
+                              .isNotEmpty
+                          ? HearingCalendarFields.asDisplayString(
+                              _detailData?['message'],
+                            )
+                          : item.subtitle,
                           style: TextStyle(
                             fontSize: 14,
                             height: 1.45,

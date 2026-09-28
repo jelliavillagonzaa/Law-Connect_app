@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -5,6 +7,9 @@ import 'package:intl/intl.dart';
 import '../../theme/app_theme.dart';
 import '../../models/case_model.dart';
 import '../../pages/case/case_detail_page.dart';
+import '../../utils/case_status_filter.dart';
+import '../../utils/case_result.dart';
+import '../../utils/quiet_console.dart';
 
 /// Client cases list — one-shot Firestore load + pull to refresh (no live listener).
 class CasesListScreen extends StatefulWidget {
@@ -16,53 +21,75 @@ class CasesListScreen extends StatefulWidget {
 
 class _CasesListScreenState extends State<CasesListScreen> {
   List<CaseModel> _cases = const [];
-  bool _loading = true;
   String? _error;
+  bool _viewClosed = false;
+  bool _inFlight = false;
 
   @override
   void initState() {
     super.initState();
-    _loadCases();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_loadCases());
+    });
   }
 
   Future<void> _loadCases() async {
+    if (_inFlight) return;
     final user = FirebaseAuth.instance.currentUser;
-    if (user == null) {
-      if (mounted) setState(() => _loading = false);
-      return;
-    }
+    if (user == null) return;
 
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+    _inFlight = true;
+    final query = FirebaseFirestore.instance
+        .collection('cases')
+        .where('clientId', isEqualTo: user.uid)
+        .limit(20);
 
     try {
-      final snapshot = await FirebaseFirestore.instance
-          .collection('cases')
-          .where('clientId', isEqualTo: user.uid)
-          .limit(60)
-          .get()
-          .timeout(const Duration(seconds: 12));
+      try {
+        final cached = await query
+            .get(const GetOptions(source: Source.cache))
+            .timeout(const Duration(milliseconds: 600));
+        if (mounted && cached.docs.isNotEmpty) {
+          await _applyDocs(cached.docs);
+        }
+      } catch (_) {}
 
-      final cases = snapshot.docs
-          .map((doc) => CaseModel.fromFirestore(doc))
-          .where((c) => !c.isArchived)
-          .toList()
-        ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
-
-      if (!mounted) return;
-      setState(() {
-        _cases = cases;
-        _loading = false;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _error = e.toString();
-        _loading = false;
-      });
+      try {
+        final snapshot = await query.get().timeout(const Duration(seconds: 1));
+        if (!mounted) return;
+        await _applyDocs(snapshot.docs);
+      } catch (e) {
+        if (mounted && _cases.isEmpty) {
+          setState(() => _error = safeErrorString(e));
+        }
+      }
+    } finally {
+      _inFlight = false;
     }
+  }
+
+  Future<void> _applyDocs(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
+  ) async {
+    final cases = <CaseModel>[];
+    for (var i = 0; i < docs.length; i++) {
+      try {
+        final model = CaseModel.fromFirestore(docs[i]);
+        if (CaseStatusFilter.visibleToClient(model)) {
+          cases.add(model);
+        }
+      } catch (_) {}
+      if (i % 8 == 7) {
+        await Future<void>.delayed(Duration.zero);
+        if (!mounted) return;
+      }
+    }
+    cases.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    if (!mounted) return;
+    setState(() {
+      _cases = cases;
+      _error = null;
+    });
   }
 
   @override
@@ -91,22 +118,33 @@ class _CasesListScreenState extends State<CasesListScreen> {
       backgroundColor: AppTheme.lightBackground,
       appBar: AppBar(
         backgroundColor: AppTheme.navy,
-        title: const Text(
-          'My Cases',
-          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+        title: Text(
+          _viewClosed ? 'Closed Cases' : 'My Cases',
+          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
         ),
         centerTitle: true,
         elevation: 0,
         automaticallyImplyLeading: false,
+        actions: [
+          TextButton(
+            onPressed: () => setState(() => _viewClosed = !_viewClosed),
+            child: Text(
+              _viewClosed ? 'My Cases' : 'Closed',
+              style: const TextStyle(color: Colors.white),
+            ),
+          ),
+        ],
       ),
       body: _buildBody(),
     );
   }
 
   Widget _buildBody() {
-    if (_loading && _cases.isEmpty) {
-      return const Center(child: CircularProgressIndicator());
-    }
+    final visible = _cases.where((c) {
+      return _viewClosed
+          ? CaseStatusFilter.isCompleted(c.status)
+          : !CaseStatusFilter.isCompleted(c.status);
+    }).toList();
 
     if (_error != null && _cases.isEmpty) {
       return Center(
@@ -139,7 +177,7 @@ class _CasesListScreenState extends State<CasesListScreen> {
       );
     }
 
-    if (_cases.isEmpty) {
+    if (visible.isEmpty) {
       return RefreshIndicator(
         onRefresh: _loadCases,
         child: ListView(
@@ -153,7 +191,7 @@ class _CasesListScreenState extends State<CasesListScreen> {
             ),
             const SizedBox(height: 16),
             Text(
-              'No cases yet',
+              _viewClosed ? 'No closed cases' : 'No cases yet',
               textAlign: TextAlign.center,
               style: AppTheme.heading4.copyWith(color: AppTheme.textSecondary),
             ),
@@ -161,7 +199,9 @@ class _CasesListScreenState extends State<CasesListScreen> {
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 32),
               child: Text(
-                'Your attorney will create cases for you.\nPull down to refresh.',
+                _viewClosed
+                    ? 'Completed cases will appear here.'
+                    : 'Your attorney will create cases for you.\nPull down to refresh.',
                 style: AppTheme.bodyMedium.copyWith(
                   color: AppTheme.textSecondary,
                 ),
@@ -178,9 +218,9 @@ class _CasesListScreenState extends State<CasesListScreen> {
       child: ListView.builder(
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.all(16),
-        itemCount: _cases.length,
+        itemCount: visible.length,
         itemBuilder: (context, index) {
-          return _buildCaseCard(context, _cases[index]);
+          return _buildCaseCard(context, visible[index]);
         },
       ),
     );
@@ -198,9 +238,12 @@ class _CasesListScreenState extends State<CasesListScreen> {
         statusBgColor = const Color(0xFF4A90E2);
         break;
       case 'pending':
-      case 'under_review':
         statusColor = Colors.white;
         statusBgColor = const Color(0xFFFF9500);
+        break;
+      case 'accepted':
+        statusColor = Colors.white;
+        statusBgColor = AppTheme.navy;
         break;
       case 'completed':
       case 'closed':
@@ -300,9 +343,7 @@ class _CasesListScreenState extends State<CasesListScreen> {
                       borderRadius: BorderRadius.circular(20),
                     ),
                     child: Text(
-                      caseModel.status.length > 10
-                          ? caseModel.status.substring(0, 10)
-                          : caseModel.status,
+                      CaseStatusFilter.statusLabel(caseModel.status),
                       style: AppTheme.caption.copyWith(
                         color: statusColor,
                         fontWeight: FontWeight.w600,
@@ -318,6 +359,17 @@ class _CasesListScreenState extends State<CasesListScreen> {
                   ),
                 ],
               ),
+              if (CaseStatusFilter.isCompleted(caseModel.status) &&
+                  CaseResult.label(caseModel.caseResult).isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'Result: ${CaseResult.label(caseModel.caseResult)}',
+                  style: AppTheme.bodySmall.copyWith(
+                    color: AppTheme.textPrimary,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
               if (hearingDateStr != null) ...[
                 const SizedBox(height: 12),
                 Row(

@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import '../../services/admin_service.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/admin/admin_page_header.dart';
+import '../../widgets/admin/admin_ui_theme.dart';
 import 'platform_policies_screen.dart';
 import 'notification_settings_screen.dart';
 import 'email_templates_screen.dart';
@@ -150,35 +152,19 @@ class _SystemSettingsScreenState extends State<SystemSettingsScreen> {
     final body = _buildBody();
 
     if (widget.inline) {
-      return Column(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.05),
-                  blurRadius: 5,
-                  offset: const Offset(0, 2),
-                ),
-              ],
-            ),
-            child: Text(
-              'System Settings',
-              style: TextStyle(
-                fontSize: 20,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ),
-          Expanded(child: body),
-        ],
+      return ColoredBox(
+        color: AdminUi.background,
+        child: Column(
+          children: [
+            const AdminPageHeader(title: 'System Settings'),
+            Expanded(child: body),
+          ],
+        ),
       );
     }
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F4F4),
+      backgroundColor: AppTheme.lightGray,
       appBar: AppBar(
         title: Text(
           'System Settings',
@@ -195,14 +181,9 @@ class _SystemSettingsScreenState extends State<SystemSettingsScreen> {
       padding: const EdgeInsets.all(24),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.05),
-            blurRadius: 10,
-            offset: const Offset(0, 4),
-          ),
-        ],
+        borderRadius: BorderRadius.circular(AdminUi.radius),
+        boxShadow: AdminUi.cardShadow,
+        border: Border.all(color: AdminUi.line),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -368,14 +349,9 @@ class _SystemSettingsScreenState extends State<SystemSettingsScreen> {
           padding: const EdgeInsets.all(20),
           decoration: BoxDecoration(
             color: Colors.white,
-            borderRadius: BorderRadius.circular(16),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withOpacity(0.05),
-                blurRadius: 10,
-                offset: const Offset(0, 4),
-              ),
-            ],
+            borderRadius: BorderRadius.circular(AdminUi.radius),
+            boxShadow: AdminUi.cardShadow,
+            border: Border.all(color: AdminUi.line),
           ),
           child: Row(
             children: [

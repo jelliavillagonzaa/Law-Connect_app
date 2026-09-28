@@ -10,10 +10,18 @@ bool get isSupabaseClientReady => _supabaseClientReady;
 
 /// Initializes Supabase when URL + publishable key are configured.
 /// Firebase/Firestore initialization is independent; this can run after Firebase.
-Future<void> initializeSupabase() async {
-  _supabaseClientReady = false;
+bool _isClientUsable() {
+  try {
+    final _ = Supabase.instance.client;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
 
+Future<void> initializeSupabase() async {
   if (!SupabaseConfig.isConfigured) {
+    _supabaseClientReady = false;
     if (kDebugMode) {
       debugPrint(
         'Supabase: skipped (set SUPABASE_URL + SUPABASE_ANON_KEY via '
@@ -22,6 +30,13 @@ Future<void> initializeSupabase() async {
     }
     return;
   }
+
+  if (_isClientUsable()) {
+    _supabaseClientReady = true;
+    return;
+  }
+
+  _supabaseClientReady = false;
 
   try {
     await Supabase.initialize(
@@ -33,6 +48,11 @@ Future<void> initializeSupabase() async {
       debugPrint('✅ Supabase initialized (${SupabaseConfig.projectUrl})');
     }
   } catch (e, st) {
+    // Hot restart often throws because the client is already running.
+    if (_isClientUsable()) {
+      _supabaseClientReady = true;
+      return;
+    }
     if (kDebugMode) {
       debugPrint('⚠️ Supabase initialization failed: $e');
       debugPrint('$st');

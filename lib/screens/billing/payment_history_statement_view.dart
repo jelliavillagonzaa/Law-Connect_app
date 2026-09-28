@@ -48,7 +48,7 @@ class PaymentHistoryStatementView extends StatelessWidget {
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const BrandLogo(size: 48),
+              const BrandLogo(size: 56),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(

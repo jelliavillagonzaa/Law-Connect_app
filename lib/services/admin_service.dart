@@ -5,7 +5,7 @@ import '../models/system_log_model.dart';
 import 'fcm_service.dart';
 import 'staff_auth_service.dart';
 import 'backup_service.dart';
-import 'sms_service.dart';
+import 'semaphore_service.dart';
 import 'firestore_mirror_helper.dart';
 
 enum _CaseAnalyticsBucket { pending, inProgress, completed }
@@ -343,41 +343,6 @@ class AdminService {
     );
   }
 
-  Future<void> lockCase(String caseId, String reason) async {
-    final result = await HybridDatastore.updateCase(
-      id: caseId,
-      patch: {
-        'isLocked': true,
-        'lockReason': reason,
-        'lockedAt': FieldValue.serverTimestamp(),
-      },
-    );
-    if (!result.isSuccess) throw Exception(result.failureMessage);
-    await logAction(
-      action: 'case_locked',
-      resourceType: 'case',
-      resourceId: caseId,
-      details: reason,
-    );
-  }
-
-  Future<void> unlockCase(String caseId) async {
-    final result = await HybridDatastore.updateCase(
-      id: caseId,
-      patch: {
-        'isLocked': false,
-        'lockReason': FieldValue.delete(),
-        'lockedAt': FieldValue.delete(),
-      },
-    );
-    if (!result.isSuccess) throw Exception(result.failureMessage);
-    await logAction(
-      action: 'case_unlocked',
-      resourceType: 'case',
-      resourceId: caseId,
-    );
-  }
-
   /// Moves a case to archive storage (hidden from Case Oversight).
   Future<void> archiveCase(String caseId) async {
     final result = await HybridDatastore.updateCase(
@@ -671,7 +636,8 @@ class AdminService {
     return documents;
   }
 
-  /// Queue SMS via [SmsService] (Supabase Edge and/or Firestore `sms_requests` → Cloud Function).
+  /// Sends SMS through Cloud Function `sendSemaphoreSms` so it reaches the phone.
+  /// A Firestore queue is not treated as delivered.
   Future<Map<String, dynamic>> queueManualSms({
     required String to,
     required String body,
@@ -682,30 +648,29 @@ class AdminService {
       if (me == null) {
         return {'success': false, 'message': 'Not signed in'};
       }
-      final smsResult = await SmsService().queueSms(
+      final result = await SemaphoreService.instance.sendSmsWithResult(
         to: to,
-        body: body,
-        userId: relatedUserId ?? me.uid,
-        meta: {
-          'type': 'admin_manual',
-          'channel': 'sms',
-          if (relatedUserId != null) 'relatedUserId': relatedUserId,
-        },
+        message: body,
       );
-      final sentNow = smsResult.result == SmsQueueResult.sentViaSupabase;
+      final messageId = result.messageId?.trim() ?? '';
+      final delivered =
+          result.success && RegExp(r'^\d+$').hasMatch(messageId);
+      if (!delivered) {
+        return {
+          'success': false,
+          'message': result.errorMessage ??
+              'SMS was not delivered. Semaphore did not return a message id. Check credits and that the LAWCONNECT sender name is active.',
+        };
+      }
       await logAction(
-        action: sentNow ? 'sms_sent_manual' : 'sms_queued_manual',
-        details: sentNow
-            ? 'Admin sent SMS via Supabase send-sms from User Management'
-            : 'Admin queued an SMS from User Management',
-        resourceType: 'sms_request',
+        action: 'sms_sent_manual',
+        details: 'Admin sent SMS via Semaphore ($messageId) from User Management',
+        resourceType: 'user',
         resourceId: relatedUserId,
       );
       return {
         'success': true,
-        'message': sentNow
-            ? 'SMS sent successfully.'
-            : 'SMS queued (${smsResult.requestId ?? "id unknown"}). Deploy onSmsRequestSend with SEMAPHORE_API_KEY or Twilio, or run sms-worker.',
+        'message': 'SMS sent to the phone (Semaphore id $messageId).',
       };
     } catch (e) {
       return {'success': false, 'message': e.toString()};
@@ -1043,23 +1008,26 @@ class AdminService {
     }
   }
 
-  // Get all attorneys for selection
+  // Attorneys who can already sign in. Missing isActive counts as available.
+  // Signup accounts stay out until an admin sets isActive to true.
   Future<List<Map<String, dynamic>>> getAllAttorneys() async {
     final snapshot = await _firestore
         .collection('users')
         .where('role', isEqualTo: 'attorney')
-        .where('isActive', isEqualTo: true)
         .get();
 
-    return snapshot.docs.map((doc) {
-      final data = doc.data();
-      return {
-        'id': doc.id,
-        'name': data['name'] ?? 'Unknown',
-        'email': data['email'] ?? '',
-        'specializations': data['specializations'] ?? [],
-      };
-    }).toList();
+    return snapshot.docs
+        .where((doc) => doc.data()['isActive'] != false)
+        .map((doc) {
+          final data = doc.data();
+          return {
+            'id': doc.id,
+            'name': data['name'] ?? 'Unknown',
+            'email': data['email'] ?? '',
+            'specializations': data['specializations'] ?? [],
+          };
+        })
+        .toList();
   }
 
   // Permanently delete a user (Firestore document only)

@@ -3,6 +3,7 @@ import 'package:get/get.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../services/chat_service.dart';
+import '../../services/chat_session.dart';
 import '../../models/message_model.dart';
 import '../../theme/app_theme.dart';
 
@@ -44,6 +45,7 @@ class _ChatPageState extends State<ChatPage> {
       setState(() {
         _chatId = chatId;
       });
+      ChatSession.open(chatId);
 
       // Mark messages as seen
       _chatService.markMessagesAsSeen(chatId, user.uid);
@@ -112,8 +114,9 @@ class _ChatPageState extends State<ChatPage> {
             child: StreamBuilder<List<MessageModel>>(
               stream: _chatService.getMessagesWithNotifications(_chatId!),
               builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
+                if (snapshot.connectionState == ConnectionState.waiting &&
+                    !snapshot.hasData) {
+                  return const SizedBox.shrink();
                 }
 
                 if (snapshot.hasError) {
@@ -223,6 +226,7 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   void dispose() {
+    ChatSession.close(_chatId);
     _messageController.dispose();
     _scrollController.dispose();
     super.dispose();

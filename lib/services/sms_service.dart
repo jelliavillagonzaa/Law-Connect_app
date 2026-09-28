@@ -1,10 +1,12 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode, kIsWeb;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../config/philsms_config.dart';
+import '../config/semaphore_config.dart';
 import 'philsms_service.dart';
+import 'semaphore_service.dart';
 import 'firestore_mirror_helper.dart';
 import 'supabase_service.dart';
 
@@ -12,6 +14,8 @@ import 'supabase_service.dart';
 enum SmsQueueResult {
   /// Sent immediately via PhilSMS API (see [PhilSmsConfig]).
   sentViaPhilSms,
+  /// Sent immediately via Semaphore API (see [SemaphoreConfig]).
+  sentViaSemaphore,
   /// Supabase Edge `send-sms` accepted the call.
   sentViaSupabase,
   /// A document was added to Firestore `sms_requests` for Cloud Function / sms-worker.
@@ -43,8 +47,8 @@ class SmsDeliveryOutcome {
   bool get isSent => status == SmsDeliveryStatus.sent;
 }
 
-/// Sends SMS via **PhilSMS** when configured; else Supabase `send-sms`; else Firestore queue.
-/// Sign-up OTP (`meta.type == 'otp'`) uses **PhilSMS only** — no Semaphore/Twilio/Firestore.
+/// Sends SMS via **PhilSMS** (unchanged) and **Semaphore** in parallel when both are set.
+/// Sign-up OTP also uses both; success if either provider accepts the message.
 class SmsService {
   SmsService({FirebaseFirestore? firestore, FirebaseAuth? auth})
       : _firestore = firestore ?? FirebaseFirestore.instance,
@@ -78,7 +82,7 @@ class SmsService {
     return s;
   }
 
-  /// Sign-up / verification OTP — PhilSMS only (no Semaphore, Twilio, or Firestore queue).
+  /// Sign-up / verification OTP — PhilSMS (unchanged) plus Semaphore when configured.
   Future<SmsDeliveryOutcome> sendSignupOtpSms({
     required String to,
     required String body,
@@ -105,19 +109,44 @@ class SmsService {
       to: cleanTo,
       message: cleanBody,
     );
+    var semOk = false;
+    String? semError;
+    if (SemaphoreConfig.isConfigured) {
+      final sem = await SemaphoreService.instance.sendOtpSms(
+        to: cleanTo,
+        message: cleanBody,
+      );
+      semOk = sem.success;
+      semError = sem.errorMessage;
+      if (kDebugMode) {
+        debugPrint(
+          semOk
+              ? '✅ Sign-up OTP sent via Semaphore'
+              : '⚠️ Semaphore OTP failed: ${sem.errorMessage}',
+        );
+      }
+    }
     if (result.success) {
       if (kDebugMode) debugPrint('✅ Sign-up OTP sent via PhilSMS');
+      return SmsDeliveryOutcome(
+        status: SmsDeliveryStatus.sent,
+        provider: semOk ? 'philsms+semaphore' : 'philsms',
+        queueResult: SmsQueueResult.sentViaPhilSms,
+      );
+    }
+    if (semOk) {
       return const SmsDeliveryOutcome(
         status: SmsDeliveryStatus.sent,
-        provider: 'philsms',
-        queueResult: SmsQueueResult.sentViaPhilSms,
+        provider: 'semaphore',
+        queueResult: SmsQueueResult.sentViaSemaphore,
       );
     }
     return SmsDeliveryOutcome(
       status: SmsDeliveryStatus.failed,
       error: result.errorMessage ??
-          'PhilSMS could not send the verification code. Try email instead.',
-      provider: 'philsms',
+          semError ??
+          'Could not send the verification code via SMS. Try email instead.',
+      provider: SemaphoreConfig.isConfigured ? 'philsms+semaphore' : 'philsms',
     );
   }
 
@@ -152,27 +181,51 @@ class SmsService {
     if (_isSignupOtpMeta(meta)) {
       final outcome = await sendSignupOtpSms(to: cleanTo, body: cleanBody);
       if (outcome.isSent) {
-        return (result: SmsQueueResult.sentViaPhilSms, requestId: null);
+        return (
+          result: outcome.queueResult ?? SmsQueueResult.sentViaPhilSms,
+          requestId: null,
+        );
       }
       throw StateError(
-        outcome.error ?? 'PhilSMS could not send verification code.',
+        outcome.error ?? 'Could not send verification code via SMS.',
       );
     }
 
-    if (PhilSmsConfig.isConfigured) {
-      final sent = await PhilSmsService.instance.sendSms(
+    var philOk = false;
+    // Browser calls to PhilSMS are blocked by CORS. Web queues the SMS so
+    // Cloud Function onSmsRequestSend sends it (same path as push).
+    if (!kIsWeb && PhilSmsConfig.isConfigured) {
+      philOk = await PhilSmsService.instance.sendSms(
         to: cleanTo,
         message: cleanBody,
       );
-      if (sent) {
+      if (philOk) {
         if (kDebugMode) {
           debugPrint('✅ SMS sent via PhilSMS');
         }
-        return (result: SmsQueueResult.sentViaPhilSms, requestId: null);
+      } else if (kDebugMode) {
+        debugPrint('⚠️ PhilSMS failed — Semaphore / fallback still attempted');
       }
+    }
+
+    var semOk = false;
+    if (SemaphoreConfig.isConfigured) {
+      semOk = await SemaphoreService.instance.sendSms(
+        to: cleanTo,
+        message: cleanBody,
+      );
       if (kDebugMode) {
-        debugPrint('⚠️ PhilSMS failed — trying fallback SMS providers');
+        debugPrint(semOk ? '✅ SMS sent via Semaphore' : '⚠️ Semaphore SMS failed');
       }
+    }
+
+    if (philOk || semOk) {
+      return (
+        result: philOk
+            ? SmsQueueResult.sentViaPhilSms
+            : SmsQueueResult.sentViaSemaphore,
+        requestId: null,
+      );
     }
 
     final supabase = SupabaseService.instance.clientOrNull;
@@ -264,13 +317,18 @@ class SmsService {
   ) async {
 
     if (handedOff.result == SmsQueueResult.sentViaPhilSms ||
+        handedOff.result == SmsQueueResult.sentViaSemaphore ||
         handedOff.result == SmsQueueResult.sentViaSupabase) {
+      final provider = switch (handedOff.result) {
+        SmsQueueResult.sentViaPhilSms => 'philsms',
+        SmsQueueResult.sentViaSemaphore => 'semaphore',
+        SmsQueueResult.sentViaSupabase => 'supabase',
+        SmsQueueResult.queuedInFirestore => 'firestore',
+      };
       return SmsDeliveryOutcome(
         status: SmsDeliveryStatus.sent,
         queueResult: handedOff.result,
-        provider: handedOff.result == SmsQueueResult.sentViaPhilSms
-            ? 'philsms'
-            : 'supabase',
+        provider: provider,
       );
     }
 

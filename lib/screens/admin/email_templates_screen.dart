@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import '../../services/system_settings_service.dart';
 
 class EmailTemplatesScreen extends StatefulWidget {
   const EmailTemplatesScreen({super.key});
@@ -75,6 +76,7 @@ class _EmailTemplatesScreenState extends State<EmailTemplatesScreen> {
             'appointmentEmail': _appointmentController.text,
             'updatedAt': FieldValue.serverTimestamp(),
           }, SetOptions(merge: true));
+      SystemSettingsService.instance.invalidate();
 
       if (mounted) {
         Get.snackbar(
@@ -103,7 +105,7 @@ class _EmailTemplatesScreenState extends State<EmailTemplatesScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F4F4),
+      backgroundColor: const Color(0xFFF8FAFC),
       appBar: AppBar(
         title: Text(
           'Email Templates',

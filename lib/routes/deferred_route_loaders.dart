@@ -7,6 +7,7 @@ import '../theme/app_theme.dart';
 import '../widgets/common/brand_logo.dart';
 import '../screens/client/client_dashboard_web_shell.dart';
 import '../screens/client/notifications_screen_web.dart' as web_notifications;
+import '../screens/portal/portal_web_shells.dart';
 
 import '../pages/admin/admin_dashboard.dart' deferred as admin_dashboard;
 import '../pages/attorney/attorney_dashboard.dart' deferred as attorney_dashboard;
@@ -14,14 +15,26 @@ import '../pages/staff/staff_dashboard.dart' deferred as staff_dashboard;
 import '../screens/client/dashboard_screen_with_nav.dart' deferred as client_dashboard;
 import '../screens/client/notifications_screen_mobile.dart' deferred as notif_mobile;
 
-void _safeUnawaited(Future<void> future, String label) {
-  unawaited(
-    future.catchError((Object e, StackTrace st) {
+/// Flutter web (especially after hot reload) can return `null`/`undefined` from
+/// deferred `loadLibrary()`. Calling `.catchError` on that crashes login.
+Future<void> _wrapLoadLibrary(Future<void> Function() loadLibrary) {
+  return Future<void>(() async {
+    await loadLibrary();
+  });
+}
+
+void _safeUnawaited(Future<void>? future, String label) {
+  unawaited(() async {
+    try {
+      if (future != null) {
+        await future;
+      }
+    } catch (e, st) {
       // Avoid crashing the app due to unhandled deferred-load errors.
       debugPrint('⚠️ Deferred load failed ($label): $e');
       debugPrint('$st');
-    }),
-  );
+    }
+  }());
 }
 
 /// Start downloading a deferred dashboard library (safe to call multiple times).
@@ -110,8 +123,11 @@ class _DeferredRouteHost extends StatefulWidget {
 }
 
 class _DeferredRouteHostState extends State<_DeferredRouteHost> {
+  Widget? _readyPage;
+
   @override
   Widget build(BuildContext context) {
+    if (_readyPage != null) return _readyPage!;
     return FutureBuilder<void>(
       future: widget.loadFuture,
       builder: (context, snapshot) {
@@ -122,11 +138,12 @@ class _DeferredRouteHostState extends State<_DeferredRouteHost> {
             ),
           );
         }
-        if (snapshot.connectionState != ConnectionState.done) {
-          return widget.loadingWidget ??
-              RouteLoadingScaffold(message: widget.loadingMessage);
+        if (snapshot.connectionState == ConnectionState.done) {
+          _readyPage = widget.pageBuilder();
+          return _readyPage!;
         }
-        return widget.pageBuilder();
+        return widget.loadingWidget ??
+            RouteLoadingScaffold(message: widget.loadingMessage);
       },
     );
   }
@@ -135,15 +152,20 @@ class _DeferredRouteHostState extends State<_DeferredRouteHost> {
 class DeferredAdminDashboard extends StatelessWidget {
   const DeferredAdminDashboard({super.key});
 
-  static final Future<void> _load = admin_dashboard.loadLibrary();
+  static Future<void>? _load;
 
-  static Future<void> prefetch() => _load;
+  static Future<void> prefetch() => _ensureLoaded();
+
+  static Future<void> _ensureLoaded() {
+    return _load ??= _wrapLoadLibrary(() => admin_dashboard.loadLibrary());
+  }
 
   @override
   Widget build(BuildContext context) {
     return _DeferredRouteHost(
-      loadFuture: _load,
+      loadFuture: _ensureLoaded(),
       loadingMessage: 'Loading admin dashboard…',
+      loadingWidget: kIsWeb ? const AdminPortalWebShell() : null,
       pageBuilder: () => admin_dashboard.AdminDashboard(),
     );
   }
@@ -152,15 +174,20 @@ class DeferredAdminDashboard extends StatelessWidget {
 class DeferredAttorneyDashboard extends StatelessWidget {
   const DeferredAttorneyDashboard({super.key});
 
-  static final Future<void> _load = attorney_dashboard.loadLibrary();
+  static Future<void>? _load;
 
-  static Future<void> prefetch() => _load;
+  static Future<void> prefetch() => _ensureLoaded();
+
+  static Future<void> _ensureLoaded() {
+    return _load ??= _wrapLoadLibrary(() => attorney_dashboard.loadLibrary());
+  }
 
   @override
   Widget build(BuildContext context) {
     return _DeferredRouteHost(
-      loadFuture: _load,
+      loadFuture: _ensureLoaded(),
       loadingMessage: 'Loading attorney dashboard…',
+      loadingWidget: kIsWeb ? const AttorneyPortalWebShell() : null,
       pageBuilder: () => attorney_dashboard.AttorneyDashboard(),
     );
   }
@@ -169,15 +196,20 @@ class DeferredAttorneyDashboard extends StatelessWidget {
 class DeferredStaffDashboard extends StatelessWidget {
   const DeferredStaffDashboard({super.key});
 
-  static final Future<void> _load = staff_dashboard.loadLibrary();
+  static Future<void>? _load;
 
-  static Future<void> prefetch() => _load;
+  static Future<void> prefetch() => _ensureLoaded();
+
+  static Future<void> _ensureLoaded() {
+    return _load ??= _wrapLoadLibrary(() => staff_dashboard.loadLibrary());
+  }
 
   @override
   Widget build(BuildContext context) {
     return _DeferredRouteHost(
-      loadFuture: _load,
+      loadFuture: _ensureLoaded(),
       loadingMessage: 'Loading staff dashboard…',
+      loadingWidget: kIsWeb ? const StaffPortalWebShell() : null,
       pageBuilder: () => staff_dashboard.StaffDashboard(),
     );
   }
@@ -186,16 +218,18 @@ class DeferredStaffDashboard extends StatelessWidget {
 class DeferredClientDashboard extends StatelessWidget {
   const DeferredClientDashboard({super.key});
 
-  static final Future<void> _load = client_dashboard.loadLibrary();
+  static Future<void>? _load;
 
-  static Future<void> prefetch() {
-    return _load;
+  static Future<void> prefetch() => _ensureLoaded();
+
+  static Future<void> _ensureLoaded() {
+    return _load ??= _wrapLoadLibrary(() => client_dashboard.loadLibrary());
   }
 
   @override
   Widget build(BuildContext context) {
     return _DeferredRouteHost(
-      loadFuture: _load,
+      loadFuture: _ensureLoaded(),
       loadingMessage: 'Loading client dashboard…',
       loadingWidget: kIsWeb ? const ClientDashboardWebShell() : null,
       pageBuilder: () => client_dashboard.DashboardScreenWithNav(),
@@ -208,7 +242,7 @@ class DeferredClientNotificationsScreen extends StatelessWidget {
 
   static Future<void> prefetch() {
     if (kIsWeb) return Future<void>.value();
-    return notif_mobile.loadLibrary();
+    return _wrapLoadLibrary(() => notif_mobile.loadLibrary());
   }
 
   @override
@@ -217,7 +251,7 @@ class DeferredClientNotificationsScreen extends StatelessWidget {
       return const web_notifications.NotificationsScreen();
     }
     return _DeferredRouteHost(
-      loadFuture: notif_mobile.loadLibrary(),
+      loadFuture: _wrapLoadLibrary(() => notif_mobile.loadLibrary()),
       loadingMessage: 'Loading notifications…',
       pageBuilder: () => notif_mobile.NotificationsScreen(),
     );

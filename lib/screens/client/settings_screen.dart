@@ -5,7 +5,7 @@ import '../../widgets/card_row.dart';
 import '../../widgets/primary_button.dart';
 import '../../services/auth_service.dart';
 import '../../controllers/auth_controller.dart';
-import '../../pages/client/client_landing_page.dart';
+import '../../routes/portal_navigation.dart';
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
@@ -41,11 +41,9 @@ class SettingsScreen extends StatelessWidget {
           await authService.logout();
         }
 
-        // Navigate to splash screen (which will route to appropriate login)
-        Get.offAll(() => const ClientLandingPage());
+        navigateAfterLogout();
       } catch (e) {
-        // Even if logout fails, navigate to splash screen
-        Get.offAll(() => const ClientLandingPage());
+        navigateAfterLogout();
       }
     }
   }

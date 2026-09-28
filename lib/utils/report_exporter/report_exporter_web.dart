@@ -2,7 +2,7 @@ import 'dart:typed_data';
 import 'dart:html' as html;
 
 /// Triggers a browser download with real binary content (not comma-separated text).
-Future<void> saveBytes({
+Future<String?> saveBytes({
   required Uint8List bytes,
   required String filename,
   required String mimeType,
@@ -20,4 +20,5 @@ Future<void> saveBytes({
   } finally {
     html.Url.revokeObjectUrl(url);
   }
+  return null;
 }

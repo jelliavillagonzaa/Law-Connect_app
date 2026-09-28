@@ -1,0 +1,13 @@
+---
+description: dart:html Notification constructor has no JS options like silent
+globs: lib/services/web_notification*.dart
+alwaysApply: false
+---
+
+# dart:html Notification
+
+`html.Notification(title, {dir, body, lang, tag, icon})` is the full constructor.
+
+Do not pass JS NotificationOptions (`silent`, `badge`, `vibrate`, `requireInteraction`, `renotify`). Those compile on JS but **fail Dart Chrome compile** with `No named parameter with the name 'silent'`.
+
+Create notifications only through `_createBrowserNotification` in `web_notification_web.dart`.

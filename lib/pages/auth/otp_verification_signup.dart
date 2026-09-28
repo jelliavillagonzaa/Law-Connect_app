@@ -1,9 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import '../../services/auth_service.dart';
+import '../../routes/portal_navigation.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/otp_input_field.dart';
-import '../auth/login_page.dart';
 
 class OtpVerificationPage extends StatefulWidget {
   final String email;
@@ -20,7 +22,7 @@ class OtpVerificationPage extends StatefulWidget {
     required this.email,
     this.fullName,
     this.otp,
-    this.role = 'client', // Default to client for backward compatibility
+    this.role = 'client',
     this.otpChannel,
     this.phoneNumber,
   });
@@ -31,96 +33,67 @@ class OtpVerificationPage extends StatefulWidget {
 
 class _OtpVerificationPageState extends State<OtpVerificationPage> {
   final AuthService _authService = AuthService();
+  final GlobalKey<OtpInputFieldState> _otpFieldKey =
+      GlobalKey<OtpInputFieldState>();
+
   bool _isSubmitting = false;
-  bool _isResending = false;
-  String _enteredOtp = ''; // Store entered OTP from 6 boxes
+  bool _isSending = false;
+  String _enteredOtp = '';
+  String? _sendError;
+  bool _codeSent = false;
+  int _resendSeconds = 0;
+  Timer? _resendTimer;
 
-  String get _deliveryHint {
-    if (widget.otpChannel == 'sms') {
+  bool get _viaSms => widget.otpChannel == 'sms';
+
+  String get _maskedDestination {
+    if (_viaSms) {
       final phone = widget.phoneNumber ?? '';
-      final suffix = phone.length >= 4
-          ? phone.substring(phone.length - 4)
-          : phone;
-      return "We've sent a verification code to your SMS (phone ending in $suffix). "
-          'Please do not share this code with anybody.';
+      if (phone.length >= 4) return '•••• ${phone.substring(phone.length - 4)}';
+      return phone.isEmpty ? 'your phone' : phone;
     }
-    return "We've sent a verification code to your email — ${widget.email}. "
-        'Please do not share this code with anybody.';
+    final email = widget.email;
+    final at = email.indexOf('@');
+    if (at <= 1) return email;
+    return '${email[0]}•••${email.substring(at)}';
   }
 
-  Future<void> _verifyOtp() async {
-    final otp = _enteredOtp.trim();
-
-    if (otp.isEmpty) {
-      Get.snackbar(
-        'Error',
-        'Please enter the verification code',
-        backgroundColor: Colors.red,
-        colorText: Colors.white,
-      );
-      return;
-    }
-
-    if (otp.length != 6) {
-      Get.snackbar(
-        'Error',
-        'Verification code must be 6 digits',
-        backgroundColor: Colors.red,
-        colorText: Colors.white,
-      );
-      return;
-    }
-
-    setState(() {
-      _isSubmitting = true;
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _sendOtp(isInitial: true);
     });
-
-    try {
-      final result = widget.role == 'attorney'
-          ? await _authService.verifyOtpAndCreateAttorneyAccount(
-              email: widget.email,
-              otp: otp,
-            )
-          : await _authService.verifyOtpAndCreateAccount(
-              email: widget.email,
-              otp: otp,
-            );
-
-      if (result['success'] == true) {
-        Get.snackbar(
-          'Success',
-          result['message'] ?? 'Email verified! Account created successfully.',
-          backgroundColor: Colors.green,
-          colorText: Colors.white,
-        );
-
-        // Navigate to login page
-        Get.offAll(() => const LoginPage());
-      } else {
-        Get.snackbar(
-          'Error',
-          result['message'] ?? 'Verification failed',
-          backgroundColor: Colors.red,
-          colorText: Colors.white,
-        );
-      }
-    } catch (e) {
-      Get.snackbar(
-        'Error',
-        'Failed to verify code: $e',
-        backgroundColor: Colors.red,
-        colorText: Colors.white,
-      );
-    } finally {
-      setState(() {
-        _isSubmitting = false;
-      });
-    }
   }
 
-  Future<void> _resendOtp() async {
+  @override
+  void dispose() {
+    _resendTimer?.cancel();
+    super.dispose();
+  }
+
+  void _startResendCooldown([int seconds = 45]) {
+    _resendTimer?.cancel();
+    setState(() => _resendSeconds = seconds);
+    _resendTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      if (_resendSeconds <= 1) {
+        timer.cancel();
+        setState(() => _resendSeconds = 0);
+      } else {
+        setState(() => _resendSeconds -= 1);
+      }
+    });
+  }
+
+  Future<void> _sendOtp({bool isInitial = false}) async {
+    if (_isSending) return;
     setState(() {
-      _isResending = true;
+      _isSending = true;
+      _sendError = null;
     });
 
     try {
@@ -137,241 +110,370 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
               channel: widget.otpChannel,
             );
 
+      if (!mounted) return;
+
+      if (result['success'] == true) {
+        setState(() {
+          _codeSent = true;
+          _sendError = null;
+        });
+        _startResendCooldown();
+        if (!isInitial) {
+          Get.snackbar(
+            'Code sent',
+            result['message'] ??
+                (_viaSms
+                    ? 'Check your SMS for the 6-digit code.'
+                    : 'Check your email inbox and spam folder.'),
+            backgroundColor: Colors.green,
+            colorText: Colors.white,
+          );
+        }
+      } else {
+        setState(() {
+          _sendError = result['message'] as String? ??
+              'Could not send the verification code. Tap Resend.';
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _sendError = 'Could not send the verification code. Tap Resend.';
+      });
+    } finally {
+      if (mounted) setState(() => _isSending = false);
+    }
+  }
+
+  Future<void> _verifyOtp() async {
+    if (_isSubmitting) return;
+    final otp = _enteredOtp.trim();
+
+    if (otp.length != 6) {
+      Get.snackbar(
+        'Code required',
+        'Enter the 6-digit verification code.',
+        backgroundColor: Colors.orange,
+        colorText: Colors.white,
+      );
+      return;
+    }
+
+    setState(() => _isSubmitting = true);
+
+    try {
+      final result = widget.role == 'attorney'
+          ? await _authService.verifyOtpAndCreateAttorneyAccount(
+              email: widget.email,
+              otp: otp,
+            )
+          : await _authService.verifyOtpAndCreateAccount(
+              email: widget.email,
+              otp: otp,
+            );
+
+      if (!mounted) return;
+
       if (result['success'] == true) {
         Get.snackbar(
-          'Success',
-          result['message'] ?? 'Verification code sent to your email',
+          'Verified',
+          result['message'] ?? 'Account created successfully.',
           backgroundColor: Colors.green,
           colorText: Colors.white,
         );
+        final portalRole = widget.role == 'attorney' ? 'attorney' : 'client';
+        navigateToPortalDashboard(portalRole);
       } else {
+        _otpFieldKey.currentState?.clear();
+        setState(() => _enteredOtp = '');
         Get.snackbar(
-          'Error',
-          result['message'] ?? 'Failed to resend code',
+          'Verification failed',
+          result['message'] ?? 'Invalid code. Please try again.',
           backgroundColor: Colors.red,
           colorText: Colors.white,
         );
       }
     } catch (e) {
+      if (!mounted) return;
       Get.snackbar(
         'Error',
-        'Failed to resend code: $e',
+        'Failed to verify code. Please try again.',
         backgroundColor: Colors.red,
         colorText: Colors.white,
       );
     } finally {
-      setState(() {
-        _isResending = false;
-      });
+      if (mounted) setState(() => _isSubmitting = false);
     }
+  }
+
+  void _goToLogin() {
+    Get.offAllNamed('/LoginPage');
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: AppTheme.royalBlue, // Professional royal blue background
-      body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 500),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const SizedBox(height: 40),
-                  // Title
-                  Text(
-                    'OTP Verification',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 32,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                    ),
-                  ),
-                  const SizedBox(height: 32),
-                  // Card Container
-                  Container(
-                    padding: const EdgeInsets.all(32),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(20),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withOpacity(0.1),
-                          blurRadius: 20,
-                          offset: const Offset(0, 10),
-                        ),
-                      ],
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        // Green banner with message
-                        Container(
-                          padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: Colors.green[50],
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(
-                              color: Colors.green[300]!,
-                              width: 1,
-                            ),
-                          ),
-                          child: Text(
-                            _deliveryHint,
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              fontSize: 14,
-                              color: Colors.green[800],
-                              height: 1.5,
-                            ),
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _goToLogin();
+      },
+      child: Scaffold(
+        resizeToAvoidBottomInset: true,
+        backgroundColor: AppTheme.navy,
+        body: SafeArea(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final isWide = constraints.maxWidth > 600;
+              return SingleChildScrollView(
+                keyboardDismissBehavior:
+                    ScrollViewKeyboardDismissBehavior.onDrag,
+                padding: EdgeInsets.fromLTRB(
+                  isWide ? 24 : 20,
+                  16,
+                  isWide ? 24 : 20,
+                  24,
+                ),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(minHeight: constraints.maxHeight - 40),
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 440),
+                      child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: TextButton.icon(
+                          onPressed: _goToLogin,
+                          icon: const Icon(Icons.arrow_back_rounded, size: 18),
+                          label: const Text('Back to login'),
+                          style: TextButton.styleFrom(
+                            foregroundColor: Colors.white,
                           ),
                         ),
-                        const SizedBox(height: 24),
-                        // OTP Input Field - 6 separate boxes
-                        Column(
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Verify your ${_viaSms ? 'phone' : 'email'}',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: isWide ? 26 : 28,
+                          fontWeight: FontWeight.w800,
+                          color: Colors.white,
+                          letterSpacing: -0.3,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        _isSending
+                            ? 'Sending your 6-digit code…'
+                            : _sendError != null
+                                ? 'We could not send the code yet. You can still type it or tap Resend.'
+                                : 'Enter the 6-digit code we sent to $_maskedDestination.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 14,
+                          height: 1.45,
+                          color: Colors.white.withOpacity(0.82),
+                        ),
+                      ),
+                      const SizedBox(height: 28),
+                      Container(
+                        padding: EdgeInsets.fromLTRB(
+                          isWide ? 20 : 22,
+                          isWide ? 24 : 28,
+                          isWide ? 20 : 22,
+                          22,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(24),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.12),
+                              blurRadius: 24,
+                              offset: const Offset(0, 10),
+                            ),
+                          ],
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            Text(
-                              'Input your OTP',
-                              style: TextStyle(
-                                fontSize: 14,
-                                fontWeight: FontWeight.w600,
-                                color: Colors.grey[800],
+                            Center(
+                              child: Container(
+                                width: 56,
+                                height: 56,
+                                decoration: BoxDecoration(
+                                  color: AppTheme.royalBlue.withOpacity(0.1),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: Icon(
+                                  _viaSms
+                                      ? Icons.sms_outlined
+                                      : Icons.mark_email_unread_outlined,
+                                  color: AppTheme.royalBlue,
+                                  size: 30,
+                                ),
                               ),
                             ),
-                            const SizedBox(height: 4),
+                            const SizedBox(height: 18),
+                            if (_isSending)
+                              _StatusBanner(
+                                color: AppTheme.royalBlue,
+                                icon: Icons.hourglass_top_rounded,
+                                text: _viaSms
+                                    ? 'Sending code via SMS…'
+                                    : 'Sending code to your email…',
+                              )
+                            else if (_sendError != null)
+                              _StatusBanner(
+                                color: Colors.orange.shade800,
+                                background: Colors.orange.shade50,
+                                icon: Icons.error_outline_rounded,
+                                text: _sendError!,
+                              )
+                            else if (_codeSent)
+                              _StatusBanner(
+                                color: Colors.green.shade800,
+                                background: Colors.green.shade50,
+                                icon: Icons.check_circle_outline_rounded,
+                                text: _viaSms
+                                    ? 'Code sent by SMS. Do not share it with anyone.'
+                                    : 'Code sent to ${widget.email}. Check Inbox, Promotions, and Spam.',
+                              ),
+                            const SizedBox(height: 22),
                             Text(
-                              'Enter Verification Code',
+                              'Enter verification code',
+                              textAlign: TextAlign.center,
                               style: TextStyle(
-                                fontSize: 13,
-                                fontWeight: FontWeight.w500,
-                                color: Colors.grey[600],
+                                fontSize: 15,
+                                fontWeight: FontWeight.w700,
+                                color: Colors.grey[850],
                               ),
                             ),
                             const SizedBox(height: 16),
                             OtpInputField(
-                              onChanged: (otp) {
-                                _enteredOtp = otp;
-                              },
-                              onCompleted: (otp) {
-                                // Auto-verify when all 6 digits are entered
+                              key: _otpFieldKey,
+                              onChanged: (otp) => _enteredOtp = otp,
+                              onCompleted: (_) {
                                 if (!_isSubmitting && mounted) {
-                                  Future.delayed(const Duration(milliseconds: 300), () {
-                                    if (mounted && !_isSubmitting) {
-                                      _verifyOtp();
-                                    }
-                                  });
+                                  _verifyOtp();
                                 }
                               },
                             ),
-                          ],
-                        ),
-                        const SizedBox(height: 32),
-                        // Submit Button
-                        SizedBox(
-                          height: 50,
-                          child: ElevatedButton(
-                            onPressed: _isSubmitting ? null : _verifyOtp,
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: AppTheme.royalBlue,
-                              foregroundColor: Colors.white,
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(12),
+                            const SizedBox(height: 24),
+                            SizedBox(
+                              height: 52,
+                              child: ElevatedButton(
+                                onPressed: _isSubmitting ? null : _verifyOtp,
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: AppTheme.royalBlue,
+                                  foregroundColor: Colors.white,
+                                  elevation: 0,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(14),
+                                  ),
+                                  disabledBackgroundColor:
+                                      AppTheme.royalBlue.withOpacity(0.55),
+                                ),
+                                child: _isSubmitting
+                                    ? const SizedBox(
+                                        height: 22,
+                                        width: 22,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2.4,
+                                          valueColor:
+                                              AlwaysStoppedAnimation<Color>(
+                                            Colors.white,
+                                          ),
+                                        ),
+                                      )
+                                    : const Text(
+                                        'Verify and continue',
+                                        style: TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
                               ),
-                              elevation: 2,
-                              disabledBackgroundColor: AppTheme.royalBlue.withOpacity(0.6),
                             ),
-                            child: _isSubmitting
-                                ? const SizedBox(
-                                    height: 20,
-                                    width: 20,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                      valueColor: AlwaysStoppedAnimation<Color>(
-                                        Colors.white,
+                            const SizedBox(height: 10),
+                            TextButton(
+                              onPressed: (_isSending || _resendSeconds > 0)
+                                  ? null
+                                  : () => _sendOtp(),
+                              child: _isSending
+                                  ? const SizedBox(
+                                      height: 18,
+                                      width: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : Text(
+                                      _resendSeconds > 0
+                                          ? 'Resend code in ${_resendSeconds}s'
+                                          : 'Resend code',
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w600,
                                       ),
                                     ),
-                                  )
-                                : Text(
-                                    'Submit',
-                                    style: TextStyle(
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.bold,
-                                      color: Colors.white,
-                                    ),
-                                  ),
-                          ),
-                        ),
-                        const SizedBox(height: 16),
-                        // Resend Code Button
-                        TextButton(
-                          onPressed: _isResending
-                              ? null
-                              : () {
-                                  if (mounted) {
-                                    _resendOtp();
-                                  }
-                                },
-                          style: TextButton.styleFrom(
-                            foregroundColor: AppTheme.royalBlue,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 12,
                             ),
-                          ),
-                          child: _isResending
-                              ? SizedBox(
-                                  height: 20,
-                                  width: 20,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                    valueColor: AlwaysStoppedAnimation<Color>(
-                                      AppTheme.royalBlue,
-                                    ),
-                                  ),
-                                )
-                              : const Text(
-                                  'Resend Code',
-                                  style: TextStyle(
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
+                          ],
                         ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 24),
-                  // Back to Login
-                  TextButton(
-                    onPressed: () {
-                      if (mounted) {
-                        Get.offAll(() => const LoginPage());
-                      }
-                    },
-                    style: TextButton.styleFrom(
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 12,
                       ),
-                    ),
-                    child: const Text(
-                      'Back to Login',
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w500,
+                    ],
                       ),
                     ),
                   ),
-                ],
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _StatusBanner extends StatelessWidget {
+  final Color color;
+  final Color? background;
+  final IconData icon;
+  final String text;
+
+  const _StatusBanner({
+    required this.color,
+    this.background,
+    required this.icon,
+    required this.text,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+      decoration: BoxDecoration(
+        color: background ?? color.withOpacity(0.08),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: color, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              text,
+              style: TextStyle(
+                fontSize: 13,
+                height: 1.35,
+                color: color,
+                fontWeight: FontWeight.w600,
               ),
             ),
           ),
-        ),
+        ],
       ),
     );
   }

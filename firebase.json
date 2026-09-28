@@ -14,6 +14,20 @@
           ]
         },
         {
+          "source": "/logo.png",
+          "headers": [
+            { "key": "Cache-Control", "value": "public, max-age=604800" },
+            { "key": "Access-Control-Allow-Origin", "value": "*" }
+          ]
+        },
+        {
+          "source": "/email-logo.png",
+          "headers": [
+            { "key": "Cache-Control", "value": "public, max-age=604800" },
+            { "key": "Access-Control-Allow-Origin", "value": "*" }
+          ]
+        },
+        {
           "source": "**/*.@(js|wasm)",
           "headers": [
             { "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }

@@ -129,6 +129,12 @@ class SupabaseHybridSyncService {
       if (patch.containsKey('staffAssigned')) {
         row['staff_assigned'] = patch['staffAssigned'];
       }
+      if (patch.containsKey('opposingParty')) {
+        row['opposing_party'] = patch['opposingParty'];
+      }
+      if (patch.containsKey('caseResult')) {
+        row['case_result'] = patch['caseResult'];
+      }
       if (patch.containsKey('hearingDate')) {
         row['hearing_date'] = SupabaseRowMappers.caseMapToRow(id, {
           'hearingDate': patch['hearingDate'],
@@ -349,6 +355,12 @@ class SupabaseHybridSyncService {
       if (patch.containsKey('staffId')) row['staff_id'] = patch['staffId'];
       if (patch.containsKey('staffAssigned')) {
         row['staff_assigned'] = patch['staffAssigned'];
+      }
+      if (patch.containsKey('opposingParty')) {
+        row['opposing_party'] = patch['opposingParty'];
+      }
+      if (patch.containsKey('caseResult')) {
+        row['case_result'] = patch['caseResult'];
       }
       if (patch.containsKey('hearingDate')) {
         row['hearing_date'] = SupabaseRowMappers.caseMapToRow(id, {

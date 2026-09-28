@@ -123,7 +123,7 @@ class PhilSmsHearingAlertConfig {
   static const String hearingCollection = 'hearings';
   static const String smsDedupePrefsKey = 'hearing_philsms_sent_ids_v3';
   static const int maxDedupeIds = 1500;
-  static const String smsBrandLabel = 'JurisLink Hearing';
+  static const String smsBrandLabel = 'LAWCONNECT HEARING REMINDER';
 
   /// Any change to these fields on a `hearings` doc sends a new SMS (deduped).
   static const List<String> hearingDigestFieldKeys = [
@@ -139,8 +139,6 @@ class PhilSmsHearingAlertConfig {
     'location',
     'summary',
     'hearingDateTime',
-    'updatedAt',
-    'createdAt',
   ];
 
   static String _fieldAsTrimmedString(dynamic value) {

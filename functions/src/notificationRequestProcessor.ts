@@ -67,7 +67,28 @@ export async function handleNotificationRequestCreated(
       token,
       notification: { title, body },
       data,
-      android: { priority: "high" as const },
+      android: {
+        priority: "high" as const,
+        notification: {
+          sound: "default",
+          channelId: "high_importance_channel",
+          defaultSound: true,
+        },
+      },
+      apns: {
+        payload: {
+          aps: { sound: "default", badge: 1 },
+        },
+      },
+      webpush:
+        data.type === "new_message"
+          ? {
+              notification: { title, body, silent: false },
+              fcmOptions: { link: "/" },
+            }
+          : {
+              notification: { silent: true },
+            },
     });
     await ref.update({
       status: "sent",

@@ -28,7 +28,6 @@ class AttorneySidebar extends StatefulWidget {
 class _AttorneySidebarState extends State<AttorneySidebar>
     with SingleTickerProviderStateMixin {
   UserModel? _currentUser;
-  bool _isLoading = true;
   late AnimationController _animationController;
   late Animation<double> _fadeAnimation;
 
@@ -56,7 +55,6 @@ class _AttorneySidebarState extends State<AttorneySidebar>
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) {
-        setState(() => _isLoading = false);
         return;
       }
 
@@ -67,16 +65,9 @@ class _AttorneySidebarState extends State<AttorneySidebar>
       if (userDoc.exists && mounted) {
         setState(() {
           _currentUser = UserModel.fromFirestore(userDoc.data()!, user.uid);
-          _isLoading = false;
         });
-      } else {
-        setState(() => _isLoading = false);
       }
-    } catch (e) {
-      if (mounted) {
-        setState(() => _isLoading = false);
-      }
-    }
+    } catch (_) {}
   }
 
   Future<void> _onProfilePictureUpdated() async {
@@ -154,14 +145,7 @@ class _AttorneySidebarState extends State<AttorneySidebar>
       padding: const EdgeInsets.fromLTRB(24, 28, 24, 28),
       // Make header background transparent so only the circular profile image stands out
       decoration: const BoxDecoration(color: Colors.transparent),
-      child: _isLoading
-          ? const Center(
-              child: CircularProgressIndicator(
-                color: Colors.white,
-                strokeWidth: 2.5,
-              ),
-            )
-          : _currentUser == null
+      child: _currentUser == null
           ? const SizedBox.shrink()
           : Column(
               children: [
@@ -388,22 +372,11 @@ class _MenuItemState extends State<_MenuItem>
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
             decoration: BoxDecoration(
               color: widget.isActive
-                  ? AppTheme.royalBlue.withOpacity(0.1)
+                  ? AppTheme.sidebarActive
                   : (_isHovered
-                        ? AppTheme.royalBlue.withOpacity(0.05)
+                        ? AppTheme.sidebarActive.withOpacity(0.6)
                         : Colors.transparent),
               borderRadius: BorderRadius.circular(12),
-              border: widget.isActive
-                  ? Border.all(
-                      color: AppTheme.royalBlue.withOpacity(0.3),
-                      width: 1,
-                    )
-                  : (_isHovered
-                        ? Border.all(
-                            color: AppTheme.royalBlue.withOpacity(0.15),
-                            width: 1,
-                          )
-                        : null),
             ),
             child: Row(
               children: [
@@ -412,7 +385,7 @@ class _MenuItemState extends State<_MenuItem>
                   padding: const EdgeInsets.all(9),
                   decoration: BoxDecoration(
                     color: widget.isActive
-                        ? AppTheme.royalBlue.withOpacity(0.12)
+                        ? AppTheme.sidebarActive
                         : Colors.transparent,
                     borderRadius: BorderRadius.circular(10),
                   ),
@@ -420,9 +393,9 @@ class _MenuItemState extends State<_MenuItem>
                     widget.icon,
                     size: 21,
                     color: widget.isActive
-                        ? AppTheme.royalBlue
+                        ? AppTheme.sidebarActiveText
                         : (_isHovered
-                              ? AppTheme.royalBlue.withOpacity(0.75)
+                              ? AppTheme.sidebarActiveText.withOpacity(0.75)
                               : AppTheme.mutedText),
                   ),
                 ),
@@ -437,9 +410,9 @@ class _MenuItemState extends State<_MenuItem>
                           ? FontWeight.w600
                           : FontWeight.w500,
                       color: widget.isActive
-                          ? AppTheme.royalBlue
+                          ? AppTheme.sidebarActiveText
                           : (_isHovered
-                                ? AppTheme.royalBlue.withOpacity(0.85)
+                                ? AppTheme.sidebarActiveText.withOpacity(0.85)
                                 : AppTheme.mutedText),
                       letterSpacing: 0.15,
                       height: 1.3,

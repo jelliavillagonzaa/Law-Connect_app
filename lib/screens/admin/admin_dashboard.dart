@@ -248,8 +248,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
                     value: '${_stats['totalUsers'] ?? 0}',
                     description: 'All registered users',
                     icon: Icons.people_outlined,
-                    iconColor: AppTheme.royalBlue,
-                    backgroundColor: AppTheme.royalBlue.withOpacity(0.1),
+                    iconColor: AppTheme.inkBlue,
+                    backgroundColor: AppTheme.pastelBlueGray,
                     percentageChange: '+12%',
                   ),
                   StatCard(
@@ -257,8 +257,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
                     value: '${_stats['totalClients'] ?? 0}',
                     description: 'Active clients',
                     icon: Icons.person_outline,
-                    iconColor: const Color(0xFF2D7A4F),
-                    backgroundColor: const Color(0xFF2D7A4F).withOpacity(0.1),
+                    iconColor: AppTheme.inkGreen,
+                    backgroundColor: AppTheme.pastelMint,
                     percentageChange: '+8%',
                   ),
                   StatCard(
@@ -266,16 +266,16 @@ class _AdminDashboardState extends State<AdminDashboard> {
                     value: '${_stats['attorneys'] ?? 0}',
                     description: 'Registered attorneys',
                     icon: Icons.badge_outlined,
-                    iconColor: const Color(0xFFB8860B),
-                    backgroundColor: const Color(0xFFB8860B).withOpacity(0.1),
+                    iconColor: AppTheme.inkGold,
+                    backgroundColor: AppTheme.pastelBeige,
                   ),
                   StatCard(
                     title: 'Total Cases',
                     value: '${_stats['totalCases'] ?? 0}',
                     description: 'All cases',
                     icon: Icons.folder_outlined,
-                    iconColor: AppTheme.deepNavy,
-                    backgroundColor: AppTheme.deepNavy.withOpacity(0.1),
+                    iconColor: AppTheme.inkSteel,
+                    backgroundColor: AppTheme.pastelSteel,
                     percentageChange: '+15%',
                   ),
                   StatCard(
@@ -283,16 +283,16 @@ class _AdminDashboardState extends State<AdminDashboard> {
                     value: '${_stats['pendingCases'] ?? 0}',
                     description: 'Awaiting review',
                     icon: Icons.pending_outlined,
-                    iconColor: const Color(0xFFC55A3F),
-                    backgroundColor: const Color(0xFFC55A3F).withOpacity(0.1),
+                    iconColor: AppTheme.inkCoral,
+                    backgroundColor: AppTheme.pastelPink,
                   ),
                   StatCard(
                     title: 'Active Cases',
                     value: '${_stats['activeCases'] ?? 0}',
                     description: 'In progress',
                     icon: Icons.work_outline,
-                    iconColor: const Color(0xFF2E5C8A),
-                    backgroundColor: const Color(0xFF2E5C8A).withOpacity(0.1),
+                    iconColor: AppTheme.inkBlue,
+                    backgroundColor: AppTheme.pastelBlueGray,
                     percentageChange: '+5%',
                   ),
                 ],
@@ -624,7 +624,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
     final isMobile = MediaQuery.of(context).size.width < 768;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F4F4),
+      backgroundColor: AppTheme.lightGray,
       body: Row(
         children: [
           // Sidebar - Desktop

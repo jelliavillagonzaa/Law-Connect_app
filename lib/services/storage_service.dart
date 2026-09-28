@@ -5,49 +5,26 @@ import 'package:flutter/foundation.dart' show kDebugMode, kIsWeb, debugPrint;
 import 'package:image_picker/image_picker.dart';
 import 'package:file_picker/file_picker.dart';
 import 'local_attachment_service.dart';
+import 'supabase_storage_service.dart';
 
 class StorageService {
   final FirebaseStorage _storage = FirebaseStorage.instance;
   final LocalAttachmentService _localAttachmentService = LocalAttachmentService();
+  final SupabaseStorageService _supabaseStorage = SupabaseStorageService();
 
-  // Upload user profile photo (works on both web and mobile)
+  // Upload user profile photo to Supabase Storage (works on both web and mobile)
   Future<String> uploadProfilePhoto({
     required String userId,
     required XFile imageFile,
   }) async {
     try {
-      // Create a unique filename
-      final fileName =
-          'profile_${userId}_${DateTime.now().millisecondsSinceEpoch}.jpg';
-      final ref = _storage.ref().child('profile_photos/$userId/$fileName');
-
-      UploadTask uploadTask;
-
-      if (kIsWeb) {
-        // For web: read file as bytes and use putData
-        final bytes = await imageFile.readAsBytes();
-        final metadata = SettableMetadata(contentType: 'image/jpeg');
-        uploadTask = ref.putData(bytes, metadata);
-      } else {
-        // For mobile: use putFile with File object
-        final file = File(imageFile.path);
-        if (!await file.exists()) {
-          throw Exception('Image file does not exist');
-        }
-        final metadata = SettableMetadata(contentType: 'image/jpeg');
-        uploadTask = ref.putFile(file, metadata);
-      }
-
-      // Wait for upload (no timeout - allows for large files and slow connections)
-      final snapshot = await uploadTask;
-
-      // Get download URL (no timeout)
-      final downloadUrl = await snapshot.ref.getDownloadURL();
-
+      final downloadUrl = await _supabaseStorage.uploadProfilePhoto(
+        userId: userId,
+        imageFile: imageFile,
+      );
       if (kDebugMode) {
         debugPrint('✅ Profile photo uploaded: $downloadUrl');
       }
-
       return downloadUrl;
     } catch (e) {
       if (kDebugMode) {

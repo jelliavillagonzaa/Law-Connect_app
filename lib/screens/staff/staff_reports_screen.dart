@@ -5,15 +5,16 @@ import '../../services/staff_service.dart';
 import '../../services/task_service.dart';
 import '../../models/task_model.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/open_work_tasks.dart';
+import '../../services/hearing_calendar_fields.dart';
+import '../../utils/staff_task_report_export.dart';
+import '../../widgets/staff/staff_task_report_download_button.dart';
 
 enum DateFilterType {
   all,
   today,
   thisWeek,
   thisMonth,
-  thisYear,
-  customDate,
-  customRange,
 }
 
 class StaffReportsScreen extends StatefulWidget {
@@ -27,16 +28,27 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
   final StaffService _staffService = StaffService();
   final TaskService _taskService = TaskService();
 
-  // Date filtering for activity logs
-  DateFilterType _dateFilterType = DateFilterType.all;
-  DateTime? _selectedDate;
-  DateTime? _startDate;
-  DateTime? _endDate;
+  DateFilterType _dateFilterType = DateFilterType.thisWeek;
+  bool _showSignIns = false;
+  Future<List<Map<String, dynamic>>>? _logsFuture;
+  String? _logsStaffId;
+  Stream<List<TaskModel>>? _tasksStream;
+  String? _tasksStaffId;
 
-  @override
-  void initState() {
-    super.initState();
-    _selectedDate = DateTime.now();
+  Future<List<Map<String, dynamic>>> _activityLogsFuture(String staffId) {
+    if (_logsFuture == null || _logsStaffId != staffId) {
+      _logsStaffId = staffId;
+      _logsFuture = _staffService.fetchStaffActivityLogs(staffId);
+    }
+    return _logsFuture!;
+  }
+
+  Stream<List<TaskModel>> _staffTasksStream(String staffId) {
+    if (_tasksStream == null || _tasksStaffId != staffId) {
+      _tasksStaffId = staffId;
+      _tasksStream = _taskService.getStaffTasks(staffId);
+    }
+    return _tasksStream!;
   }
 
   @override
@@ -123,350 +135,228 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
                 spacing: 8,
                 runSpacing: 8,
                 children: [
-                  _buildFilterChip('All', DateFilterType.all),
                   _buildFilterChip('Today', DateFilterType.today),
                   _buildFilterChip('This Week', DateFilterType.thisWeek),
                   _buildFilterChip('This Month', DateFilterType.thisMonth),
-                  _buildFilterChip('This Year', DateFilterType.thisYear),
-                  _buildFilterChip('Custom Date', DateFilterType.customDate),
-                  _buildFilterChip('Date Range', DateFilterType.customRange),
+                  _buildFilterChip('All', DateFilterType.all),
                 ],
               ),
-              // Custom Date/Range Selection
-              if (_dateFilterType == DateFilterType.customDate ||
-                  _dateFilterType == DateFilterType.customRange) ...[
-                const SizedBox(height: 12),
-                if (_dateFilterType == DateFilterType.customDate) ...[
-                  Row(
-                    children: [
-                      Expanded(
-                        child: InkWell(
-                          onTap: () => _selectDate(context),
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 12,
-                            ),
-                            decoration: BoxDecoration(
-                              border: Border.all(color: AppTheme.royalBlue),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      'Selected Date',
-                                      style: TextStyle(
-                                        fontSize: 12,
-                                        color: Colors.grey[600],
-                                      ),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      _selectedDate != null
-                                          ? DateFormat(
-                                              'MMMM dd, yyyy',
-                                            ).format(_selectedDate!)
-                                          : 'Select Date',
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w600,
-                                        color: AppTheme.royalBlue,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                Icon(
-                                  Icons.calendar_today,
-                                  color: AppTheme.royalBlue,
-                                  size: 20,
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      IconButton(
-                        icon: const Icon(Icons.today),
-                        onPressed: () {
-                          setState(() {
-                            _selectedDate = DateTime.now();
-                          });
-                        },
-                        tooltip: 'Today',
-                        color: AppTheme.royalBlue,
-                      ),
-                    ],
-                  ),
-                ] else if (_dateFilterType == DateFilterType.customRange) ...[
-                  Row(
-                    children: [
-                      Expanded(
-                        child: InkWell(
-                          onTap: () => _selectStartDate(context),
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 12,
-                            ),
-                            decoration: BoxDecoration(
-                              border: Border.all(color: AppTheme.royalBlue),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      'Start Date',
-                                      style: TextStyle(
-                                        fontSize: 12,
-                                        color: Colors.grey[600],
-                                      ),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      _startDate != null
-                                          ? DateFormat(
-                                              'MMM dd, yyyy',
-                                            ).format(_startDate!)
-                                          : 'Select Start',
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w600,
-                                        color: AppTheme.royalBlue,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                Icon(
-                                  Icons.calendar_today,
-                                  color: AppTheme.royalBlue,
-                                  size: 20,
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: InkWell(
-                          onTap: () => _selectEndDate(context),
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 12,
-                            ),
-                            decoration: BoxDecoration(
-                              border: Border.all(color: AppTheme.royalBlue),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      'End Date',
-                                      style: TextStyle(
-                                        fontSize: 12,
-                                        color: Colors.grey[600],
-                                      ),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      _endDate != null
-                                          ? DateFormat(
-                                              'MMM dd, yyyy',
-                                            ).format(_endDate!)
-                                          : 'Select End',
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w600,
-                                        color: AppTheme.royalBlue,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                Icon(
-                                  Icons.calendar_today,
-                                  color: AppTheme.royalBlue,
-                                  size: 20,
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ],
+              const SizedBox(height: 8),
+              SwitchListTile.adaptive(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                title: const Text(
+                  'Show sign-ins',
+                  style: TextStyle(fontSize: 14),
+                ),
+                value: _showSignIns,
+                activeThumbColor: AppTheme.royalBlue,
+                onChanged: (value) {
+                  setState(() => _showSignIns = value);
+                },
+              ),
             ],
           ),
         ),
         // Activity Logs List
         Expanded(
-          child: StreamBuilder<List<Map<String, dynamic>>>(
-            stream: _staffService.getStaffActivityLogs(staffId),
+          child: FutureBuilder<List<Map<String, dynamic>>>(
+            future: _activityLogsFuture(staffId),
             builder: (context, snapshot) {
-              if (snapshot.connectionState == ConnectionState.waiting) {
-                return const Center(child: CircularProgressIndicator());
-              }
-
-              if (snapshot.hasError) {
+              try {
+                return _buildActivityLogsBody(snapshot);
+              } catch (e) {
                 return Center(
                   child: Padding(
                     padding: const EdgeInsets.all(24),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(
-                          Icons.error_outline,
-                          size: 64,
-                          color: Colors.red[300],
-                        ),
-                        const SizedBox(height: 16),
-                        Text(
-                          'Error loading logs',
-                          style: TextStyle(fontSize: 18, color: Colors.red),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          '${snapshot.error}',
-                          style: TextStyle(fontSize: 14, color: Colors.grey),
-                          textAlign: TextAlign.center,
-                        ),
-                      ],
+                    child: Text(
+                      'Could not display logs. Hot restart and try again.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.grey[700]),
                     ),
                   ),
                 );
               }
-
-              final allLogs = snapshot.data ?? [];
-
-              // Filter logs based on selected filter type
-              final filteredLogs = _filterLogsByDateRange(allLogs);
-
-              if (filteredLogs.isEmpty) {
-                return Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(Icons.history, size: 64, color: Colors.grey[400]),
-                      const SizedBox(height: 16),
-                      Text(
-                        _getEmptyStateMessage(),
-                        style: TextStyle(fontSize: 18, color: Colors.grey[600]),
-                      ),
-                      if (_dateFilterType != DateFilterType.all) ...[
-                        const SizedBox(height: 8),
-                        TextButton(
-                          onPressed: () {
-                            setState(() {
-                              _dateFilterType = DateFilterType.all;
-                            });
-                          },
-                          child: const Text('Show All Logs'),
-                        ),
-                      ],
-                    ],
-                  ),
-                );
-              }
-
-              // Group logs by date
-              final groupedLogs = <String, List<Map<String, dynamic>>>{};
-              for (var log in filteredLogs) {
-                final timestamp = log['timestamp'] as DateTime?;
-                if (timestamp != null) {
-                  final dateKey = DateFormat('MMMM dd, yyyy').format(timestamp);
-                  groupedLogs.putIfAbsent(dateKey, () => []).add(log);
-                }
-              }
-
-              final sortedDates = groupedLogs.keys.toList()
-                ..sort((a, b) {
-                  final dateA = DateFormat('MMMM dd, yyyy').parse(a);
-                  final dateB = DateFormat('MMMM dd, yyyy').parse(b);
-                  return dateB.compareTo(dateA);
-                });
-
-              return ListView.builder(
-                padding: const EdgeInsets.all(16),
-                itemCount: sortedDates.length,
-                itemBuilder: (context, dateIndex) {
-                  final dateKey = sortedDates[dateIndex];
-                  final logsForDate = groupedLogs[dateKey]!;
-
-                  return Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      // Date Header
-                      Padding(
-                        padding: EdgeInsets.only(
-                          bottom: 12,
-                          top: dateIndex > 0 ? 24 : 0,
-                        ),
-                        child: Row(
-                          children: [
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 12,
-                                vertical: 6,
-                              ),
-                              decoration: BoxDecoration(
-                                color: AppTheme.royalBlue.withOpacity(0.1),
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                              child: Text(
-                                dateKey,
-                                style: TextStyle(
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.bold,
-                                  color: AppTheme.royalBlue,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 4,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.grey[200],
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                              child: Text(
-                                '${logsForDate.length} ${logsForDate.length == 1 ? 'log' : 'logs'}',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.grey[700],
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      // Logs for this date
-                      ...logsForDate.map((log) => _buildLogCard(log)),
-                    ],
-                  );
-                },
-              );
             },
           ),
         ),
       ],
+    );
+  }
+
+  Widget _buildActivityLogsBody(
+    AsyncSnapshot<List<Map<String, dynamic>>> snapshot,
+  ) {
+    if (snapshot.connectionState == ConnectionState.waiting &&
+        !snapshot.hasData) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (snapshot.hasError) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.error_outline,
+                size: 64,
+                color: Colors.red[300],
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'Could not load logs',
+                style: TextStyle(fontSize: 18, color: Colors.red),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Hot restart and try again.',
+                style: const TextStyle(fontSize: 14, color: Colors.grey),
+                textAlign: TextAlign.center,
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    final allLogs = snapshot.data ?? [];
+    final filteredLogs = _visibleLogs(allLogs);
+
+    if (filteredLogs.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.history, size: 64, color: Colors.grey[400]),
+            const SizedBox(height: 16),
+            Text(
+              _getEmptyStateMessage(),
+              style: TextStyle(fontSize: 18, color: Colors.grey[600]),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _showSignIns
+                  ? 'No activity in this filter.'
+                  : 'Work logs appear when you update a task, create a draft, or upload a document.',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 13, color: Colors.grey[500]),
+            ),
+            if (_dateFilterType != DateFilterType.all) ...[
+              const SizedBox(height: 8),
+              TextButton(
+                onPressed: () {
+                  setState(() {
+                    _dateFilterType = DateFilterType.all;
+                  });
+                },
+                child: const Text('Show all dates'),
+              ),
+            ],
+          ],
+        ),
+      );
+    }
+
+    final groupedLogs = <String, List<Map<String, dynamic>>>{};
+    for (final log in filteredLogs) {
+      final timestamp = _safeDate(log['timestamp']);
+      final dateKey = timestamp != null
+          ? DateFormat('MMMM dd, yyyy').format(timestamp)
+          : 'Unknown date';
+      groupedLogs.putIfAbsent(dateKey, () => []).add(log);
+    }
+
+    final sortedDates = groupedLogs.keys.toList()
+      ..sort((a, b) {
+        if (a == 'Unknown date') return 1;
+        if (b == 'Unknown date') return -1;
+        final dateA = DateFormat('MMMM dd, yyyy').parse(a);
+        final dateB = DateFormat('MMMM dd, yyyy').parse(b);
+        return dateB.compareTo(dateA);
+      });
+
+    return ListView.builder(
+      padding: const EdgeInsets.all(16),
+      itemCount: sortedDates.length + 1,
+      itemBuilder: (context, dateIndex) {
+        if (dateIndex == 0) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildWorkSummary(filteredLogs),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Text(
+                  '${filteredLogs.length} ${filteredLogs.length == 1 ? 'log' : 'logs'}'
+                  '${_dateFilterType == DateFilterType.all ? '' : ' in this filter'}',
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: Colors.grey[700],
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          );
+        }
+        final dateKey = sortedDates[dateIndex - 1];
+        final logsForDate = groupedLogs[dateKey]!;
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: EdgeInsets.only(
+                bottom: 12,
+                top: dateIndex > 1 ? 24 : 0,
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: AppTheme.royalBlue.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      dateKey,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.bold,
+                        color: AppTheme.royalBlue,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.grey[200],
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      '${logsForDate.length} ${logsForDate.length == 1 ? 'log' : 'logs'}',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.grey[700],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            ...logsForDate.map((log) => _buildLogCard(log)),
+          ],
+        );
+      },
     );
   }
 
@@ -478,9 +368,6 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
       onSelected: (selected) {
         setState(() {
           _dateFilterType = type;
-          if (type == DateFilterType.today) {
-            _selectedDate = DateTime.now();
-          }
         });
       },
       selectedColor: AppTheme.royalBlue.withOpacity(0.2),
@@ -500,8 +387,8 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
     }
 
     final now = DateTime.now();
-    DateTime startDate;
-    DateTime endDate;
+    late DateTime startDate;
+    late DateTime endDate;
 
     switch (_dateFilterType) {
       case DateFilterType.today:
@@ -517,38 +404,12 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
         startDate = DateTime(now.year, now.month, 1);
         endDate = DateTime(now.year, now.month + 1, 1);
         break;
-      case DateFilterType.thisYear:
-        startDate = DateTime(now.year, 1, 1);
-        endDate = DateTime(now.year + 1, 1, 1);
-        break;
-      case DateFilterType.customDate:
-        if (_selectedDate == null) return [];
-        startDate = DateTime(
-          _selectedDate!.year,
-          _selectedDate!.month,
-          _selectedDate!.day,
-        );
-        endDate = startDate.add(const Duration(days: 1));
-        break;
-      case DateFilterType.customRange:
-        if (_startDate == null || _endDate == null) return [];
-        startDate = DateTime(
-          _startDate!.year,
-          _startDate!.month,
-          _startDate!.day,
-        );
-        endDate = DateTime(
-          _endDate!.year,
-          _endDate!.month,
-          _endDate!.day,
-        ).add(const Duration(days: 1));
-        break;
-      default:
+      case DateFilterType.all:
         return logs;
     }
 
     return logs.where((log) {
-      final timestamp = log['timestamp'] as DateTime?;
+      final timestamp = _safeDate(log['timestamp']);
       if (timestamp == null) return false;
       return timestamp.isAfter(
             startDate.subtract(const Duration(milliseconds: 1)),
@@ -557,30 +418,102 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
     }).toList();
   }
 
+  bool _isSignInLog(Map<String, dynamic> log) {
+    final action = _safeString(log['action']).toLowerCase();
+    final type = _safeString(log['resourceType']).toLowerCase();
+    return type == 'session' ||
+        action == 'signed in' ||
+        action.contains('sign in') ||
+        action.contains('session started');
+  }
+
+  List<Map<String, dynamic>> _visibleLogs(List<Map<String, dynamic>> allLogs) {
+    var logs = _filterLogsByDateRange(allLogs);
+    logs = logs
+        .where((log) => !HearingCalendarFields.isJunkWorkLog(log))
+        .toList();
+    if (!_showSignIns) {
+      logs = logs.where((log) => !_isSignInLog(log)).toList();
+    }
+    return logs;
+  }
+
   String _getEmptyStateMessage() {
     switch (_dateFilterType) {
       case DateFilterType.today:
-        return 'No logs for today';
+        return 'No work logs for today';
       case DateFilterType.thisWeek:
-        return 'No logs for this week';
+        return 'No work logs for this week';
       case DateFilterType.thisMonth:
-        return 'No logs for this month';
-      case DateFilterType.thisYear:
-        return 'No logs for this year';
-      case DateFilterType.customDate:
-        return 'No logs for selected date';
-      case DateFilterType.customRange:
-        return 'No logs for selected date range';
-      default:
-        return 'No activity logs yet';
+        return 'No work logs for this month';
+      case DateFilterType.all:
+        return 'No work logs yet';
     }
   }
 
+  Widget _buildWorkSummary(List<Map<String, dynamic>> logs) {
+    final tasksDone = logs.where((log) {
+      final action = _safeString(log['action']).toLowerCase();
+      final details = _safeString(log['details']).toLowerCase();
+      return action.contains('task') &&
+          (details.contains('completed') || details.contains('to completed'));
+    }).length;
+    final drafts = logs.where((log) {
+      return _safeString(log['action']).toLowerCase().contains('draft');
+    }).length;
+    final uploads = logs.where((log) {
+      return _safeString(log['action']).toLowerCase().contains('upload');
+    }).length;
+
+    Widget chip(String label, int count) {
+      return Expanded(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+          decoration: BoxDecoration(
+            color: AppTheme.royalBlue.withOpacity(0.06),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Column(
+            children: [
+              Text(
+                '$count',
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                  color: AppTheme.royalBlue,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                label,
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 11, color: Colors.grey[700]),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        children: [
+          chip('tasks done', tasksDone),
+          const SizedBox(width: 8),
+          chip('drafts', drafts),
+          const SizedBox(width: 8),
+          chip('uploads', uploads),
+        ],
+      ),
+    );
+  }
+
   Widget _buildLogCard(Map<String, dynamic> log) {
-    final timestamp = log['timestamp'] as DateTime?;
-    final action = log['action'] ?? 'Activity';
-    final details = log['details'] ?? '';
-    final resourceType = log['resourceType'] as String?;
+    final timestamp = _safeDate(log['timestamp']);
+    final action = _safeString(log['action'], 'Activity');
+    final details = _safeString(log['details']);
+    final resourceType = _safeString(log['resourceType']);
 
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
@@ -591,7 +524,6 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Icon
             Container(
               width: 48,
               height: 48,
@@ -606,7 +538,6 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
               ),
             ),
             const SizedBox(width: 16),
-            // Content
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -648,8 +579,7 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
                 ],
               ),
             ),
-            // Resource Type Chip
-            if (resourceType != null)
+            if (resourceType.isNotEmpty)
               Chip(
                 label: Text(resourceType, style: const TextStyle(fontSize: 10)),
                 backgroundColor: AppTheme.lightGray,
@@ -661,9 +591,34 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
     );
   }
 
+  static String _safeString(dynamic value, [String fallback = '']) {
+    if (value == null) return fallback;
+    if (value is String) {
+      final trimmed = value.trim();
+      if (trimmed.isEmpty || trimmed == 'null' || trimmed == 'undefined') {
+        return fallback;
+      }
+      return value;
+    }
+    try {
+      final text = value.toString().trim();
+      if (text.isEmpty || text == 'null' || text == 'undefined') {
+        return fallback;
+      }
+      return text;
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  static DateTime? _safeDate(dynamic value) {
+    if (value is DateTime) return value;
+    return StaffService.parseActivityTimestamp(value);
+  }
+
   Widget _buildTaskReports(String staffId) {
     return StreamBuilder<List<TaskModel>>(
-      stream: _taskService.getStaffTasks(staffId),
+      stream: _staffTasksStream(staffId),
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator());
@@ -689,13 +644,15 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
         }
 
         final tasks = snapshot.data ?? [];
-        final completedTasks = tasks
-            .where((t) => t.status == 'completed')
-            .length;
+        final completedTasks =
+            tasks.where((t) => t.status == 'completed').length;
         final pendingTasks = tasks.where((t) => t.status == 'pending').length;
-        final inProgressTasks = tasks
-            .where((t) => t.status == 'in_progress')
-            .length;
+        final inProgressTasks =
+            tasks.where((t) => t.status == 'in_progress').length;
+        final cancelledTasks =
+            tasks.where((t) => OpenWorkTasks.isCancelled(t.status)).length;
+        final openWorkTasks =
+            tasks.where((t) => OpenWorkTasks.isOpenStatus(t.status)).length;
         final totalTasks = tasks.length;
 
         if (tasks.isEmpty) {
@@ -714,76 +671,126 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
           );
         }
 
+        final completedList = tasks
+            .where((t) => t.status == 'completed')
+            .toList();
+        final preparedBy = FirebaseAuth.instance.currentUser?.email ??
+            FirebaseAuth.instance.currentUser?.displayName ??
+            'Staff';
+        final generatedAt = DateTime.now();
+        final summaryReport = StaffTaskReportData(
+          kind: StaffTaskReportKind.summary,
+          preparedBy: preparedBy,
+          generatedAt: generatedAt,
+          totalTasks: totalTasks,
+          completedCount: completedTasks,
+          inProgressCount: inProgressTasks,
+          pendingCount: pendingTasks,
+          tasks: tasks,
+        );
+        final completedReport = StaffTaskReportData(
+          kind: StaffTaskReportKind.completed,
+          preparedBy: preparedBy,
+          generatedAt: generatedAt,
+          totalTasks: totalTasks,
+          completedCount: completedTasks,
+          inProgressCount: inProgressTasks,
+          pendingCount: pendingTasks,
+          tasks: completedList,
+        );
+
         return SingleChildScrollView(
           padding: const EdgeInsets.all(16),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Summary Cards
-              Text(
-                'Task Summary',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                  color: AppTheme.royalBlue,
-                ),
-              ),
-              const SizedBox(height: 16),
-              GridView.count(
-                crossAxisCount: 2,
-                shrinkWrap: true,
-                physics: const NeverScrollableScrollPhysics(),
-                mainAxisSpacing: 12,
-                crossAxisSpacing: 12,
-                childAspectRatio: 1.5,
+              Row(
                 children: [
-                  _buildStatCard(
-                    'Total Tasks',
-                    '$totalTasks',
-                    Icons.task,
-                    AppTheme.royalBlue,
+                  const Expanded(
+                    child: Text(
+                      'Task Summary',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        color: AppTheme.royalBlue,
+                      ),
+                    ),
                   ),
-                  _buildStatCard(
-                    'Completed',
-                    '$completedTasks',
-                    Icons.check_circle,
-                    Colors.green,
-                  ),
-                  _buildStatCard(
-                    'In Progress',
-                    '$inProgressTasks',
-                    Icons.work,
-                    Colors.blue,
-                  ),
-                  _buildStatCard(
-                    'Pending',
-                    '$pendingTasks',
-                    Icons.pending,
-                    Colors.orange,
-                  ),
+                  StaffTaskReportDownloadButton(data: summaryReport),
                 ],
               ),
+              const SizedBox(height: 10),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final maxW = constraints.maxWidth.isFinite
+                      ? constraints.maxWidth
+                      : MediaQuery.sizeOf(context).width;
+                  final wide = maxW >= 640;
+                  return GridView(
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: wide ? 3 : 1,
+                      mainAxisSpacing: 8,
+                      crossAxisSpacing: 8,
+                      mainAxisExtent: 64,
+                    ),
+                    children: [
+                      _buildStatCard(
+                        'Open work',
+                        '$openWorkTasks',
+                        Icons.assignment_outlined,
+                        AppTheme.royalBlue,
+                      ),
+                      _buildStatCard(
+                        'Completed',
+                        '$completedTasks',
+                        Icons.check_circle,
+                        Colors.green,
+                      ),
+                      _buildStatCard(
+                        'Cancelled',
+                        '$cancelledTasks',
+                        Icons.cancel_outlined,
+                        Colors.grey,
+                      ),
+                    ],
+                  );
+                },
+              ),
               const SizedBox(height: 24),
-              // Completed Tasks Section
-              Text(
-                'Completed Tasks',
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                  color: AppTheme.royalBlue,
-                ),
+              Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Completed Tasks',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: AppTheme.royalBlue,
+                      ),
+                    ),
+                  ),
+                  StaffTaskReportDownloadButton(data: completedReport),
+                ],
               ),
               const SizedBox(height: 12),
-              ...tasks
-                  .where((t) => t.status == 'completed')
-                  .take(20)
-                  .map((task) => _buildTaskCard(task)),
-              if (tasks.where((t) => t.status == 'completed').length > 20)
+              if (completedList.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Text(
+                    'No completed tasks yet.',
+                    style: TextStyle(fontSize: 14, color: Colors.grey[600]),
+                  ),
+                )
+              else
+                ...completedList.take(20).map((task) => _buildTaskCard(task)),
+              if (completedList.length > 20)
                 Padding(
                   padding: const EdgeInsets.all(16),
                   child: Center(
                     child: Text(
-                      'Showing first 20 of ${tasks.where((t) => t.status == 'completed').length} completed tasks',
+                      'Showing first 20 of ${completedList.length} completed tasks',
                       style: TextStyle(
                         fontSize: 12,
                         color: Colors.grey[600],
@@ -806,28 +813,38 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
     Color color,
   ) {
     return Card(
-      elevation: 2,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      elevation: 1,
+      margin: EdgeInsets.zero,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
       child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        child: Row(
           children: [
-            Icon(icon, color: color, size: 32),
-            const SizedBox(height: 8),
-            Text(
-              value,
-              style: TextStyle(
-                fontSize: 24,
-                fontWeight: FontWeight.bold,
-                color: color,
+            Icon(icon, color: color, size: 20),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    value,
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: color,
+                      height: 1.1,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    title,
+                    style: TextStyle(fontSize: 11, color: Colors.grey[600]),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
               ),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              title,
-              style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-              textAlign: TextAlign.center,
             ),
           ],
         ),
@@ -895,10 +912,11 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
   }
 
   Widget _buildDocumentHistory(String staffId) {
-    return StreamBuilder<List<Map<String, dynamic>>>(
-      stream: _staffService.getDocumentUploadHistory(staffId),
+    return FutureBuilder<List<Map<String, dynamic>>>(
+      future: _activityLogsFuture(staffId),
       builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
+        if (snapshot.connectionState == ConnectionState.waiting &&
+            !snapshot.hasData) {
           return const Center(child: CircularProgressIndicator());
         }
 
@@ -912,7 +930,7 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
                   Icon(Icons.error_outline, size: 64, color: Colors.red[300]),
                   const SizedBox(height: 16),
                   Text(
-                    'Error loading documents',
+                    'Could not load documents',
                     style: TextStyle(fontSize: 18, color: Colors.red),
                   ),
                 ],
@@ -921,7 +939,9 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
           );
         }
 
-        final uploads = snapshot.data ?? [];
+        final uploads = (snapshot.data ?? []).where((log) {
+          return _safeString(log['action']).toLowerCase().contains('upload');
+        }).toList();
 
         if (uploads.isEmpty) {
           return Center(
@@ -945,16 +965,18 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
 
         // Group uploads by date
         final groupedUploads = <String, List<Map<String, dynamic>>>{};
-        for (var upload in uploads) {
-          final timestamp = upload['timestamp'] as DateTime?;
-          if (timestamp != null) {
-            final dateKey = DateFormat('MMMM dd, yyyy').format(timestamp);
-            groupedUploads.putIfAbsent(dateKey, () => []).add(upload);
-          }
+        for (final upload in uploads) {
+          final timestamp = _safeDate(upload['timestamp']);
+          final dateKey = timestamp != null
+              ? DateFormat('MMMM dd, yyyy').format(timestamp)
+              : 'Unknown date';
+          groupedUploads.putIfAbsent(dateKey, () => []).add(upload);
         }
 
         final sortedDates = groupedUploads.keys.toList()
           ..sort((a, b) {
+            if (a == 'Unknown date') return 1;
+            if (b == 'Unknown date') return -1;
             final dateA = DateFormat('MMMM dd, yyyy').parse(a);
             final dateB = DateFormat('MMMM dd, yyyy').parse(b);
             return dateB.compareTo(dateA);
@@ -1028,10 +1050,10 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
   }
 
   Widget _buildDocumentCard(Map<String, dynamic> upload) {
-    final timestamp = upload['timestamp'] as DateTime?;
-    final details = upload['details'] ?? 'Document uploaded';
-    final resourceType = upload['resourceType'] as String?;
-    final resourceId = upload['resourceId'] as String?;
+    final timestamp = _safeDate(upload['timestamp']);
+    final details = _safeString(upload['details'], 'Document uploaded');
+    final resourceType = _safeString(upload['resourceType']);
+    final resourceId = _safeString(upload['resourceId']);
 
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
@@ -1067,7 +1089,7 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
                       fontWeight: FontWeight.bold,
                     ),
                   ),
-                  if (resourceType != null && resourceId != null) ...[
+                  if (resourceType.isNotEmpty && resourceId.isNotEmpty) ...[
                     const SizedBox(height: 4),
                     Text(
                       'Case: ${resourceId.substring(0, resourceId.length > 8 ? 8 : resourceId.length)}...',
@@ -1097,7 +1119,7 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
                 ],
               ),
             ),
-            if (resourceType != null)
+            if (resourceType.isNotEmpty)
               Chip(
                 label: Text(resourceType, style: const TextStyle(fontSize: 10)),
                 backgroundColor: AppTheme.lightGray,
@@ -1107,96 +1129,6 @@ class _StaffReportsScreenState extends State<StaffReportsScreen> {
         ),
       ),
     );
-  }
-
-  Future<void> _selectDate(BuildContext context) async {
-    final picked = await showDatePicker(
-      context: context,
-      initialDate: _selectedDate ?? DateTime.now(),
-      firstDate: DateTime(2020),
-      lastDate: DateTime(2030, 12, 31), // Extended to 2030
-      builder: (context, child) {
-        return Theme(
-          data: Theme.of(context).copyWith(
-            colorScheme: ColorScheme.light(
-              primary: AppTheme.royalBlue,
-              onPrimary: Colors.white,
-              surface: Colors.white,
-              onSurface: Colors.black,
-            ),
-          ),
-          child: child!,
-        );
-      },
-    );
-    if (picked != null) {
-      setState(() {
-        _selectedDate = picked;
-        _dateFilterType = DateFilterType.customDate;
-      });
-    }
-  }
-
-  Future<void> _selectStartDate(BuildContext context) async {
-    final picked = await showDatePicker(
-      context: context,
-      initialDate: _startDate ?? DateTime.now(),
-      firstDate: DateTime(2020),
-      lastDate: DateTime(2030, 12, 31), // Extended to 2030
-      builder: (context, child) {
-        return Theme(
-          data: Theme.of(context).copyWith(
-            colorScheme: ColorScheme.light(
-              primary: AppTheme.royalBlue,
-              onPrimary: Colors.white,
-              surface: Colors.white,
-              onSurface: Colors.black,
-            ),
-          ),
-          child: child!,
-        );
-      },
-    );
-    if (picked != null) {
-      setState(() {
-        _startDate = picked;
-        if (_endDate != null && _startDate!.isAfter(_endDate!)) {
-          _endDate = null; // Reset end date if start is after end
-        }
-        _dateFilterType = DateFilterType.customRange;
-      });
-    }
-  }
-
-  Future<void> _selectEndDate(BuildContext context) async {
-    final picked = await showDatePicker(
-      context: context,
-      initialDate: _endDate ?? _startDate ?? DateTime.now(),
-      firstDate: _startDate ?? DateTime(2020),
-      lastDate: DateTime(2030, 12, 31), // Extended to 2030
-      builder: (context, child) {
-        return Theme(
-          data: Theme.of(context).copyWith(
-            colorScheme: ColorScheme.light(
-              primary: AppTheme.royalBlue,
-              onPrimary: Colors.white,
-              surface: Colors.white,
-              onSurface: Colors.black,
-            ),
-          ),
-          child: child!,
-        );
-      },
-    );
-    if (picked != null) {
-      setState(() {
-        _endDate = picked;
-        if (_startDate != null && _endDate!.isBefore(_startDate!)) {
-          _startDate = _endDate; // Adjust start date if end is before start
-        }
-        _dateFilterType = DateFilterType.customRange;
-      });
-    }
   }
 
   Color _getActionColor(String? action) {

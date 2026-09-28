@@ -112,12 +112,24 @@ service cloud.firestore {
       return isAuthenticated()
         && (isStaff() || userRoleMatchesAttorneyAdminStaff());
     }
+
+    // Prevent automated systems from writing to the court_email_queue collection.
+    // Creates and updates are denied for all clients; admins may delete documents.
+    match /court_email_queue/{docId} {
+      allow create: if false;
+      allow update: if false;
+      allow delete: if isAdmin();
+      allow get: if canAccessCourtEmailQueue();
+      allow list: if canAccessCourtEmailQueue();
+    }
     
     // Check if user is client (safe - returns false if user doesn't exist)
     function isClient() {
-      return isAuthenticated() 
-        && userExists() 
-        && getUserRole() == 'client';
+      return isAuthenticated()
+        && userExists()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role is string
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
+             .matches('(?i)^client$');
     }
     
     // Check if user is staff (safe - returns false if user doesn't exist)
@@ -812,6 +824,54 @@ service cloud.firestore {
       // Allow delete: only admins can delete appointments
       allow delete: if isAdmin();
     }
+
+    // Occupied attorney time slots (no client names). Clients may read these
+    // to see whether a requested time is already booked.
+    match /appointment_slots/{slotId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated()
+                    && (isAttorney() || isStaff() || isAdmin() || isClient())
+                    && request.resource.data.attorneyId is string
+                    && request.resource.data.appointmentId is string
+                    && request.resource.data.startAt != null;
+      allow update, delete: if isAuthenticated()
+                            && (isAttorney() || isStaff() || isAdmin());
+    }
+
+    // Client notary requests. Only assigned staff may accept / decline /
+    // schedule. Attorneys may read; they are notified by SMS, not by writing.
+    match /notary_requests/{requestId} {
+      allow get: if isAuthenticated()
+                 && (resource.data.clientId == request.auth.uid
+                     || isAttorney()
+                     || isAdmin()
+                     || (isStaff()
+                         && getStaffAttorneyId() != null
+                         && (!('attorneyId' in resource.data)
+                             || resource.data.attorneyId == null
+                             || resource.data.attorneyId == ''
+                             || resource.data.attorneyId == getStaffAttorneyId())));
+      allow list: if isAuthenticated()
+                  && (isClient() || isAttorney() || isStaff() || isAdmin());
+      allow create: if isAuthenticated()
+                    && request.resource.data.clientId == request.auth.uid
+                    && request.resource.data.status == 'pending'
+                    && request.resource.data.serviceType is string;
+      allow update: if isAuthenticated()
+                    && ((isClient()
+                            && resource.data.clientId == request.auth.uid
+                            && request.resource.data.status == resource.data.status)
+                        || isAdmin()
+                        || (isStaff()
+                            && getStaffAttorneyId() != null
+                            && (!('attorneyId' in resource.data)
+                                || resource.data.attorneyId == null
+                                || resource.data.attorneyId == ''
+                                || resource.data.attorneyId == getStaffAttorneyId())
+                            && (!('attorneyId' in request.resource.data)
+                                || request.resource.data.attorneyId == getStaffAttorneyId())));
+      allow delete: if isAdmin();
+    }
     
     // ==============================
     // TASKS COLLECTION
@@ -954,8 +1014,9 @@ service cloud.firestore {
                     && (!('assignedTo' in request.resource.data)
                         || request.resource.data.assignedTo == resource.data.assignedTo);
       
-      // Allow delete: only admins can delete calendar events
-      allow delete: if isAdmin();
+      // Allow delete: owner attorney/staff, or admin (junk promo rows)
+      allow delete: if isAuthenticated()
+                    && (isAdmin() || calendarAssignedToAuthOrStaffAttorney());
     }
     
     // ==============================
@@ -1068,12 +1129,19 @@ service cloud.firestore {
                       )
                     );
       
-      allow delete: if isAdmin();
+      allow delete: if isAdmin()
+                    || (isFirmUser()
+                        && 'source' in resource.data
+                        && resource.data.source == 'n8n');
     }
     
     // Written only by Cloud Functions (reminder scheduler)
     match /hearing_reminder_jobs/{jobId} {
-      allow read, write: if false;
+      allow read: if isAuthenticated() && (
+        isFirmUser() ||
+        resource.data.targetUserId == request.auth.uid
+      );
+      allow write: if false;
     }
     
     // Written only by Cloud Functions (optional SMTP)
@@ -1141,8 +1209,9 @@ service cloud.firestore {
                             && getStaffAttorneyId() == resource.data.attorneyId)
                         || isAdmin());
       
-      // Allow delete: only admins can delete notifications
-      allow delete: if isAdmin();
+      // Allow delete: owner attorney, or admin (junk promo rows)
+      allow delete: if isAuthenticated()
+                    && (isAdmin() || resource.data.attorneyId == request.auth.uid);
     }
     
     // ==============================
@@ -1157,6 +1226,10 @@ service cloud.firestore {
                  || (
                    'clientId' in resource.data
                    && resource.data.clientId == request.auth.uid
+                 )
+                 || (
+                   'attorneyId' in resource.data
+                   && resource.data.attorneyId == request.auth.uid
                  )
                );
       }
@@ -1175,7 +1248,8 @@ service cloud.firestore {
                || t == 'court_email_ingest';
       }
 
-      // Unified read so `where(userId == uid)` / `where(clientId == uid)` queries work.
+      // Unified read so `where(userId == uid)` / `where(clientId == uid)` /
+      // `where(attorneyId == uid)` queries work.
       allow read: if notificationOwnedByAuth();
       
       // Allow create: 
@@ -1186,11 +1260,20 @@ service cloud.firestore {
       allow create: if isAuthenticated()
                     && request.resource.data.userId is string
                     && request.resource.data.type is string
-                    && request.resource.data.title is string
-                    && request.resource.data.message is string
-                    && (!('eventId' in request.resource.data) || request.resource.data.eventId is string)
-                    && (!('isRead' in request.resource.data) || request.resource.data.isRead is bool)
-                    && notificationCreatedAtValid();
+                    && (
+                      (
+                        request.resource.data.title is string
+                        && request.resource.data.message is string
+                        && (!('eventId' in request.resource.data) || request.resource.data.eventId is string)
+                        && (!('isRead' in request.resource.data) || request.resource.data.isRead is bool)
+                        && notificationCreatedAtValid()
+                      )
+                      || (
+                        request.resource.data.userId == request.auth.uid
+                        && request.resource.data.type == 'attorney_read_keys'
+                        && request.resource.data.keys is list
+                      )
+                    );
       
       // Allow update: users can update their own notifications (mark as read).
       // Staff/attorney/admin may merge hearing fan-out rows for any recipient (SetOptions merge).
@@ -1215,6 +1298,10 @@ service cloud.firestore {
                       || (
                         'clientId' in resource.data
                         && resource.data.clientId == request.auth.uid
+                      )
+                      || (
+                        'attorneyId' in resource.data
+                        && resource.data.attorneyId == request.auth.uid
                       )
                     );
     }

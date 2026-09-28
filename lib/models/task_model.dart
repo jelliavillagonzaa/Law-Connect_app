@@ -9,7 +9,7 @@ class TaskModel {
   final String? caseId;
   final String status; // pending, in_progress, completed
   final DateTime? dueDate;
-  final int? priority; // 1 = Urgent, 2 = High, 3 = Normal, 4 = Low
+  final int? priority; // 2 = High, 3 = Normal, 4 = Low (1 = legacy Urgent → High)
   final DateTime createdAt;
   final DateTime? updatedAt;
   final DateTime? completedAt;

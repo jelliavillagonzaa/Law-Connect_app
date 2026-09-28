@@ -36,8 +36,9 @@ class BillingScreen extends StatelessWidget {
           : StreamBuilder<List<InvoiceModel>>(
               stream: billing.streamInvoicesForClient(clientId),
               builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
+                if (snapshot.connectionState == ConnectionState.waiting &&
+                    !snapshot.hasData) {
+                  return const SizedBox.shrink();
                 }
                 if (snapshot.hasError) {
                   return EmptyState(
@@ -122,8 +123,8 @@ class _OutstandingCard extends StatelessWidget {
             style: AppTheme.bodyMedium.copyWith(color: Colors.white70),
           ),
           const SizedBox(height: 6),
-          Text(
-            Currency.peso(outstanding),
+          CurrencyText(
+            amount: outstanding,
             style: const TextStyle(
               color: Colors.white,
               fontSize: 34,
@@ -134,11 +135,11 @@ class _OutstandingCard extends StatelessWidget {
           Row(
             children: [
               Expanded(
-                child: _miniStat('Total Legal Fees', Currency.peso(totalFees)),
+                child: _miniStat('Total Legal Fees', totalFees),
               ),
               Container(width: 1, height: 36, color: Colors.white24),
               Expanded(
-                child: _miniStat('Total Paid', Currency.peso(totalPaid)),
+                child: _miniStat('Total Paid', totalPaid),
               ),
             ],
           ),
@@ -147,12 +148,12 @@ class _OutstandingCard extends StatelessWidget {
     );
   }
 
-  Widget _miniStat(String label, String value) {
+  Widget _miniStat(String label, num amount) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        Text(
-          value,
+        CurrencyText(
+          amount: amount,
           style: const TextStyle(
             color: Colors.white,
             fontSize: 16,
@@ -202,13 +203,13 @@ class _InvoiceCard extends StatelessWidget {
             Text(invoice.description!, style: AppTheme.bodySmall),
           ],
           const SizedBox(height: 12),
-          _row('Total Legal Fee', Currency.peso(invoice.totalLegalFee)),
+          _row('Total Legal Fee', invoice.totalLegalFee),
           const SizedBox(height: 6),
-          _row('Amount Paid', Currency.peso(invoice.amountPaid)),
+          _row('Amount Paid', invoice.amountPaid),
           const Divider(height: 20),
           _row(
             'Remaining Balance',
-            Currency.peso(invoice.remainingBalance),
+            invoice.remainingBalance,
             emphasize: true,
           ),
           if (invoice.hasOutstanding) ...[
@@ -242,7 +243,7 @@ class _InvoiceCard extends StatelessWidget {
     );
   }
 
-  Widget _row(String label, String value, {bool emphasize = false}) {
+  Widget _row(String label, num value, {bool emphasize = false}) {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
@@ -252,8 +253,8 @@ class _InvoiceCard extends StatelessWidget {
               ? AppTheme.bodyMedium.copyWith(fontWeight: FontWeight.w600)
               : AppTheme.bodyMedium.copyWith(color: AppTheme.mutedText),
         ),
-        Text(
-          value,
+        CurrencyText(
+          amount: value,
           style: TextStyle(
             fontSize: emphasize ? 18 : 14,
             fontWeight: emphasize ? FontWeight.bold : FontWeight.w600,
@@ -414,8 +415,8 @@ class PaymentHistoryTile extends StatelessWidget {
           Column(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              Text(
-                Currency.peso(payment.amount),
+              CurrencyText(
+                amount: payment.amount,
                 style: const TextStyle(
                   fontWeight: FontWeight.bold,
                   fontSize: 15,

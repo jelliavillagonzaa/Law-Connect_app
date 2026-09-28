@@ -8,7 +8,10 @@
     "test": "test"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "delete:court_email_queue:node": "node ./scripts/delete_court_email_queue.js --key ./serviceAccount.json --collection court_email_queue",
+    "delete:imap_notifications": "node ./scripts/delete_imap_notifications.js --key ./serviceAccount.json",
+    "delete:imap_notifications:dry-run": "node ./scripts/delete_imap_notifications.js --key ./serviceAccount.json --dry-run"
   },
   "repository": {
     "type": "git",
@@ -26,6 +29,7 @@
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
+    "firebase-admin": "^14.3.0",
     "twilio": "^5.10.6"
   }
 }

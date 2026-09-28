@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart' show debugPrint;
 import '../../services/case_service.dart';
 import '../../services/case_request_service.dart';
+import '../../services/client_directory_service.dart';
 import '../../models/case_model.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/case_status_filter.dart';
+import '../../widgets/common/dropdown_helpers.dart';
 
 class AttorneyCreateCaseScreen extends StatefulWidget {
   final String? clientId; // Pre-selected client (from request)
@@ -27,19 +29,16 @@ class _AttorneyCreateCaseScreenState extends State<AttorneyCreateCaseScreen> {
   final _formKey = GlobalKey<FormState>();
   final _titleController = TextEditingController();
   final _descriptionController = TextEditingController();
+  final _opposingPartyController = TextEditingController();
   final CaseService _caseService = CaseService();
   final CaseRequestService _requestService = CaseRequestService();
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final ClientDirectoryService _clientDirectory = ClientDirectoryService();
 
   String? _selectedClientId;
   String? _selectedCategory;
-  String _selectedStatus = 'pending';
-  String? _selectedStaffId;
-  DateTime? _selectedHearingDate;
   bool _isLoading = false;
   bool _isLoadingClients = false;
   List<Map<String, dynamic>> _clients = [];
-  List<Map<String, dynamic>> _staffMembers = [];
 
   final List<String> _categories = [
     'Criminal',
@@ -51,56 +50,12 @@ class _AttorneyCreateCaseScreenState extends State<AttorneyCreateCaseScreen> {
     'Personal Injury',
     'Immigration',
     'Intellectual Property',
-    'Other',
-  ];
-
-  final List<String> _statusOptions = [
-    'pending',
-    'under_review',
-    'in_progress',
-    'open',
-    'ongoing',
   ];
 
   @override
   void initState() {
     super.initState();
     _loadClients();
-    _loadStaffMembers();
-    // Don't set _selectedClientId here - wait until clients are loaded
-    // This prevents DropdownButton assertion errors
-  }
-
-  Future<void> _loadStaffMembers() async {
-    try {
-      final user = FirebaseAuth.instance.currentUser;
-      if (user == null) return;
-
-      // Get staff assigned to this attorney
-      final staffSnapshot = await _firestore
-          .collection('users')
-          .where('role', isEqualTo: 'staff')
-          .where('assignedAttorneyId', isEqualTo: user.uid)
-          .get();
-
-      final staffList = <Map<String, dynamic>>[];
-      for (var doc in staffSnapshot.docs) {
-        final data = doc.data();
-        staffList.add({
-          'id': doc.id,
-          'name': data['fullName'] ?? data['name'] ?? 'Unknown',
-          'email': data['email'] ?? '',
-        });
-      }
-
-      if (mounted) {
-        setState(() {
-          _staffMembers = staffList;
-        });
-      }
-    } catch (e) {
-      // Handle error
-    }
   }
 
   Future<void> _loadClients() async {
@@ -110,142 +65,18 @@ class _AttorneyCreateCaseScreenState extends State<AttorneyCreateCaseScreen> {
 
       setState(() => _isLoadingClients = true);
 
-      final clientIds = <String>{};
-      final clientsMap = <String, Map<String, dynamic>>{};
-
-      // 1. Get clients from existing cases (same as appointment calendar)
-      try {
-        final casesSnapshot = await _firestore
-            .collection('cases')
-            .where('attorneyId', isEqualTo: user.uid)
-            .get();
-
-        for (var caseDoc in casesSnapshot.docs) {
-          final caseData = caseDoc.data();
-          final clientId = caseData['clientId'] as String?;
-          if (clientId != null &&
-              clientId.trim().isNotEmpty &&
-              !clientIds.contains(clientId)) {
-            clientIds.add(clientId);
-          }
-        }
-      } catch (e) {
-        if (mounted) {
-          debugPrint('Error loading clients from cases: $e');
-        }
-      }
-
-      // 2. Get clients from appointments (same as appointment calendar)
-      try {
-        final appointmentsSnapshot = await _firestore
-            .collection('appointments')
-            .where('attorneyId', isEqualTo: user.uid)
-            .get();
-
-        for (var aptDoc in appointmentsSnapshot.docs) {
-          final aptData = aptDoc.data();
-          final clientId = aptData['clientId'] as String?;
-          if (clientId != null && !clientIds.contains(clientId)) {
-            clientIds.add(clientId);
-          }
-        }
-      } catch (e) {
-        if (mounted) {
-          debugPrint('Error loading clients from appointments: $e');
-        }
-      }
-
-      // 3. Get clients from case requests (if attorneyId matches or is null)
-      try {
-        final requestsSnapshot = await _firestore
-            .collection('case_requests')
-            .get();
-
-        for (var requestDoc in requestsSnapshot.docs) {
-          final requestData = requestDoc.data();
-          final requestAttorneyId = requestData['attorneyId'] as String?;
-          final clientId = requestData['clientId'] as String?;
-          
-          // Include if request is for this attorney or general (no attorneyId)
-          if (clientId != null &&
-              clientId.trim().isNotEmpty &&
-              (requestAttorneyId == null || requestAttorneyId == user.uid) &&
-              !clientIds.contains(clientId)) {
-            clientIds.add(clientId);
-          }
-        }
-      } catch (e) {
-        if (mounted) {
-          debugPrint('Error loading clients from requests: $e');
-        }
-      }
-
-      // 4. If a clientId was pre-selected from widget (e.g., from case request),
-      // ensure it's included even if not found in cases/appointments/requests
-      if (widget.clientId != null &&
-          widget.clientId!.trim().isNotEmpty &&
-          !clientIds.contains(widget.clientId)) {
-        clientIds.add(widget.clientId!);
-      }
-
-      // 4. Get client details from users collection (same as appointment calendar)
-      for (var clientId in clientIds) {
-        if (clientId.trim().isEmpty) continue;
-        try {
-          final clientDoc = await _firestore.collection('users').doc(clientId).get();
-          if (clientDoc.exists) {
-            final clientData = clientDoc.data()!;
-            final name = clientData['name'] as String? ?? '';
-            final fullName = clientData['fullName'] as String? ?? '';
-            final email = clientData['email'] as String? ?? '';
-            final isVerified = clientData['isVerified'] as bool? ?? false;
-
-            // Build display name: prefer fullName, especially for verified clients
-            String displayName;
-            if (fullName.isNotEmpty && fullName.trim().isNotEmpty) {
-              displayName = fullName.trim();
-            } else if (name.isNotEmpty && name.trim().isNotEmpty) {
-              displayName = name.trim();
-            } else if (email.isNotEmpty) {
-              displayName = email;
-            } else {
-              displayName = 'Client';
-            }
-
-            // Store all information (same structure as appointment calendar)
-            clientsMap[clientId] = {
-              'id': clientId,
-              'name': name,
-              'fullName': fullName,
-              'displayName': displayName,
-              'email': email,
-              'isVerified': isVerified,
-            };
-          }
-        } catch (e) {
-          if (mounted) {
-            debugPrint('Error loading client $clientId: $e');
-          }
-        }
-      }
-
-      // Sort clients by display name (same as appointment calendar)
-      final clientsList = clientsMap.values.toList();
-      clientsList.sort((a, b) {
-        final nameA = (a['displayName'] as String? ?? '').toLowerCase();
-        final nameB = (b['displayName'] as String? ?? '').toLowerCase();
-        return nameA.compareTo(nameB);
-      });
+      final clientsList = await _clientDirectory.loadSignedUpClients(
+        ensureClientId: widget.clientId,
+      );
 
       if (mounted) {
         setState(() {
           _clients = clientsList;
           _isLoadingClients = false;
-          
-          // Now that clients are loaded, set the selected client if provided
-          // Only set it if the client ID exists in the loaded clients
+
           if (widget.clientId != null && _selectedClientId == null) {
-            final clientExists = clientsList.any((client) => client['id'] == widget.clientId);
+            final clientExists =
+                clientsList.any((client) => client['id'] == widget.clientId);
             if (clientExists) {
               _selectedClientId = widget.clientId;
             }
@@ -275,9 +106,9 @@ class _AttorneyCreateCaseScreenState extends State<AttorneyCreateCaseScreen> {
       return;
     }
 
-    if (_selectedCategory == null) {
+    if (_selectedCategory == null || _selectedCategory!.trim().isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please select a case category')),
+        const SnackBar(content: Text('Please select or enter a case category')),
       );
       return;
     }
@@ -294,43 +125,29 @@ class _AttorneyCreateCaseScreenState extends State<AttorneyCreateCaseScreen> {
         return;
       }
 
-      // Build progress map with hearing date if selected
-      Map<String, dynamic>? progressMap;
-      if (_selectedHearingDate != null) {
-        progressMap = {
-          'hearingDate': _selectedHearingDate,
-          'timeline': [
-            {
-              'date': DateTime.now().toIso8601String(),
-              'action': 'Case created by attorney',
-              'actor': user.uid,
-            }
-          ],
-        };
-      } else {
-        progressMap = {
-          'timeline': [
-            {
-              'date': DateTime.now().toIso8601String(),
-              'action': 'Case created by attorney',
-              'actor': user.uid,
-            }
-          ],
-        };
-      }
+      final progressMap = {
+        'timeline': [
+          {
+            'date': DateTime.now().toIso8601String(),
+        'action': 'Case opened',
+            'actor': user.uid,
+          }
+        ],
+      };
 
       final caseModel = CaseModel(
         id: '',
         clientId: _selectedClientId!,
         attorneyId: user.uid,
         caseTitle: _titleController.text.trim(),
-        caseType: _selectedCategory!,
+        caseType: _selectedCategory!.trim(),
         caseDescription: _descriptionController.text.trim(),
-        status: _selectedStatus,
+        status: CaseStatusFilter.openStoredStatus,
         createdAt: DateTime.now(),
         updatedAt: DateTime.now(),
-        staffId: _selectedStaffId,
-        hearingDate: _selectedHearingDate,
+        opposingParty: _opposingPartyController.text.trim().isEmpty
+            ? null
+            : _opposingPartyController.text.trim(),
         progress: progressMap,
       );
 
@@ -395,6 +212,50 @@ class _AttorneyCreateCaseScreenState extends State<AttorneyCreateCaseScreen> {
     }
   }
 
+  String _clientLabel(Map<String, dynamic> client) {
+    final displayName = client['displayName'] as String? ??
+        client['fullName'] as String? ??
+        client['name'] as String? ??
+        'Client';
+    final email = client['email'] as String? ?? '';
+    return email.isNotEmpty ? '$displayName ($email)' : displayName;
+  }
+
+  String _clientLabelById(String id) {
+    for (final client in _clients) {
+      if (client['id'] == id) return _clientLabel(client);
+    }
+    return widget.clientName ?? id;
+  }
+
+  Widget _sectionHeader(String text) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Text(
+        text,
+        style: const TextStyle(
+          fontSize: 12,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 1.2,
+          color: AppTheme.royalBlue,
+        ),
+      ),
+    );
+  }
+
+  Widget _fieldLabel(String text) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Text(
+        text,
+        style: const TextStyle(
+          fontSize: 16,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -410,88 +271,125 @@ class _AttorneyCreateCaseScreenState extends State<AttorneyCreateCaseScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // Client Selection
               const Text(
-                'Client *',
+                'Add a new case to your law firm records',
                 style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
+                  fontSize: 14,
+                  color: AppTheme.mutedText,
                 ),
               ),
-              const SizedBox(height: 8),
-              DropdownButtonFormField<String>(
-                // Only set value if it exists in the items list to avoid assertion errors
-                value: _isLoadingClients || _clients.isEmpty
-                    ? null
-                    : (_selectedClientId != null &&
-                            _clients.any((client) => client['id'] == _selectedClientId)
-                        ? _selectedClientId
-                        : null),
-                decoration: const InputDecoration(
-                  border: OutlineInputBorder(),
-                  hintText: 'Select a client',
-                ),
-                items: _isLoadingClients
-                    ? [
-                        const DropdownMenuItem<String>(
-                          value: null,
-                          child: Text('Loading clients...'),
-                          enabled: false,
-                        ),
-                      ]
-                    : _clients.isEmpty
-                        ? [
-                            const DropdownMenuItem<String>(
-                              value: null,
-                              child: Text('No clients found'),
-                              enabled: false,
-                            ),
-                          ]
-                        : _clients.map((client) {
-                            final displayName = client['displayName'] as String? ??
-                                client['fullName'] as String? ??
-                                client['name'] as String? ??
-                                'Client';
-                            final email = client['email'] as String? ?? '';
-                            return DropdownMenuItem<String>(
-                              value: client['id'] as String,
-                              child: Text(
-                                email.isNotEmpty
-                                    ? '$displayName ($email)'
-                                    : displayName,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            );
-                          }).toList(),
-                onChanged: (value) {
-                  setState(() {
-                    _selectedClientId = value;
-                  });
-                },
-                validator: (value) {
-                  if (value == null) {
-                    return 'Please select a client';
-                  }
-                  return null;
-                },
-              ),
-
               const SizedBox(height: 24),
-
-              // Case Title
-              const Text(
-                'Case Title *',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                ),
+              _sectionHeader('CLIENT'),
+              _fieldLabel('Select Client *'),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  return Autocomplete<String>(
+                    key: ValueKey(
+                      'client-${_clients.length}-$_selectedClientId-$_isLoadingClients',
+                    ),
+                    initialValue: _selectedClientId == null
+                        ? null
+                        : TextEditingValue(
+                            text: _clientLabelById(_selectedClientId!),
+                          ),
+                    displayStringForOption: _clientLabelById,
+                    optionsBuilder: (textEditingValue) {
+                      if (_isLoadingClients) {
+                        return const Iterable<String>.empty();
+                      }
+                      final query = textEditingValue.text.trim().toLowerCase();
+                      final matches = query.isEmpty
+                          ? _clients
+                          : _clients.where(
+                              (client) => _clientLabel(client)
+                                  .toLowerCase()
+                                  .contains(query),
+                            );
+                      return matches.map((client) => client['id'] as String);
+                    },
+                    onSelected: (id) {
+                      setState(() => _selectedClientId = id);
+                    },
+                    fieldViewBuilder: (
+                      context,
+                      textEditingController,
+                      focusNode,
+                      onFieldSubmitted,
+                    ) {
+                      return TextFormField(
+                        controller: textEditingController,
+                        focusNode: focusNode,
+                        enabled: !_isLoadingClients,
+                        decoration: InputDecoration(
+                          border: const OutlineInputBorder(),
+                          hintText: _isLoadingClients
+                              ? 'Loading clients...'
+                              : 'Search or select a client',
+                          prefixIcon: const Icon(Icons.search, size: 20),
+                          suffixIcon: const Icon(Icons.arrow_drop_down),
+                        ),
+                        onChanged: (value) {
+                          final typed = value.trim().toLowerCase();
+                          String? matchId;
+                          for (final client in _clients) {
+                            if (_clientLabel(client).toLowerCase() == typed) {
+                              matchId = client['id'] as String;
+                              break;
+                            }
+                          }
+                          _selectedClientId = matchId;
+                        },
+                        onFieldSubmitted: (_) => onFieldSubmitted(),
+                        validator: (_) {
+                          if (_selectedClientId == null) {
+                            return 'Please select a client';
+                          }
+                          return null;
+                        },
+                      );
+                    },
+                    optionsViewBuilder: (context, onSelected, options) {
+                      return Align(
+                        alignment: Alignment.topLeft,
+                        child: Material(
+                          elevation: 4,
+                          child: SizedBox(
+                            width: constraints.maxWidth,
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(maxHeight: 240),
+                              child: options.isEmpty
+                                  ? const ListTile(
+                                      title: Text('No matching clients'),
+                                    )
+                                  : ListView.builder(
+                                      padding: EdgeInsets.zero,
+                                      shrinkWrap: true,
+                                      itemCount: options.length,
+                                      itemBuilder: (context, index) {
+                                        final id = options.elementAt(index);
+                                        return ListTile(
+                                          title: dropdownEllipsisText(
+                                            _clientLabelById(id),
+                                          ),
+                                          onTap: () => onSelected(id),
+                                        );
+                                      },
+                                    ),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  );
+                },
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 28),
+              _sectionHeader('CASE INFORMATION'),
+              _fieldLabel('Case Title *'),
               TextFormField(
                 controller: _titleController,
                 decoration: const InputDecoration(
                   border: OutlineInputBorder(),
-                  hintText: 'e.g., Contract Dispute - ABC Company',
                 ),
                 validator: (value) {
                   if (value == null || value.trim().isEmpty) {
@@ -500,59 +398,101 @@ class _AttorneyCreateCaseScreenState extends State<AttorneyCreateCaseScreen> {
                   return null;
                 },
               ),
-
-              const SizedBox(height: 24),
-
-              // Case Category
-              const Text(
-                'Case Category *',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                ),
+              const SizedBox(height: 20),
+              _fieldLabel('Case Category *'),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  return Autocomplete<String>(
+                    optionsBuilder: (textEditingValue) {
+                      final query = textEditingValue.text.trim().toLowerCase();
+                      if (query.isEmpty) return _categories;
+                      return _categories.where(
+                        (category) => category.toLowerCase().contains(query),
+                      );
+                    },
+                    onSelected: (value) {
+                      setState(() {
+                        _selectedCategory = value;
+                      });
+                    },
+                    fieldViewBuilder: (
+                      context,
+                      textEditingController,
+                      focusNode,
+                      onFieldSubmitted,
+                    ) {
+                      return TextFormField(
+                        controller: textEditingController,
+                        focusNode: focusNode,
+                        decoration: const InputDecoration(
+                          border: OutlineInputBorder(),
+                          hintText: 'Select or type a category',
+                          suffixIcon: Icon(Icons.arrow_drop_down),
+                        ),
+                        onChanged: (value) {
+                          final trimmed = value.trim();
+                          _selectedCategory = trimmed.isEmpty ? null : trimmed;
+                        },
+                        onFieldSubmitted: (value) {
+                          final trimmed = value.trim();
+                          setState(() {
+                            _selectedCategory =
+                                trimmed.isEmpty ? null : trimmed;
+                          });
+                          onFieldSubmitted();
+                        },
+                        validator: (value) {
+                          if (value == null || value.trim().isEmpty) {
+                            return 'Please select or enter a category';
+                          }
+                          return null;
+                        },
+                      );
+                    },
+                    optionsViewBuilder: (context, onSelected, options) {
+                      return Align(
+                        alignment: Alignment.topLeft,
+                        child: Material(
+                          elevation: 4,
+                          child: SizedBox(
+                            width: constraints.maxWidth,
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(maxHeight: 240),
+                              child: ListView.builder(
+                                padding: EdgeInsets.zero,
+                                shrinkWrap: true,
+                                itemCount: options.length,
+                                itemBuilder: (context, index) {
+                                  final option = options.elementAt(index);
+                                  return ListTile(
+                                    title: dropdownEllipsisText(option),
+                                    onTap: () => onSelected(option),
+                                  );
+                                },
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  );
+                },
               ),
-              const SizedBox(height: 8),
-              DropdownButtonFormField<String>(
-                value: _selectedCategory,
+              const SizedBox(height: 20),
+              _fieldLabel('Opposing Party'),
+              TextFormField(
+                controller: _opposingPartyController,
                 decoration: const InputDecoration(
                   border: OutlineInputBorder(),
-                  hintText: 'Select category',
-                ),
-                items: _categories.map((category) {
-                  return DropdownMenuItem<String>(
-                    value: category,
-                    child: Text(category),
-                  );
-                }).toList(),
-                onChanged: (value) {
-                  setState(() {
-                    _selectedCategory = value;
-                  });
-                },
-                validator: (value) {
-                  if (value == null) {
-                    return 'Please select a category';
-                  }
-                  return null;
-                },
-              ),
-
-              const SizedBox(height: 24),
-
-              // Case Description
-              const Text(
-                'Case Description *',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
                 ),
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 20),
+              _fieldLabel('Case Description *'),
               TextFormField(
                 controller: _descriptionController,
                 decoration: const InputDecoration(
                   border: OutlineInputBorder(),
-                  hintText: 'Describe the case in detail...',
+                  hintText: 'Describe the case and client\'s legal concern...',
                 ),
                 maxLines: 6,
                 validator: (value) {
@@ -565,118 +505,7 @@ class _AttorneyCreateCaseScreenState extends State<AttorneyCreateCaseScreen> {
                   return null;
                 },
               ),
-
-              const SizedBox(height: 24),
-
-              // Staff Assignment (Optional)
-              if (_staffMembers.isNotEmpty) ...[
-                const Text(
-                  'Assign Staff (Optional)',
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                DropdownButtonFormField<String>(
-                  value: _selectedStaffId,
-                  decoration: const InputDecoration(
-                    border: OutlineInputBorder(),
-                    hintText: 'Select staff member',
-                  ),
-                  items: [
-                    const DropdownMenuItem<String>(
-                      value: null,
-                      child: Text('None'),
-                    ),
-                    ..._staffMembers.map((staff) {
-                      return DropdownMenuItem<String>(
-                        value: staff['id'] as String,
-                        child: Text('${staff['name']} (${staff['email']})'),
-                      );
-                    }).toList(),
-                  ],
-                  onChanged: (value) {
-                    setState(() {
-                      _selectedStaffId = value;
-                    });
-                  },
-                ),
-                const SizedBox(height: 24),
-              ],
-
-              // Hearing Date (Optional)
-              const Text(
-                'First Hearing Date (Optional)',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              const SizedBox(height: 8),
-              InkWell(
-                onTap: () async {
-                  final picked = await showDatePicker(
-                    context: context,
-                    initialDate: _selectedHearingDate ?? DateTime.now(),
-                    firstDate: DateTime.now(),
-                    lastDate: DateTime.now().add(const Duration(days: 365 * 2)),
-                  );
-                  if (picked != null) {
-                    setState(() {
-                      _selectedHearingDate = picked;
-                    });
-                  }
-                },
-                child: InputDecorator(
-                  decoration: const InputDecoration(
-                    border: OutlineInputBorder(),
-                    suffixIcon: Icon(Icons.calendar_today),
-                  ),
-                  child: Text(
-                    _selectedHearingDate != null
-                        ? '${_selectedHearingDate!.day}/${_selectedHearingDate!.month}/${_selectedHearingDate!.year}'
-                        : 'Select date',
-                    style: TextStyle(
-                      color: _selectedHearingDate != null
-                          ? Colors.black87
-                          : Colors.grey[600],
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 24),
-
-              // Initial Status
-              const Text(
-                'Initial Status *',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              const SizedBox(height: 8),
-              DropdownButtonFormField<String>(
-                value: _selectedStatus,
-                decoration: const InputDecoration(
-                  border: OutlineInputBorder(),
-                ),
-                items: _statusOptions.map((status) {
-                  return DropdownMenuItem<String>(
-                    value: status,
-                    child: Text(status.replaceAll('_', ' ').toUpperCase()),
-                  );
-                }).toList(),
-                onChanged: (value) {
-                  setState(() {
-                    _selectedStatus = value ?? 'pending';
-                  });
-                },
-              ),
-
               const SizedBox(height: 32),
-
-              // Submit Button
               ElevatedButton(
                 onPressed: _isLoading ? null : _submitCase,
                 style: ElevatedButton.styleFrom(
@@ -693,7 +522,8 @@ class _AttorneyCreateCaseScreenState extends State<AttorneyCreateCaseScreen> {
                         width: 20,
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
-                          valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                          valueColor:
+                              AlwaysStoppedAnimation<Color>(Colors.white),
                         ),
                       )
                     : const Text(
@@ -715,6 +545,7 @@ class _AttorneyCreateCaseScreenState extends State<AttorneyCreateCaseScreen> {
   void dispose() {
     _titleController.dispose();
     _descriptionController.dispose();
+    _opposingPartyController.dispose();
     super.dispose();
   }
 }

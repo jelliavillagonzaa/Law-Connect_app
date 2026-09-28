@@ -6,17 +6,16 @@ import 'fcm_service.dart';
 /// Email OTP Service using EmailJS
 ///
 /// Configuration:
-/// - Service ID: service_h595leh
-/// - Template ID: template_eae41pq
-/// - Public Key: (to be provided)
+/// - Service ID: service_55uzrrn
+/// - Template ID: template_h3geajd
+/// - Public Key: 5hqM06GrxyJLvL7fM
 class EmailOtpService {
   // EmailJS Configuration
-  static const String _serviceId = 'service_h595leh';
-  static const String _templateId = 'template_eae41pq';
+  static const String _serviceId = 'service_55uzrrn';
+  static const String _templateId = 'template_h3geajd';
 
   // EmailJS Public Key
-  // Format: "public_YOUR_KEY_HERE" (must start with "public_")
-  static const String _publicKey = 'public_tMoNNXN_4cNoa_j7w';
+  static const String _publicKey = '5hqM06GrxyJLvL7fM';
 
   static const String _emailjsApiUrl =
       'https://api.emailjs.com/api/v1.0/email/send';
@@ -39,9 +38,7 @@ class EmailOtpService {
   }) async {
     try {
       // Validate public key
-      if (_publicKey == 'YOUR_PUBLIC_KEY_HERE' ||
-          _publicKey.isEmpty ||
-          !_publicKey.startsWith('public_')) {
+      if (_publicKey == 'YOUR_PUBLIC_KEY_HERE' || _publicKey.isEmpty) {
         if (kDebugMode) {
           debugPrint('❌ EMAIL OTP SERVICE: Invalid Public Key!');
           debugPrint('❌ Current key: $_publicKey');
@@ -51,7 +48,6 @@ class EmailOtpService {
           debugPrint(
             '❌ Get your Public Key from: https://dashboard.emailjs.com/admin/account',
           );
-          debugPrint('❌ Format: "public_YOUR_KEY_HERE"');
         }
         return false;
       }

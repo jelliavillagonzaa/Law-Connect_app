@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../../models/system_log_model.dart';
 import '../../services/admin_service.dart';
+import '../../widgets/admin/admin_page_header.dart';
+import '../../widgets/admin/admin_ui_theme.dart';
 
 enum DateFilterType { oneWeek, oneMonth, oneYear, custom }
 
@@ -112,8 +114,9 @@ class _SystemLogsScreenState extends State<SystemLogsScreen> {
         endDate: endDate,
       ),
       builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Center(child: CircularProgressIndicator());
+        if (snapshot.connectionState == ConnectionState.waiting &&
+            !snapshot.hasData) {
+          return const SizedBox.shrink();
         }
 
         if (snapshot.hasError) {
@@ -368,121 +371,97 @@ class _SystemLogsScreenState extends State<SystemLogsScreen> {
     final body = _buildBody();
 
     if (widget.inline) {
-      return Column(
-        children: [
-          // Custom header bar for inline mode
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.05),
-                  blurRadius: 8,
-                  offset: const Offset(0, 2),
-                ),
-              ],
-            ),
-            child: Column(
-              children: [
-                Row(
-                  children: [
-                    const Text(
-                      'System Logs',
-                      style: TextStyle(
-                        fontSize: 22,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.black87,
+      return ColoredBox(
+        color: AdminUi.background,
+        child: Column(
+          children: [
+            AdminPageHeader(
+              title: 'System Logs',
+              actions: [
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: AdminUi.background,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: AdminUi.line),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(
+                        Icons.calendar_today,
+                        size: 16,
+                        color: AdminUi.muted,
                       ),
-                    ),
-                    const Spacer(),
-                    // Date display with better styling
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 6,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.grey[100],
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            Icons.calendar_today,
-                            size: 16,
-                            color: Colors.grey[700],
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            _getDateRangeText(),
-                            style: TextStyle(
-                              fontSize: 14,
-                              color: Colors.grey[700],
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    // Calendar button (only show for custom filter)
-                    if (_selectedFilter == DateFilterType.custom)
-                      Material(
-                        color: Colors.transparent,
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(8),
-                          onTap: _pickDate,
-                          child: Container(
-                            padding: const EdgeInsets.all(8),
-                            child: Icon(
-                              Icons.calendar_today_outlined,
-                              color: Colors.grey[700],
-                              size: 20,
-                            ),
-                          ),
+                      const SizedBox(width: 8),
+                      Text(
+                        _getDateRangeText(),
+                        style: const TextStyle(
+                          fontSize: 14,
+                          color: AdminUi.muted,
+                          fontWeight: FontWeight.w600,
                         ),
                       ),
-                    const SizedBox(width: 4),
-                    // Expand button (only show for custom filter)
-                    if (_selectedFilter == DateFilterType.custom)
-                      Material(
-                        color: Colors.transparent,
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(8),
-                          onTap: () {
-                            setState(() {
-                              _showDatesList = !_showDatesList;
-                            });
-                            if (_showDatesList && _datesWithLogs.isEmpty) {
-                              _loadDatesWithLogs();
-                            }
-                          },
-                          child: Container(
-                            padding: const EdgeInsets.all(8),
-                            child: Icon(
-                              _showDatesList
-                                  ? Icons.expand_less
-                                  : Icons.expand_more,
-                              color: Colors.grey[700],
-                              size: 20,
-                            ),
-                          ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                if (_selectedFilter == DateFilterType.custom)
+                  Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(8),
+                      onTap: _pickDate,
+                      child: const Padding(
+                        padding: EdgeInsets.all(8),
+                        child: Icon(
+                          Icons.calendar_today_outlined,
+                          color: AdminUi.muted,
+                          size: 20,
                         ),
                       ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                // Filter buttons
-                _buildFilterButtons(),
-                if (_showDatesList && _selectedFilter == DateFilterType.custom)
-                  _buildDatesList(),
+                    ),
+                  ),
+                if (_selectedFilter == DateFilterType.custom)
+                  Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(8),
+                      onTap: () {
+                        setState(() {
+                          _showDatesList = !_showDatesList;
+                        });
+                        if (_showDatesList && _datesWithLogs.isEmpty) {
+                          _loadDatesWithLogs();
+                        }
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.all(8),
+                        child: Icon(
+                          _showDatesList
+                              ? Icons.expand_less
+                              : Icons.expand_more,
+                          color: AdminUi.muted,
+                          size: 20,
+                        ),
+                      ),
+                    ),
+                  ),
               ],
+              bottom: Column(
+                children: [
+                  _buildFilterButtons(),
+                  if (_showDatesList && _selectedFilter == DateFilterType.custom)
+                    _buildDatesList(),
+                ],
+              ),
             ),
-          ),
-          Expanded(child: body),
-        ],
+            Expanded(child: body),
+          ],
+        ),
       );
     }
 
@@ -791,17 +770,17 @@ class _SystemLogsScreenState extends State<SystemLogsScreen> {
           });
         }
       },
-      selectedColor: Colors.blue,
+      selectedColor: AdminUi.primary,
       checkmarkColor: Colors.white,
       labelStyle: TextStyle(
-        color: isSelected ? Colors.white : Colors.grey[700],
-        fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+        color: isSelected ? Colors.white : AdminUi.muted,
+        fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
       ),
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(20),
         side: BorderSide(
-          color: isSelected ? Colors.blue : Colors.grey[300]!,
+          color: isSelected ? AdminUi.primary : AdminUi.line,
           width: isSelected ? 2 : 1,
         ),
       ),

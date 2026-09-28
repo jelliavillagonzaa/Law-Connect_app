@@ -1,13 +1,16 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import '../models/case_model.dart';
+import '../utils/case_status_filter.dart';
 import 'fcm_service.dart';
 import 'notification_service.dart';
+import 'sms_service.dart';
 
 class CaseService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FCMService _fcmService = FCMService();
   final NotificationService _notificationService = NotificationService();
+  final SmsService _smsService = SmsService();
 
   // Create a new case
   // Returns caseId if successful, null if failed
@@ -139,6 +142,10 @@ class CaseService {
         body: 'A new case "$caseTitle" has been created.',
         payload: caseId,
       );
+      await _sendCaseSmsToClient(
+        clientId: clientId,
+        body: 'Law Connect: New case "$caseTitle" is now open.',
+      );
     } catch (e) {
       if (kDebugMode) {
         debugPrint('⚠️ Failed to send case created notification: $e');
@@ -170,6 +177,7 @@ class CaseService {
       return queryStream.map((snapshot) {
         final cases = snapshot.docs
             .map((doc) => CaseModel.fromFirestore(doc))
+            .where((c) => role != 'client' || CaseStatusFilter.visibleToClient(c))
             .toList();
         // Sort by updatedAt in memory to avoid index requirement
         cases.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
@@ -279,7 +287,7 @@ class CaseService {
       final clientId = caseData['clientId'] as String?;
       final title = caseTitle ?? caseData['caseTitle'] as String? ?? 'Case';
       
-      if (clientId != null) {
+      if (clientId != null && !CaseStatusFilter.isDraft(caseData['status'] as String?)) {
         await _sendCaseUpdateNotification(clientId, caseId, title, 'Case details have been updated');
       }
     } catch (e) {
@@ -299,14 +307,29 @@ class CaseService {
       final clientId = caseData['clientId'] as String?;
       final caseTitle = caseData['caseTitle'] as String? ?? 'Case';
 
+      final previousStatus = caseData['status'] as String? ?? '';
+
       await _firestore.collection('cases').doc(caseId).update({
         'status': status,
         'updatedAt': FieldValue.serverTimestamp(),
       });
 
-      // Send notification to client about status update
       if (clientId != null) {
-        await _sendCaseUpdateNotification(clientId, caseId, caseTitle, 'Status updated to: $status');
+        if (CaseStatusFilter.isDraft(status)) {
+          // Internal draft — no client notify
+        } else if (CaseStatusFilter.isDraft(previousStatus)) {
+          await _sendCaseCreatedNotification(clientId, caseTitle, caseId);
+        } else {
+          final label = CaseStatusFilter.statusLabel(status);
+          await _sendCaseUpdateNotification(
+            clientId,
+            caseId,
+            caseTitle,
+            'Status updated to: $label',
+            sendSms: true,
+            smsBody: _statusSmsBody(caseTitle, status),
+          );
+        }
       }
     } catch (e) {
       throw Exception('Failed to update case status: $e');
@@ -323,13 +346,35 @@ class CaseService {
       final caseDoc = await caseRef.get();
       
       if (caseDoc.exists) {
-        final currentProgress = caseDoc.data()?['progress'] as Map? ?? {};
+        final caseData = caseDoc.data()!;
+        final currentProgress =
+            Map<String, dynamic>.from(caseData['progress'] as Map? ?? {});
+        final hadHearing = currentProgress['hearingDate'] != null ||
+            caseData['hearingDate'] != null;
         currentProgress.addAll(progressUpdate);
-        
+
         await caseRef.update({
           'progress': currentProgress,
           'updatedAt': FieldValue.serverTimestamp(),
         });
+
+        final clientId = caseData['clientId'] as String?;
+        final caseTitle = caseData['caseTitle'] as String? ?? 'Case';
+        final status = caseData['status'] as String?;
+        final newHearing = progressUpdate['hearingDate'];
+        if (clientId != null &&
+            newHearing != null &&
+            !hadHearing &&
+            !CaseStatusFilter.isDraft(status)) {
+          await _sendCaseUpdateNotification(
+            clientId,
+            caseId,
+            caseTitle,
+            'Hearing scheduled',
+            sendSms: true,
+            smsBody: 'Law Connect: Hearing for "$caseTitle" was scheduled.',
+          );
+        }
       }
     } catch (e) {
       throw Exception('Failed to update case progress: $e');
@@ -358,8 +403,13 @@ class CaseService {
         });
 
         // Send notification to client about new document
-        if (clientId != null) {
-          await _sendCaseUpdateNotification(clientId, caseId, caseTitle, 'New document uploaded');
+        if (clientId != null && !CaseStatusFilter.isDraft(caseData['status'] as String?)) {
+          await _sendCaseUpdateNotification(
+            clientId,
+            caseId,
+            caseTitle,
+            'New document uploaded',
+          );
         }
       }
     } catch (e) {
@@ -372,8 +422,10 @@ class CaseService {
     String clientId,
     String caseId,
     String caseTitle,
-    String updateMessage,
-  ) async {
+    String updateMessage, {
+    bool sendSms = false,
+    String? smsBody,
+  }) async {
     try {
       // Send FCM notification
       await _fcmService.sendNotificationToUser(
@@ -400,10 +452,53 @@ class CaseService {
         'isRead': false,
         'createdAt': FieldValue.serverTimestamp(),
       });
+
+      if (sendSms && smsBody != null && smsBody.isNotEmpty) {
+        await _sendCaseSmsToClient(clientId: clientId, body: smsBody);
+      }
     } catch (e) {
       if (kDebugMode) {
         debugPrint('⚠️ Failed to send case update notification: $e');
       }
+    }
+  }
+
+  Future<void> _sendCaseSmsToClient({
+    required String clientId,
+    required String body,
+  }) async {
+    try {
+      final userDoc = await _firestore.collection('users').doc(clientId).get();
+      final data = userDoc.data();
+      if (data == null) return;
+      final phone =
+          (data['phone'] ?? data['phoneNumber'])?.toString().trim() ?? '';
+      if (phone.isEmpty) return;
+      await _smsService.queueSms(
+        to: phone,
+        body: body,
+        userId: clientId,
+        meta: const {'type': 'case_update'},
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('⚠️ Case SMS skipped: $e');
+      }
+    }
+  }
+
+  String? _statusSmsBody(String caseTitle, String status) {
+    switch (status.toLowerCase().trim()) {
+      case 'pending':
+        return 'Law Connect: New case "$caseTitle" is now open.';
+      case 'accepted':
+        return 'Law Connect: "$caseTitle" was accepted.';
+      case 'in_progress':
+        return 'Law Connect: "$caseTitle" is now in progress.';
+      case 'completed':
+        return 'Law Connect: "$caseTitle" is completed.';
+      default:
+        return null;
     }
   }
 

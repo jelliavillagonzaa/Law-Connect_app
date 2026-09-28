@@ -19,13 +19,21 @@ class CaseRequestsWidget extends StatelessWidget {
   Widget build(BuildContext context) {
     final requestService = CaseRequestService();
 
+    final compact = !isMobile;
+
     return SingleChildScrollView(
       physics: const AlwaysScrollableScrollPhysics(
         parent: BouncingScrollPhysics(),
       ),
-      padding: const EdgeInsets.all(20),
-      child: Container(
-        padding: const EdgeInsets.all(20),
+      padding: EdgeInsets.all(compact ? 16 : 20),
+      child: Align(
+        alignment: Alignment.topLeft,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: compact ? 520 : double.infinity,
+          ),
+          child: Container(
+        padding: EdgeInsets.all(compact ? 16 : 20),
         decoration: BoxDecoration(
           color: const Color(0xFFF5F7FF),
           borderRadius: BorderRadius.circular(16),
@@ -112,7 +120,7 @@ class CaseRequestsWidget extends StatelessWidget {
 
                 if (requests.isEmpty && isWaiting) {
                   return Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 32),
+                    padding: EdgeInsets.symmetric(vertical: compact ? 16 : 32),
                     child: Center(
                       child: Text(
                         'No requests yet',
@@ -125,20 +133,25 @@ class CaseRequestsWidget extends StatelessWidget {
                 if (requests.isEmpty) {
                   return Center(
                     child: Padding(
-                      padding: const EdgeInsets.all(40),
+                      padding: EdgeInsets.all(compact ? 16 : 40),
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
+                        mainAxisSize: MainAxisSize.min,
                         children: [
-                          Icon(Icons.inbox, size: 64, color: Colors.grey[400]),
-                          const SizedBox(height: 16),
+                          Icon(
+                            Icons.inbox,
+                            size: compact ? 40 : 64,
+                            color: Colors.grey[400],
+                          ),
+                          SizedBox(height: compact ? 10 : 16),
                           Text(
                             'No pending requests',
                             style: TextStyle(
-                              fontSize: 16,
+                              fontSize: compact ? 14 : 16,
                               color: Colors.grey[600],
                             ),
                           ),
-                          const SizedBox(height: 8),
+                          const SizedBox(height: 6),
                           Text(
                             'Client requests will appear here',
                             style: TextStyle(
@@ -161,6 +174,8 @@ class CaseRequestsWidget extends StatelessWidget {
               },
             ),
           ],
+        ),
+          ),
         ),
       ),
     );

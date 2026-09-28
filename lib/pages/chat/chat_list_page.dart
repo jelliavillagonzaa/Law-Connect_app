@@ -5,7 +5,8 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../services/chat_service.dart';
 import '../../models/message_model.dart';
 import '../../theme/app_theme.dart';
-import 'chat_page.dart';
+import '../../screens/client/chat_screen.dart';
+import '../../widgets/common/nav_unread_dot.dart';
 
 class ChatListPage extends StatefulWidget {
   const ChatListPage({super.key});
@@ -115,8 +116,9 @@ class _ChatListPageState extends State<ChatListPage> {
       body: StreamBuilder<List<ChatModel>>(
         stream: chatService.getUserChats(user.uid),
         builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
+          if (snapshot.connectionState == ConnectionState.waiting &&
+              !snapshot.hasData) {
+            return const SizedBox.shrink();
           }
 
           if (snapshot.hasError) {
@@ -189,7 +191,11 @@ class _ChatListPageState extends State<ChatListPage> {
                     roleColor = AppTheme.royalBlue;
                   }
 
-                  return Card(
+                  return StreamBuilder<bool>(
+                    stream: chatService.watchChatHasUnread(chat.id, user.uid),
+                    builder: (context, unreadSnap) {
+                      final hasUnread = unreadSnap.data == true;
+                      return Card(
                     margin: const EdgeInsets.only(bottom: 12),
                     elevation: 2,
                     shape: RoundedRectangleBorder(
@@ -198,9 +204,10 @@ class _ChatListPageState extends State<ChatListPage> {
                     child: InkWell(
                       onTap: () {
                         Get.to(
-                          () => ChatPage(
-                            attorneyId: otherUserId,
-                            attorneyName: displayName,
+                          () => ChatScreen(
+                            conversationId: chat.id,
+                            otherUserId: otherUserId,
+                            otherUserName: displayName,
                           ),
                         );
                       },
@@ -235,7 +242,9 @@ class _ChatListPageState extends State<ChatListPage> {
                                           displayName,
                                           style: TextStyle(
                                             fontSize: 16,
-                                            fontWeight: FontWeight.bold,
+                                            fontWeight: hasUnread
+                                                ? FontWeight.bold
+                                                : FontWeight.w600,
                                             color: AppTheme.darkText,
                                           ),
                                           overflow: TextOverflow.ellipsis,
@@ -304,6 +313,7 @@ class _ChatListPageState extends State<ChatListPage> {
                             const SizedBox(width: 8),
                             Column(
                               crossAxisAlignment: CrossAxisAlignment.end,
+                              mainAxisAlignment: MainAxisAlignment.center,
                               children: [
                                 Text(
                                   '${chat.updatedAt.hour.toString().padLeft(2, '0')}:${chat.updatedAt.minute.toString().padLeft(2, '0')}',
@@ -312,12 +322,15 @@ class _ChatListPageState extends State<ChatListPage> {
                                     color: Colors.grey[600],
                                   ),
                                 ),
+                                if (hasUnread) const ListUnreadDot(),
                               ],
                             ),
                           ],
                         ),
                       ),
                     ),
+                  );
+                    },
                   );
                 },
               );

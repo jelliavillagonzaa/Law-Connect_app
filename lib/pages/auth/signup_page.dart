@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import '../../services/auth_service.dart';
+import '../../services/system_settings_service.dart';
 import '../../widgets/common/app_text_field.dart';
+import '../../widgets/common/misamis_occidental_address_picker.dart';
 import '../../theme/app_theme.dart';
 import 'otp_verification_signup.dart';
 
@@ -23,6 +25,7 @@ class _SignupPageState extends State<SignupPage> {
 
   final _formKey = GlobalKey<FormState>();
   final _confirmPasswordKey = GlobalKey<FormFieldState<String>>();
+  final _addressFieldKey = GlobalKey<FormFieldState<String>>();
 
   final _firstNameController = TextEditingController();
   final _middleNameController = TextEditingController();
@@ -31,9 +34,19 @@ class _SignupPageState extends State<SignupPage> {
   final _passwordController = TextEditingController();
   final _confirmPasswordController = TextEditingController();
   final _phoneNumberController = TextEditingController();
-  final _addressController = TextEditingController();
+
+  final _firstNameFocus = FocusNode();
+  final _middleNameFocus = FocusNode();
+  final _lastNameFocus = FocusNode();
+  final _emailFocus = FocusNode();
+  final _phoneFocus = FocusNode();
+  final _passwordFocus = FocusNode();
+  final _confirmPasswordFocus = FocusNode();
+
+  String _address = '';
 
   final AuthService _authService = AuthService();
+  AppSystemSettings _settings = AppSystemSettings.fallback;
   bool _isLoading = false;
   bool _obscurePassword = true;
   bool _obscureConfirmPassword = true;
@@ -48,6 +61,16 @@ class _SignupPageState extends State<SignupPage> {
   void initState() {
     super.initState();
     _passwordController.addListener(_onPasswordChanged);
+    SystemSettingsService.instance.load().then((settings) {
+      if (!mounted) return;
+      setState(() => _settings = settings);
+      _updatePasswordStrength(_passwordController.text);
+    });
+  }
+
+  void _submitSignupFromKeyboard() {
+    FocusManager.instance.primaryFocus?.unfocus();
+    _signup();
   }
 
   void _onPasswordChanged() {
@@ -60,7 +83,7 @@ class _SignupPageState extends State<SignupPage> {
 
   void _updatePasswordStrength(String value) {
     setState(() {
-      _hasMinLength = value.length >= 8;
+      _hasMinLength = value.length >= _settings.minPasswordLength;
       _hasUpperCase = value.contains(RegExp(r'[A-Z]'));
       _hasLowerCase = value.contains(RegExp(r'[a-z]'));
       _hasNumber = value.contains(RegExp(r'[0-9]'));
@@ -113,7 +136,7 @@ class _SignupPageState extends State<SignupPage> {
 
   String? _validateAddress(String? value) {
     if (value == null || value.trim().isEmpty) {
-      return 'Please enter your address';
+      return 'Please complete your address (purok, barangay, and city)';
     }
     final parts = value
         .split(',')
@@ -121,12 +144,7 @@ class _SignupPageState extends State<SignupPage> {
         .where((e) => e.isNotEmpty)
         .toList();
     if (parts.length < 5) {
-      return 'Use format: Street, Barangay, City, Province, Country';
-    }
-    for (final part in parts) {
-      if (part.length < 2) {
-        return 'Each address part must be at least 2 characters';
-      }
+      return 'Please select purok, barangay, city, province, and country';
     }
     return null;
   }
@@ -135,22 +153,7 @@ class _SignupPageState extends State<SignupPage> {
     if (value == null || value.isEmpty) {
       return 'Please enter your password';
     }
-    if (value.length < 8) {
-      return 'Password must be at least 8 characters';
-    }
-    if (!RegExp(r'[A-Z]').hasMatch(value)) {
-      return 'Password must contain at least one uppercase letter';
-    }
-    if (!RegExp(r'[a-z]').hasMatch(value)) {
-      return 'Password must contain at least one lowercase letter';
-    }
-    if (!RegExp(r'[0-9]').hasMatch(value)) {
-      return 'Password must contain at least one number';
-    }
-    if (!RegExp(r'[!@#$%^&*(),.?":{}|<>]').hasMatch(value)) {
-      return 'Password must contain at least one special character';
-    }
-    return null;
+    return _settings.validatePassword(value);
   }
 
   String? _validateConfirmPassword(String? value) {
@@ -170,10 +173,17 @@ class _SignupPageState extends State<SignupPage> {
       'We value your privacy and ensure that your data will only be used for '
       'authorized purposes within the system.';
 
+  String _policyNoticeText() {
+    final privacy =
+        _settings.privacy.isEmpty ? _privacyNoticeText : _settings.privacy;
+    if (_settings.terms.isEmpty) return privacy;
+    return '$privacy\n\nTerms & Conditions\n${_settings.terms}';
+  }
+
   Future<void> _showPrivacyNotice() async {
     if (!mounted) return;
 
-    showDialog<void>(
+    await showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) {
@@ -198,24 +208,22 @@ class _SignupPageState extends State<SignupPage> {
                 ),
               ],
             ),
-            content: const SingleChildScrollView(
+            content: SingleChildScrollView(
               child: Text(
-                _privacyNoticeText,
-                style: TextStyle(fontSize: 14, height: 1.45),
+                _policyNoticeText(),
+                style: const TextStyle(fontSize: 14, height: 1.45),
               ),
             ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(),
+                child: const Text('Continue'),
+              ),
+            ],
           ),
         );
       },
     );
-
-    await Future.delayed(const Duration(seconds: 10));
-
-    if (!mounted) return;
-    final navigator = Navigator.of(context, rootNavigator: true);
-    if (navigator.canPop()) {
-      navigator.pop();
-    }
   }
 
   Future<String?> _showOtpChannelPicker({
@@ -301,108 +309,6 @@ class _SignupPageState extends State<SignupPage> {
     return choice;
   }
 
-  Future<void> _showOtpSendingDialog(String channel) async {
-    if (!mounted) return;
-
-    final label = channel == 'sms' ? 'SMS' : 'Email';
-
-    showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) {
-        return PopScope(
-          canPop: false,
-          child: AlertDialog(
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(16),
-            ),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const CircularProgressIndicator(color: AppTheme.royalBlue),
-                const SizedBox(height: 20),
-                Text(
-                  'Sending OTP to your $label...',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                const Text(
-                  'Please wait.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 13, color: AppTheme.mutedText),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  void _closeRootDialogIfOpen() {
-    if (!mounted) return;
-    final navigator = Navigator.of(context, rootNavigator: true);
-    if (navigator.canPop()) {
-      navigator.pop();
-    }
-  }
-
-  Future<void> _showOtpSentNotice({
-    required String channel,
-    required String destination,
-  }) async {
-    if (!mounted) return;
-
-    final channelLabel = channel == 'sms' ? 'SMS' : 'Email';
-    final destLabel = channel == 'sms'
-        ? 'phone number ending in ${destination.length >= 4 ? destination.substring(destination.length - 4) : destination}'
-        : 'email ($destination)';
-
-    showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) {
-        return PopScope(
-          canPop: false,
-          child: AlertDialog(
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(16),
-            ),
-            title: Row(
-              children: [
-                Icon(Icons.mark_email_read_outlined, color: AppTheme.royalBlue),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    'OTP sent to your $channelLabel',
-                    style: const TextStyle(
-                      fontSize: 17,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            content: Text(
-              'We sent your verification code to your $channelLabel ($destLabel).\n\n'
-              'Please do not share this code with anybody.\n\n'
-              'Input your OTP on the next screen.',
-              style: const TextStyle(fontSize: 14, height: 1.45),
-            ),
-          ),
-        );
-      },
-    );
-
-    await Future.delayed(const Duration(seconds: 5));
-
-    _closeRootDialogIfOpen();
-  }
-
   Future<bool> _deliverOtpAfterChannelChoice({
     required String email,
     required String phone,
@@ -410,38 +316,8 @@ class _SignupPageState extends State<SignupPage> {
     final channel = await _showOtpChannelPicker(email: email, phone: phone);
     if (!mounted || channel == null) return false;
 
-    await _showOtpSendingDialog(channel);
-
-    final sendResult = await _authService.sendClientSignupOtp(
-      email: email,
-      channel: channel,
-      name: _displayName(),
-    );
-
-    _closeRootDialogIfOpen();
-
-    if (!mounted) return false;
-
-    if (sendResult['success'] != true) {
-      Get.snackbar(
-        'Error',
-        sendResult['message'] as String? ??
-            'Failed to send verification code.',
-        backgroundColor: Colors.red,
-        colorText: Colors.white,
-        duration: const Duration(seconds: 4),
-      );
-      return false;
-    }
-
-    await _showOtpSentNotice(
-      channel: channel,
-      destination: sendResult['destination'] as String? ??
-          (channel == 'sms' ? phone : email),
-    );
-
-    if (!mounted) return false;
-
+    // Open the OTP screen immediately. Sending from a dialog here used to
+    // pop SignupPage itself (back to login) when the send finished quickly.
     Get.offAll(
       () => OtpVerificationPage(
         email: email,
@@ -456,7 +332,9 @@ class _SignupPageState extends State<SignupPage> {
   }
 
   Future<void> _signup() async {
-    if (!_formKey.currentState!.validate()) return;
+    final isValid = _formKey.currentState!.validate();
+    _addressFieldKey.currentState?.validate();
+    if (!isValid || _address.trim().isEmpty) return;
 
     setState(() => _isLoading = true);
 
@@ -468,7 +346,7 @@ class _SignupPageState extends State<SignupPage> {
         email: _emailController.text.trim(),
         password: _passwordController.text,
         phoneNumber: _phoneNumberController.text.trim(),
-        address: _addressController.text.trim(),
+        address: _address,
       );
 
       if (!mounted) return;
@@ -520,20 +398,26 @@ class _SignupPageState extends State<SignupPage> {
     final isSmallScreen = screenSize.width < 600;
 
     return Scaffold(
+      resizeToAvoidBottomInset: true,
       backgroundColor: AppTheme.navy,
       body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: EdgeInsets.symmetric(
-              horizontal: isSmallScreen ? 20 : 32,
-              vertical: 24,
-            ),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 500),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            return SingleChildScrollView(
+              keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+              padding: EdgeInsets.symmetric(
+                horizontal: isSmallScreen ? 20 : 32,
+                vertical: 24,
+              ),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                child: Center(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 500),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
                   Text(
                     'Create Your Account',
                     style: TextStyle(
@@ -576,6 +460,10 @@ class _SignupPageState extends State<SignupPage> {
                             label: 'First Name',
                             hint: 'First Name',
                             controller: _firstNameController,
+                            focusNode: _firstNameFocus,
+                            textInputAction: TextInputAction.next,
+                            onFieldSubmitted: (_) =>
+                                _middleNameFocus.requestFocus(),
                             textCapitalization: TextCapitalization.words,
                             validator: (v) =>
                                 _validateNamePart(v, 'first name'),
@@ -585,15 +473,27 @@ class _SignupPageState extends State<SignupPage> {
                             label: 'Middle Name',
                             hint: 'Middle Name',
                             controller: _middleNameController,
+                            focusNode: _middleNameFocus,
+                            textInputAction: TextInputAction.next,
+                            onFieldSubmitted: (_) =>
+                                _lastNameFocus.requestFocus(),
                             textCapitalization: TextCapitalization.words,
                             validator: (v) =>
-                                _validateNamePart(v, 'middle name'),
+                                _validateNamePart(
+                                  v,
+                                  'middle name',
+                                  required: false,
+                                ),
                           ),
                           const SizedBox(height: 16),
                           AppTextField(
                             label: 'Last Name',
                             hint: 'Last Name',
                             controller: _lastNameController,
+                            focusNode: _lastNameFocus,
+                            textInputAction: TextInputAction.next,
+                            onFieldSubmitted: (_) =>
+                                _emailFocus.requestFocus(),
                             textCapitalization: TextCapitalization.words,
                             validator: (v) => _validateNamePart(v, 'last name'),
                           ),
@@ -602,6 +502,10 @@ class _SignupPageState extends State<SignupPage> {
                             label: 'Email',
                             hint: 'name@example.com',
                             controller: _emailController,
+                            focusNode: _emailFocus,
+                            textInputAction: TextInputAction.next,
+                            onFieldSubmitted: (_) =>
+                                _phoneFocus.requestFocus(),
                             keyboardType: TextInputType.emailAddress,
                             validator: _validateEmail,
                           ),
@@ -610,6 +514,10 @@ class _SignupPageState extends State<SignupPage> {
                             label: 'Phone Number',
                             hint: '09XXXXXXXXX (11 digits)',
                             controller: _phoneNumberController,
+                            focusNode: _phoneFocus,
+                            textInputAction: TextInputAction.next,
+                            onFieldSubmitted: (_) =>
+                                _passwordFocus.requestFocus(),
                             keyboardType: TextInputType.number,
                             maxLength: 11,
                             inputFormatters: [
@@ -618,12 +526,9 @@ class _SignupPageState extends State<SignupPage> {
                             validator: _validatePhoneNumber,
                           ),
                           const SizedBox(height: 16),
-                          AppTextField(
-                            label: 'Address',
-                            hint:
-                                'Street, Barangay, City, Province, Country',
-                            controller: _addressController,
-                            maxLines: 3,
+                          MisamisOccidentalAddressPicker(
+                            formFieldKey: _addressFieldKey,
+                            onChanged: (value) => _address = value,
                             validator: _validateAddress,
                           ),
                           const SizedBox(height: 16),
@@ -631,6 +536,10 @@ class _SignupPageState extends State<SignupPage> {
                             label: 'Password',
                             hint: 'Create a strong password',
                             controller: _passwordController,
+                            focusNode: _passwordFocus,
+                            textInputAction: TextInputAction.next,
+                            onFieldSubmitted: (_) =>
+                                _confirmPasswordFocus.requestFocus(),
                             obscureText: _obscurePassword,
                             validator: _validatePassword,
                             onChanged: _updatePasswordStrength,
@@ -701,6 +610,10 @@ class _SignupPageState extends State<SignupPage> {
                             label: 'Confirm Password',
                             hint: 'Confirm Password',
                             controller: _confirmPasswordController,
+                            focusNode: _confirmPasswordFocus,
+                            textInputAction: TextInputAction.done,
+                            onFieldSubmitted: (_) =>
+                                _submitSignupFromKeyboard(),
                             obscureText: _obscureConfirmPassword,
                             validator: _validateConfirmPassword,
                             onChanged: (_) {
@@ -801,9 +714,12 @@ class _SignupPageState extends State<SignupPage> {
                     ),
                   ),
                 ],
+                    ),
+                  ),
+                ),
               ),
-            ),
-          ),
+            );
+          },
         ),
       ),
     );
@@ -837,6 +753,13 @@ class _SignupPageState extends State<SignupPage> {
   @override
   void dispose() {
     _passwordController.removeListener(_onPasswordChanged);
+    _firstNameFocus.dispose();
+    _middleNameFocus.dispose();
+    _lastNameFocus.dispose();
+    _emailFocus.dispose();
+    _phoneFocus.dispose();
+    _passwordFocus.dispose();
+    _confirmPasswordFocus.dispose();
     _firstNameController.dispose();
     _middleNameController.dispose();
     _lastNameController.dispose();
@@ -844,7 +767,6 @@ class _SignupPageState extends State<SignupPage> {
     _passwordController.dispose();
     _confirmPasswordController.dispose();
     _phoneNumberController.dispose();
-    _addressController.dispose();
     super.dispose();
   }
 }

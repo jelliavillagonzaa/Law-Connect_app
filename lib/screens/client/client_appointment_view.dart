@@ -20,7 +20,7 @@ class _ClientAppointmentViewState extends State<ClientAppointmentView>
   late TabController _tabController;
 
   // Color constants
-  static const Color primaryRed = Color(0xFF1A4D8F); // Royal Blue
+  static const Color primaryRed = Color(0xFF1A3A6C);
 
   @override
   void initState() {
@@ -105,7 +105,7 @@ class _ClientAppointmentViewState extends State<ClientAppointmentView>
 
     if (user == null) {
       return Scaffold(
-        backgroundColor: const Color(0xFFF5F5F5),
+        backgroundColor: const Color(0xFFF8FAFC),
         appBar: AppBar(
           backgroundColor: primaryRed,
           title: const Text(
@@ -120,7 +120,7 @@ class _ClientAppointmentViewState extends State<ClientAppointmentView>
     }
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF5F5F5),
+      backgroundColor: const Color(0xFFF8FAFC),
       appBar: AppBar(
         backgroundColor: primaryRed,
         title: const Text(
@@ -143,8 +143,9 @@ class _ClientAppointmentViewState extends State<ClientAppointmentView>
       body: StreamBuilder<List<AppointmentModel>>(
         stream: _appointmentService.getClientAppointments(user.uid),
         builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
+          if (snapshot.connectionState == ConnectionState.waiting &&
+              !snapshot.hasData) {
+            return const SizedBox.shrink();
           }
 
           if (snapshot.hasError) {

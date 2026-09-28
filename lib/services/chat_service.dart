@@ -1,11 +1,13 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
 import 'dart:io';
 import 'dart:async';
 import '../models/message_model.dart';
 import 'notification_service.dart';
 import 'firestore_mirror_helper.dart';
+import 'fcm_service.dart';
 
 class ChatService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -14,6 +16,7 @@ class ChatService {
 
   // Track last message timestamp to avoid duplicate notifications
   final Map<String, DateTime> _lastNotificationTime = {};
+  final Map<String, Timer> _seenMarkDebounce = {};
 
   // Get or create a chat with staff by email (no need to find staff user first)
   // Messages go directly to staff@gmail.com - staff will see it when they log in
@@ -289,6 +292,14 @@ class ChatService {
         },
       );
       if (!chatResult.isSuccess) throw Exception(chatResult.failureMessage);
+
+      unawaited(
+        _pushNewMessageToRecipients(
+          chatId: chatId,
+          senderId: senderId,
+          text: text,
+        ),
+      );
     } catch (e) {
       throw Exception('Failed to send message: $e');
     }
@@ -339,9 +350,115 @@ class ChatService {
         },
       );
       if (!chatResult.isSuccess) throw Exception(chatResult.failureMessage);
+
+      unawaited(
+        _pushNewMessageToRecipients(
+          chatId: chatId,
+          senderId: senderId,
+          text: lastMessage,
+        ),
+      );
     } catch (e) {
       throw Exception('Failed to send message with attachment: $e');
     }
+  }
+
+  /// Push only to the other people in the thread (client, staff, or attorney).
+  Future<void> _pushNewMessageToRecipients({
+    required String chatId,
+    required String senderId,
+    required String text,
+  }) async {
+    try {
+      final chatDoc = await _firestore.collection('messages').doc(chatId).get();
+      if (!chatDoc.exists) return;
+      final data = chatDoc.data() ?? {};
+      final recipients = await _messageRecipientIds(data, senderId);
+      if (recipients.isEmpty) return;
+
+      var senderName = 'New message';
+      try {
+        final senderDoc = await _firestore.collection('users').doc(senderId).get();
+        final senderData = senderDoc.data();
+        final name = (senderData?['fullName'] ??
+                senderData?['name'] ??
+                senderData?['displayName'] ??
+                '')
+            .toString()
+            .trim();
+        if (name.isNotEmpty) senderName = name;
+      } catch (_) {}
+
+      final trimmed = text.trim();
+      final preview = trimmed.isEmpty
+          ? 'Sent an attachment'
+          : (trimmed.length > 140 ? '${trimmed.substring(0, 140)}...' : trimmed);
+
+      final fcm = FCMService();
+      for (final userId in recipients) {
+        await fcm.sendChatPush(
+          userId: userId,
+          title: senderName,
+          body: preview,
+          chatId: chatId,
+          senderId: senderId,
+          senderName: senderName,
+        );
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('Chat push skipped: $e');
+      }
+    }
+  }
+
+  Future<Set<String>> _messageRecipientIds(
+    Map<String, dynamic> data,
+    String senderId,
+  ) async {
+    final ids = <String>{};
+    void addId(dynamic raw) {
+      final id = raw?.toString().trim() ?? '';
+      if (id.isEmpty || id == senderId || id.startsWith('staff_')) return;
+      ids.add(id);
+    }
+
+    final participants = data['participants'];
+    if (participants is List) {
+      for (final participant in participants) {
+        addId(participant);
+      }
+    }
+    addId(data['clientId']);
+    addId(data['staffId']);
+    addId(data['attorneyId']);
+
+    final emails = <String>{};
+    final staffEmail = data['staffEmail']?.toString().trim() ?? '';
+    if (staffEmail.isNotEmpty) emails.add(staffEmail);
+    if (participants is List) {
+      for (final participant in participants) {
+        final value = participant?.toString() ?? '';
+        if (value.startsWith('staff_') && value.length > 6) {
+          emails.add(value.substring(6));
+        }
+      }
+    }
+    for (final email in emails) {
+      try {
+        final matches = await _firestore
+            .collection('users')
+            .where('email', isEqualTo: email)
+            .limit(3)
+            .get();
+        for (final doc in matches.docs) {
+          if (doc.id != senderId) ids.add(doc.id);
+        }
+      } catch (_) {}
+    }
+
+    ids.remove(senderId);
+    return ids;
   }
 
   // Get messages for a chat (real-time stream)
@@ -351,11 +468,14 @@ class ChatService {
           .collection('messages')
           .doc(chatId)
           .collection('messages')
-          .orderBy('timestamp', descending: false)
+          .orderBy('timestamp', descending: true)
+          .limit(80)
           .snapshots()
           .map((snapshot) {
             return snapshot.docs
                 .map((doc) => MessageModel.fromFirestore(doc))
+                .toList()
+                .reversed
                 .toList();
           });
     } catch (e) {
@@ -371,59 +491,36 @@ class ChatService {
         .collection('messages')
         .doc(chatId)
         .collection('messages')
-        .orderBy('timestamp', descending: false)
+        .orderBy('timestamp', descending: true)
+        .limit(80)
         .snapshots()
-        .asyncMap((snapshot) async {
+        .map((snapshot) {
           final messages = snapshot.docs
               .map((doc) => MessageModel.fromFirestore(doc))
+              .toList()
+              .reversed
               .toList();
 
-          // Check for new messages from other users
           if (messages.isNotEmpty && currentUserId != null) {
             final lastMessage = messages.last;
-
-            // Only notify if message is from someone else and is recent
             if (lastMessage.senderId != currentUserId) {
               final messageTime = lastMessage.timestamp;
               final lastNotified = _lastNotificationTime[chatId];
-
-              // Avoid duplicate notifications (only notify if message is within last 5 seconds)
-              final now = DateTime.now();
-              final timeSinceMessage = now.difference(messageTime).inSeconds;
-
+              final timeSinceMessage =
+                  DateTime.now().difference(messageTime).inSeconds;
               if (timeSinceMessage < 5 &&
                   (lastNotified == null || messageTime.isAfter(lastNotified))) {
                 _lastNotificationTime[chatId] = messageTime;
-
-                // Get sender info for notification
-                try {
-                  final senderDoc = await _firestore
-                      .collection('users')
-                      .doc(lastMessage.senderId)
-                      .get();
-
-                  final senderName = senderDoc.data()?['fullName'] ?? 'Someone';
-
-                  // Show notification with sound
-                  await _notificationService.showNotificationWithSound(
-                    id: DateTime.now().millisecondsSinceEpoch % 100000,
-                    title: 'New message from $senderName',
-                    body: lastMessage.text.isNotEmpty
-                        ? lastMessage.text
-                        : 'Sent an attachment',
-                    payload: chatId,
-                  );
-                } catch (e) {
-                  // Fallback notification without sender name
-                  await _notificationService.showNotificationWithSound(
+                unawaited(
+                  _notificationService.showNotificationWithSound(
                     id: DateTime.now().millisecondsSinceEpoch % 100000,
                     title: 'New message',
                     body: lastMessage.text.isNotEmpty
                         ? lastMessage.text
                         : 'Sent an attachment',
                     payload: chatId,
-                  );
-                }
+                  ),
+                );
               }
             }
           }
@@ -438,6 +535,7 @@ class ChatService {
       return _firestore
           .collection('messages')
           .where('participants', arrayContains: userId)
+          .limit(30)
           .snapshots()
           .map((snapshot) {
             final chats = snapshot.docs
@@ -464,81 +562,219 @@ class ChatService {
     }
   }
 
+  /// Debounced mark-as-read while a chat is open (avoids spamming writes).
+  void markMessagesAsSeenDebounced(String chatId, String userId) {
+    _seenMarkDebounce[chatId]?.cancel();
+    _seenMarkDebounce[chatId] = Timer(const Duration(milliseconds: 350), () {
+      unawaited(markMessagesAsSeen(chatId, userId));
+    });
+  }
+
   // Mark messages as seen
   Future<void> markMessagesAsSeen(String chatId, String userId) async {
     try {
-      // Get all unread messages (filter in memory to avoid index requirement)
-      final messagesSnapshot = await _firestore
-          .collection('messages')
-          .doc(chatId)
-          .collection('messages')
-          .where('isSeen', isEqualTo: false)
-          .get();
-
-      final toMark = <Future<HybridWriteResult>>[];
-
-      for (var doc in messagesSnapshot.docs) {
-        final data = doc.data();
-        if (data['senderId'] != null && data['senderId'] != userId) {
-          toMark.add(
-            HybridDatastore.updateChatMessage(
-              chatId: chatId,
-              id: doc.id,
-              patch: {'isSeen': true},
-            ),
-          );
-        }
+      QuerySnapshot<Map<String, dynamic>> messagesSnapshot;
+      try {
+        messagesSnapshot = await _firestore
+            .collection('messages')
+            .doc(chatId)
+            .collection('messages')
+            .orderBy('timestamp', descending: true)
+            .limit(200)
+            .get();
+      } catch (_) {
+        messagesSnapshot = await _firestore
+            .collection('messages')
+            .doc(chatId)
+            .collection('messages')
+            .limit(200)
+            .get();
       }
 
-      if (toMark.isNotEmpty) {
-        await Future.wait(toMark);
-        // Update parent conversation to trigger listeners
-        try {
-          await HybridDatastore.updateChat(
+      final toMark = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+      for (final doc in messagesSnapshot.docs) {
+        final data = doc.data();
+        final senderId = data['senderId'] as String?;
+        if (senderId == null || senderId == userId) continue;
+        if (data['isSeen'] == true) continue;
+        toMark.add(doc);
+      }
+
+      if (toMark.isEmpty) return;
+
+      final batch = _firestore.batch();
+      for (final doc in toMark) {
+        batch.update(doc.reference, {'isSeen': true});
+      }
+      await batch.commit();
+
+      for (final doc in toMark) {
+        unawaited(
+          HybridDatastore.updateChatMessage(
+            chatId: chatId,
+            id: doc.id,
+            patch: {'isSeen': true},
+          ),
+        );
+      }
+
+      try {
+        await _firestore.collection('messages').doc(chatId).update({
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
+        unawaited(
+          HybridDatastore.updateChat(
             id: chatId,
             patch: {'updatedAt': FieldValue.serverTimestamp()},
-          );
-        } catch (e) {
-          // Ignore errors updating parent - messages are already marked as seen
-          print('Warning: Failed to update parent conversation: $e');
-        }
-      }
+          ),
+        );
+      } catch (_) {}
     } catch (e) {
       throw Exception('Failed to mark messages as seen: $e');
-      }
     }
+  }
 
-  // Get unread message count for a user (capped to avoid ANR on large inboxes).
-  Future<int> getUnreadCount(String userId, {int maxChats = 25}) async {
+  // Unread badge: cache-first, never N+1 message scans (those ANR the client).
+  Future<int> getUnreadCount(String userId, {int maxChats = 6}) async {
     try {
-      final chats = await _firestore
+      final query = _firestore
           .collection('messages')
           .where('participants', arrayContains: userId)
-          .limit(maxChats)
-          .get();
-
-      int totalUnread = 0;
-      for (var chatDoc in chats.docs) {
-        final unreadMessages = await _firestore
-            .collection('messages')
-            .doc(chatDoc.id)
-            .collection('messages')
-            .where('isSeen', isEqualTo: false)
-            .limit(40)
-            .get();
-
-        for (var msgDoc in unreadMessages.docs) {
-          final data = msgDoc.data();
-          if (data['senderId'] != userId) {
-            totalUnread++;
-          }
+          .limit(maxChats);
+      QuerySnapshot<Map<String, dynamic>> chats;
+      try {
+        chats = await query
+            .get(const GetOptions(source: Source.cache))
+            .timeout(const Duration(seconds: 1));
+        if (chats.docs.isEmpty) {
+          chats = await query.get().timeout(const Duration(seconds: 1));
         }
+      } catch (_) {
+        return 0;
       }
 
+      var totalUnread = 0;
+      var peeked = 0;
+      for (final chatDoc in chats.docs) {
+        final data = chatDoc.data();
+        final deletedFor = List<String>.from(data['deletedFor'] ?? []);
+        if (deletedFor.contains(userId)) continue;
+        if (peeked >= 3) break;
+        peeked++;
+        try {
+          final snap = await _firestore
+              .collection('messages')
+              .doc(chatDoc.id)
+              .collection('messages')
+              .limit(8)
+              .get(const GetOptions(source: Source.cache))
+              .timeout(const Duration(milliseconds: 400));
+          for (final msgDoc in snap.docs) {
+            final msg = msgDoc.data();
+            if (msg['senderId'] != userId && msg['isSeen'] != true) {
+              totalUnread++;
+            }
+          }
+        } catch (_) {}
+      }
       return totalUnread;
-    } catch (e) {
-      throw Exception('Failed to get unread count: $e');
+    } catch (_) {
+      return 0;
     }
+  }
+
+  /// Whether this conversation has unread messages for [userId].
+  Future<bool> chatHasUnread(String chatId, String userId) async {
+    try {
+      QuerySnapshot<Map<String, dynamic>> snap;
+      try {
+        snap = await _firestore
+            .collection('messages')
+            .doc(chatId)
+            .collection('messages')
+            .orderBy('timestamp', descending: true)
+            .limit(50)
+            .get();
+      } catch (_) {
+        snap = await _firestore
+            .collection('messages')
+            .doc(chatId)
+            .collection('messages')
+            .limit(50)
+            .get();
+      }
+      for (final doc in snap.docs) {
+        final data = doc.data();
+        if (data['senderId'] != userId && data['isSeen'] != true) {
+          return true;
+        }
+      }
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Live per-conversation unread flag for list cards.
+  Stream<bool> watchChatHasUnread(String chatId, String userId) {
+    Query<Map<String, dynamic>> query = _firestore
+        .collection('messages')
+        .doc(chatId)
+        .collection('messages');
+    try {
+      query = query.orderBy('timestamp', descending: true).limit(50);
+    } catch (_) {
+      query = query.limit(50);
+    }
+    return query.snapshots().map((snap) {
+      for (final doc in snap.docs) {
+        final data = doc.data();
+        if (data['senderId'] != userId && data['isSeen'] != true) {
+          return true;
+        }
+      }
+      return false;
+    });
+  }
+
+  /// Live unread badge stream — refreshes when conversations update.
+  Stream<int> watchUnreadCount(String userId, {int maxChats = 25}) {
+    final controller = StreamController<int>.broadcast();
+    Timer? debounce;
+    StreamSubscription<List<ChatModel>>? chatsSub;
+
+    Future<void> refresh() async {
+      try {
+        final count = await getUnreadCount(userId, maxChats: maxChats);
+        if (!controller.isClosed) controller.add(count);
+      } catch (_) {
+        if (!controller.isClosed) controller.add(0);
+      }
+    }
+
+    void scheduleRefresh() {
+      debounce?.cancel();
+      debounce = Timer(const Duration(milliseconds: 400), refresh);
+    }
+
+    chatsSub = getUserChats(userId).listen(
+      (_) => scheduleRefresh(),
+      onError: (_) {},
+    );
+    unawaited(refresh());
+
+    final poll = Timer.periodic(
+      const Duration(seconds: 10),
+      (_) => scheduleRefresh(),
+    );
+
+    controller.onCancel = () {
+      debounce?.cancel();
+      poll.cancel();
+      chatsSub?.cancel();
+    };
+
+    return controller.stream;
   }
 
   // Get user conversations (alias for getUserChats for compatibility)

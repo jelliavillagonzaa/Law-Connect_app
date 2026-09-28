@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:get/get.dart';
+import 'dart:async' show StreamSubscription, unawaited;
 import '../../services/chat_service.dart';
-import '../../services/staff_auth_service.dart';
+import '../../services/chat_session.dart';
 import '../../models/message_model.dart';
 import '../../theme/app_theme.dart';
 
@@ -24,17 +25,18 @@ class StaffClientChatScreen extends StatefulWidget {
 
 class _StaffClientChatScreenState extends State<StaffClientChatScreen> {
   final ChatService _chatService = ChatService();
-  final StaffAuthService _staffAuthService = StaffAuthService();
   final TextEditingController _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   bool _isLoading = true;
   bool _hasScrolledToBottom =
       false; // Track if we've scrolled to bottom initially
   bool _canSend = false; // Track if message can be sent
+  StreamSubscription<List<MessageModel>>? _messagesSub;
 
   @override
   void initState() {
     super.initState();
+    ChatSession.open(widget.chatId);
     _initializeChat();
     // Listen to text changes to update send button state
     _messageController.addListener(() {
@@ -55,27 +57,22 @@ class _StaffClientChatScreenState extends State<StaffClientChatScreen> {
     }
 
     try {
-      // Set loading to false immediately to show messages
       setState(() => _isLoading = false);
-
-      // Get staff info asynchronously (don't block UI)
-      _staffAuthService
-          .getCurrentStaff()
-          .then((staff) {
-            if (staff != null && mounted) {
-              // Mark messages as seen
-              _chatService.markMessagesAsSeen(widget.chatId, user.uid);
-            }
-          })
-          .catchError((e) {
-            print('Error loading staff info: $e');
-            // Don't block message display even if staff info fails
-          });
+      unawaited(_chatService.markMessagesAsSeen(widget.chatId, user.uid));
+      _listenForSeenUpdates(widget.chatId, user.uid);
     } catch (e) {
       setState(() => _isLoading = false);
       print('Error initializing chat: $e');
       // Don't show error snackbar - allow messages to display
     }
+  }
+
+  void _listenForSeenUpdates(String chatId, String userId) {
+    _messagesSub?.cancel();
+    _messagesSub = _chatService.getMessagesWithNotifications(chatId).listen(
+      (_) => _chatService.markMessagesAsSeenDebounced(chatId, userId),
+      onError: (_) {},
+    );
   }
 
   Future<void> _sendMessage() async {
@@ -119,6 +116,8 @@ class _StaffClientChatScreenState extends State<StaffClientChatScreen> {
 
   @override
   void dispose() {
+    ChatSession.close(widget.chatId);
+    _messagesSub?.cancel();
     _messageController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -157,7 +156,7 @@ class _StaffClientChatScreenState extends State<StaffClientChatScreen> {
     }
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF5F5F5), // Light gray background
+      backgroundColor: const Color(0xFFF8FAFC), // Light gray background
       appBar: AppBar(
         backgroundColor: Colors.white,
         elevation: 0,
@@ -180,8 +179,9 @@ class _StaffClientChatScreenState extends State<StaffClientChatScreen> {
             child: StreamBuilder<List<MessageModel>>(
               stream: _chatService.getMessages(widget.chatId),
               builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
+                if (snapshot.connectionState == ConnectionState.waiting &&
+                    !snapshot.hasData) {
+                  return const SizedBox.shrink();
                 }
 
                 if (snapshot.hasError) {

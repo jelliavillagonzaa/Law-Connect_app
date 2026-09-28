@@ -9,13 +9,24 @@ import '../firebase_options.dart';
 import '../utils/quiet_console.dart';
 import 'app_startup_state.dart';
 
-/// Firebase init — must complete before runApp (Auth uses Firebase on first screen).
+/// Firebase init. On web this runs after first paint so the landing page is instant.
 Future<void> initializeFirebaseInBackground() async {
   try {
+    final options = DefaultFirebaseOptions.currentPlatform;
     if (Firebase.apps.isEmpty) {
       await Firebase.initializeApp(
-        options: DefaultFirebaseOptions.currentPlatform,
+        options: options,
       ).timeout(const Duration(seconds: 20));
+    } else if (!kIsWeb && kDebugMode) {
+      // google-services.json may auto-init first with the SHA-restricted Android
+      // key. Recreate the default app so debug login matches firebase_options.
+      final existing = Firebase.app();
+      if (existing.options.apiKey != options.apiKey) {
+        await existing.delete();
+        await Firebase.initializeApp(
+          options: options,
+        ).timeout(const Duration(seconds: 20));
+      }
     }
 
     // App Check on mobile only in release — debug builds skip it so Firestore reads work
@@ -34,17 +45,17 @@ Future<void> initializeFirebaseInBackground() async {
     }
 
     try {
-      FirebaseFirestore.instance.settings = Settings(
-        persistenceEnabled: !kIsWeb,
+      FirebaseFirestore.instance.settings = const Settings(
+        persistenceEnabled: true,
         cacheSizeBytes: 40 * 1024 * 1024,
       );
     } catch (_) {}
 
-    AppStartupState.firebaseReady = true;
+    AppStartupState.markReady();
   } on TimeoutException {
-    AppStartupState.firebaseReady = false;
+    AppStartupState.markFailed();
   } catch (e) {
-    AppStartupState.firebaseReady = false;
+    AppStartupState.markFailed();
     appLog('Firebase init failed: $e', name: 'startup');
   }
 }

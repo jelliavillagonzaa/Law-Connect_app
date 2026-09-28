@@ -4,20 +4,22 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'firestore_mirror_helper.dart';
+import 'supabase_storage_service.dart';
 
 class ProfileService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final ImagePicker _picker = ImagePicker();
+  final SupabaseStorageService _supabaseStorage = SupabaseStorageService();
 
   Future<XFile?> pickImage({ImageSource? source}) async {
     try {
       final ImageSource imageSource = source ?? ImageSource.gallery;
       final XFile? image = await _picker.pickImage(
         source: imageSource,
-        maxWidth: 800, // Reduced from 1920 to save storage space
-        maxHeight: 800, // Reduced from 1920 to save storage space
-        imageQuality: 75, // Reduced from 90 to save storage space
+        maxWidth: 800,
+        maxHeight: 800,
+        imageQuality: 75,
       );
       return image;
     } catch (e) {
@@ -30,27 +32,50 @@ class ProfileService {
       final user = _auth.currentUser;
       if (user == null) throw Exception('No user logged in');
 
-      // Save to local storage using base64
       final bytes = await imageFile.readAsBytes();
-      final base64Image = base64Encode(bytes);
+      final publicUrl = await _supabaseStorage.uploadProfilePhoto(
+        userId: user.uid,
+        imageFile: imageFile,
+      );
 
+      // Keep a local cache so the avatar still shows if the network is slow.
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('profile_image_${user.uid}', base64Image);
+      await prefs.setString('profile_image_${user.uid}', base64Encode(bytes));
 
-      // Update Firestore to indicate local storage
-      final patch = <String, dynamic>{
-        'photoUrl': 'local_storage',
-        'hasLocalPhoto': true,
-        'profilePictureUpdatedAt': FieldValue.serverTimestamp(),
-      };
-      final result = await HybridDatastore.update(
+      final existing = await _firestore.collection('users').doc(user.uid).get();
+      final existingData = existing.data() ?? <String, dynamic>{};
+
+      // Persist the public URL. Firestore is what the app reads; Supabase
+      // users.photo_url is best-effort and must not fail the upload.
+      await _firestore.collection('users').doc(user.uid).set(
+        {
+          'photoUrl': publicUrl,
+          'hasLocalPhoto': false,
+          'profilePictureUpdatedAt': FieldValue.serverTimestamp(),
+        },
+        SetOptions(merge: true),
+      );
+
+      final result = await HybridDatastore.set(
         collection: 'users',
         id: user.uid,
-        patch: patch,
+        data: {
+          'photoUrl': publicUrl,
+          'hasLocalPhoto': false,
+          'email': existingData['email'] ?? user.email ?? '',
+          'name': existingData['name'] ??
+              existingData['fullName'] ??
+              user.displayName ??
+              '',
+          'role': existingData['role'] ?? 'client',
+        },
+        options: SetOptions(merge: true),
       );
-      if (!result.isSuccess) throw Exception(result.failureMessage);
+      if (!result.firestoreOk && !result.supabaseOk) {
+        throw Exception(result.failureMessage);
+      }
 
-      return 'local_storage';
+      return publicUrl;
     } catch (e) {
       throw Exception('Failed to save profile picture: $e');
     }
@@ -75,8 +100,6 @@ class ProfileService {
 
       final data = doc.data();
 
-      // If photoUrl is from Firebase Storage, use it directly
-      // Otherwise, check for local storage (backward compatibility)
       if (data?['photoUrl'] == 'local_storage' ||
           (data?['hasLocalPhoto'] == true &&
               (data?['photoUrl'] == null || data?['photoUrl'] == ''))) {

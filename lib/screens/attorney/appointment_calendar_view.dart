@@ -1,19 +1,29 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import '../../models/appointment_model.dart';
 import '../../services/enhanced_appointment_service.dart';
 import '../../services/auth_service.dart';
 import '../../services/hearing_calendar_fields.dart';
 import '../../services/hearing_calendar_sync_service.dart';
 import '../../services/staff_service.dart';
+import '../../services/notary_service.dart';
+import '../../services/hearing_notification_fanout_service.dart';
+import '../../utils/calendar_perf.dart';
+import '../../utils/calendar_hearing_nav.dart';
+import '../../utils/calendar_live_hearing_map.dart';
+import '../../utils/firestore_query_get.dart';
 import '../../widgets/common/hearing_calendar_event_body.dart';
 import '../../widgets/common/hearing_notification_detail_panel.dart';
+import '../../widgets/common/calendar_month_grid.dart';
+import '../../widgets/common/stable_merged_listenable_builder.dart';
 
 import 'appointment_scheduler_form.dart';
+import 'attorney_notary_request_detail_screen.dart';
 
 /// Single cell in the unified attorney calendar: client appointment OR Firestore hearing/deadline.
 class _AttorneyCalendarEntry {
@@ -61,26 +71,29 @@ class _AttorneyCalendarEntry {
   }
 
   String hearingTitle() {
-    final caseNo = (hearingEvent!['caseNo'] as String?)?.trim();
-    if (caseNo != null && caseNo.isNotEmpty) return caseNo;
-    final client = (hearingEvent!['clientName'] as String?)?.trim();
-    if (client != null && client.isNotEmpty) return client;
-    final caseTitle = (hearingEvent!['caseTitle'] as String?)?.trim();
-    if (caseTitle != null && caseTitle.isNotEmpty) return caseTitle;
-    final t = hearingEvent!['title'];
-    if (t is String && t.trim().isNotEmpty) {
-      return t.trim().replaceFirst(RegExp(r'^\[AI\]\s*'), '');
+    final caseNo = HearingCalendarFields.asDisplayString(hearingEvent!['caseNo']);
+    if (caseNo.isNotEmpty) return caseNo;
+    final client =
+        HearingCalendarFields.asDisplayString(hearingEvent!['clientName']);
+    if (client.isNotEmpty) return client;
+    final caseTitle =
+        HearingCalendarFields.asDisplayString(hearingEvent!['caseTitle']);
+    if (caseTitle.isNotEmpty) return caseTitle;
+    final t = HearingCalendarFields.asDisplayString(hearingEvent!['title']);
+    if (t.isNotEmpty) {
+      return t.replaceFirst(RegExp(r'^\[AI\]\s*'), '');
     }
     return 'Hearing';
   }
 
-  /// Short label for month grid cells (client name first).
+  /// Short label for month grid cells (client name first — matches legacy UI).
   String calendarCellLabel() {
     if (appointment != null) return '';
-    final client = (hearingEvent!['clientName'] as String?)?.trim();
-    if (client != null && client.isNotEmpty) return client;
-    final caseNo = (hearingEvent!['caseNo'] as String?)?.trim();
-    if (caseNo != null && caseNo.isNotEmpty) return caseNo;
+    final client =
+        HearingCalendarFields.asDisplayString(hearingEvent!['clientName']);
+    if (client.isNotEmpty) return client;
+    final caseNo = HearingCalendarFields.asDisplayString(hearingEvent!['caseNo']);
+    if (caseNo.isNotEmpty) return caseNo;
     final title = hearingTitle();
     return title.replaceFirst(RegExp(r'^\[AI\]\s*'), '');
   }
@@ -104,11 +117,35 @@ class AppointmentCalendarView extends StatefulWidget {
   /// When true, no nested [Scaffold] — required inside [AttorneyDashboard] tabs.
   final bool embedded;
 
+  /// Staff calendar: view this attorney’s grid (same UI as attorney).
+  final String? attorneyId;
+
+  /// Staff calendar: + opens add-event instead of the attorney scheduler.
+  final VoidCallback? onAddPressed;
+
+  /// Staff calendar: empty-day tap opens add-event for that date.
+  final Future<void> Function(DateTime day)? onAddForDate;
+
+  /// Top-right + on the embedded mobile header. Staff app hides this.
+  final bool showTopAddButton;
+
+  /// Push the month row below the device status bar. Staff app only.
+  final bool padHeaderForStatusBar;
+
+  /// Staff calendar: open notary details with staff actions and full request info.
+  final bool actingAsStaff;
+
   const AppointmentCalendarView({
     super.key,
     this.initialAppointments,
     this.sharedAppointmentsStream,
     this.embedded = false,
+    this.attorneyId,
+    this.onAddPressed,
+    this.onAddForDate,
+    this.showTopAddButton = true,
+    this.padHeaderForStatusBar = false,
+    this.actingAsStaff = false,
   });
 
   @override
@@ -117,33 +154,63 @@ class AppointmentCalendarView extends StatefulWidget {
 }
 
 class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
+  static final Map<String, List<Map<String, dynamic>>>
+  _calendarEventsCacheByAttorney = <String, List<Map<String, dynamic>>>{};
+
   final EnhancedAppointmentService _appointmentService =
       EnhancedAppointmentService();
   final AuthService _authService = AuthService();
   final StaffService _staffService = StaffService();
+  final NotaryService _notaryService = NotaryService();
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
-  DateTime _viewDate = DateTime.now();
+  late final ValueNotifier<DateTime> _viewDateNotifier = ValueNotifier(
+    DateTime.now(),
+  );
+  DateTime get _viewDate => _viewDateNotifier.value;
   String _viewMode = 'month'; // 'month' or 'week'
   List<AppointmentModel> _appointments = [];
 
   /// Hearings/deadlines/meetings from `calendar_events` (manual + AI-synced hearings).
   List<Map<String, dynamic>> _calendarEvents = [];
 
-  /// Live projection from `hearings` (ensures marks show even if sync write lags).
-  List<Map<String, dynamic>> _hearingOverlay = [];
   StreamSubscription<List<Map<String, dynamic>>>? _calendarEventsSub;
+  StreamSubscription<List<Map<String, dynamic>>>? _liveHearingsSub;
+  StreamSubscription<List<Map<String, dynamic>>>? _notaryCalendarSub;
   StreamSubscription<List<AppointmentModel>>? _appointmentsSub;
-  String? _attachedAttorneyId;
   bool _ownsAppointmentsStream = false;
-  Timer? _calendarUiDebounce;
-  // Hearing overlay disabled on mobile to avoid ANR.
+  Timer? _dataUiDebounce;
+
+  /// Precomputed day → entries map so the month grid does not rescan all data 42× per frame.
+  Map<String, List<_AttorneyCalendarEntry>> _entriesByDayKey = {};
+  List<Map<String, dynamic>>? _pendingCalendarEvents;
+  List<AppointmentModel>? _pendingAppointments;
+  List<Map<String, dynamic>>? _pendingLiveHearings;
+  String _lastCalendarFingerprint = '';
+  String _lastAppointmentsFingerprint = '';
+  String _lastLiveHearingsFingerprint = '';
+  String _lastEntriesIndexFingerprint = '';
+  int _entriesRevision = 0;
+  final ValueNotifier<int> _entriesRevisionNotifier = ValueNotifier(0);
+  List<Map<String, dynamic>> _cachedHearingNavEvents = [];
+  List<Map<String, dynamic>> _liveHearingRows = [];
+  List<Map<String, dynamic>> _notaryCalendarRows = [];
+  int _entriesIndexGen = 0;
+  bool _didRevealHearingMonth = false;
+  final Set<String> _seenHearingDocIds = {};
+  bool _followNewHearings = false;
+  Timer? _armFollowTimer;
+  bool _notaryCalendarReady = false;
+  Timer? _entriesIndexDebounce;
+  Timer? _clientNamesDebounce;
+  final ValueNotifier<int> _hearingNavRevision = ValueNotifier(0);
+  bool _flushDataImmediately = true;
+  bool _entriesIndexFlushImmediately = true;
 
   final Map<String, String> _clientNameCache =
       <String, String>{}; // Cache for client full names
   final Map<String, String> _clientEmailCache =
       <String, String>{}; // Cache for client emails
-  bool _didAutoFocusHearingMonth = false;
 
   // Calendar color theme (match reference UI: blue + gold, Sunday red)
   static const Color calendarBlue = Color.fromARGB(255, 46, 109, 192);
@@ -192,55 +259,591 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     if (seed != null && seed.isNotEmpty) {
       _appointments = List<AppointmentModel>.from(seed);
     }
-    _bindAppointments();
-    _subscribeCalendarEvents();
+    _hydrateCalendarEventsFromCache();
+    _hydrateLiveHearingsFromCache();
+    _paintGridFromCachedData();
 
-    final user = _authService.currentUser;
-    if (user != null) {
-      _attachedAttorneyId = user.uid;
-      // NOTE: Avoid attaching heavy `hearings` listeners / bulk reads on open;
-      // these can ANR on some devices. The calendar still shows `calendar_events`
-      // + appointments; hearing overlay can be added back behind an explicit
-      // "refresh AI hearings" action if needed.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _bindAppointments();
+      _subscribeCalendarEvents();
+      _subscribeNotaryCalendar();
+      Future<void>.delayed(
+        const Duration(milliseconds: CalendarPerf.hearingStreamDeferMs),
+        () {
+          if (!mounted) return;
+          _subscribeLiveHearings();
+        },
+      );
+      Future<void>.delayed(
+        Duration(milliseconds: kIsWeb ? 200 : 2000),
+        () {
+          if (mounted) unawaited(_loadAutomatedHearings());
+        },
+      );
+    });
+  }
+
+  List<Map<String, dynamic>> get _effectiveHearingRows => _liveHearingRows;
+
+  List<Map<String, dynamic>> _gridCalendarEvents() {
+    final merged = CalendarLiveHearingMap.mergeIntoCalendarEvents(
+      _calendarEvents,
+      _effectiveHearingRows,
+    );
+    if (_notaryCalendarRows.isEmpty) return merged;
+    return [...merged, ..._notaryCalendarRows];
+  }
+
+  void _hydrateCalendarEventsFromCache() {
+    final uid = _calendarAttorneyId();
+    if (uid.isEmpty) return;
+    final cached = _calendarEventsCacheByAttorney[uid];
+    if (cached == null || cached.isEmpty) return;
+    _calendarEvents = List<Map<String, dynamic>>.from(cached);
+    _lastCalendarFingerprint = _calendarEventsFingerprint(_calendarEvents);
+    _seedSeenHearings(_calendarEvents);
+  }
+
+  void _hydrateLiveHearingsFromCache() {
+    final uid = _calendarAttorneyId();
+    if (uid.isEmpty) return;
+    final cached = HearingCalendarSyncService.instance.peekHearingNavRows(uid);
+    if (cached == null || cached.isEmpty) return;
+    _liveHearingRows = List<Map<String, dynamic>>.from(cached);
+    _lastLiveHearingsFingerprint = CalendarPerf.eventsFingerprint(_liveHearingRows);
+    _seedSeenHearings(_liveHearingRows);
+  }
+
+  void _paintGridFromCachedData() {
+    if (_calendarEvents.isEmpty &&
+        _liveHearingRows.isEmpty &&
+        _appointments.isEmpty) {
+      return;
     }
+    _rebuildHearingNavCache();
+    _scheduleEntriesIndexRebuild();
+    _hearingNavRevision.value++;
+  }
+
+  void _scheduleEntriesIndexRebuild({bool immediate = false}) {
+    _entriesIndexDebounce?.cancel();
+    if (immediate) _entriesIndexFlushImmediately = true;
+    final ms = _entriesIndexFlushImmediately
+        ? 0
+        : CalendarPerf.entriesIndexDebounceMs;
+    _entriesIndexDebounce = Timer(Duration(milliseconds: ms), () {
+      if (!mounted) return;
+      unawaited(_rebuildEntriesIndexAsync());
+      _entriesIndexFlushImmediately = false;
+    });
+  }
+
+  String _entriesIndexFingerprint() =>
+      '${_appointmentsFingerprint(_appointments)}|${_calendarEventsFingerprint(_calendarEvents)}|${_calendarEventsFingerprint(_liveHearingRows)}|${_calendarEventsFingerprint(_notaryCalendarRows)}';
+
+  Future<void> _rebuildEntriesIndexAsync() async {
+    final gen = ++_entriesIndexGen;
+    final fp = _entriesIndexFingerprint();
+    if (fp == _lastEntriesIndexFingerprint && _entriesByDayKey.isNotEmpty) {
+      return;
+    }
+
+    final appointments = List<AppointmentModel>.from(_appointments);
+    final calendarEvents = _gridCalendarEvents();
+
+    await Future<void>.delayed(Duration.zero);
+    if (!mounted || gen != _entriesIndexGen) return;
+
+    final buckets = <String, List<_AttorneyCalendarEntry>>{};
+    final hearingIdsByDay = <String, Set<String>>{};
+
+    for (final apt in appointments) {
+      if (apt.appointmentType == 'hearing_court') continue;
+      if (!apt.appearsOnAttorneyCalendar) continue;
+      final d = apt.appointmentDateTime;
+      final key = _dayKey(DateTime(d.year, d.month, d.day));
+      buckets
+          .putIfAbsent(key, () => [])
+          .add(_AttorneyCalendarEntry.fromAppointment(apt));
+    }
+
+    void addHearing(Map<String, dynamic> ev) {
+      final type = (ev['eventType'] as String?)?.trim().toLowerCase() ?? '';
+      if (type == 'appointment') return;
+      final eventDate = _dateTimeFromField(ev['eventDate']);
+      if (eventDate == null) return;
+      final day = DateTime(eventDate.year, eventDate.month, eventDate.day);
+      final key = _dayKey(day);
+      final hid = (ev['hearingDocId'] as String?)?.trim() ?? '';
+      if (hid.isNotEmpty) {
+        final seen = hearingIdsByDay.putIfAbsent(key, () => <String>{});
+        if (seen.contains(hid)) return;
+        seen.add(hid);
+      }
+      buckets
+          .putIfAbsent(key, () => [])
+          .add(_AttorneyCalendarEntry.fromHearing(ev));
+    }
+
+    for (var i = 0; i < calendarEvents.length; i++) {
+      if (i > 0 && i % 50 == 0) {
+        await Future<void>.delayed(Duration.zero);
+        if (!mounted) return;
+      }
+      addHearing(calendarEvents[i]);
+    }
+
+    if (!mounted || gen != _entriesIndexGen) return;
+
+    for (final key in buckets.keys.toList()) {
+      buckets[key] = _dedupeCalendarEntriesForDay(buckets[key]!);
+    }
+
+    if (!mounted || gen != _entriesIndexGen) return;
+    _lastEntriesIndexFingerprint = fp;
+    _entriesByDayKey = buckets;
+    _entriesRevision++;
+    _entriesRevisionNotifier.value++;
+  }
+
+  void _rebuildEntriesIndex() {
+    unawaited(_rebuildEntriesIndexAsync());
+  }
+
+  void _scheduleDeferredClientNamesLoad() {
+    _clientNamesDebounce?.cancel();
+    _clientNamesDebounce = Timer(
+      const Duration(milliseconds: CalendarPerf.clientNamesLoadDeferMs),
+      () {
+        if (!mounted || _appointments.isEmpty) return;
+        unawaited(_loadClientNames(_appointments));
+      },
+    );
   }
 
   @override
   void didUpdateWidget(AppointmentCalendarView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.sharedAppointmentsStream != widget.sharedAppointmentsStream ||
-        oldWidget.initialAppointments != widget.initialAppointments) {
+        oldWidget.attorneyId != widget.attorneyId) {
       final seed = widget.initialAppointments;
       if (seed != null && seed.isNotEmpty) {
         _appointments = List<AppointmentModel>.from(seed);
       }
+      _hydrateCalendarEventsFromCache();
+      _hydrateLiveHearingsFromCache();
       _bindAppointments();
+      _subscribeCalendarEvents();
+      _subscribeLiveHearings();
+      _subscribeNotaryCalendar();
     }
   }
 
   @override
   void dispose() {
-    _calendarUiDebounce?.cancel();
+    _dataUiDebounce?.cancel();
+    _entriesIndexDebounce?.cancel();
+    _clientNamesDebounce?.cancel();
+    _armFollowTimer?.cancel();
+    _hearingNavRevision.dispose();
+    _entriesRevisionNotifier.dispose();
+    _viewDateNotifier.dispose();
     _calendarEventsSub?.cancel();
+    _liveHearingsSub?.cancel();
+    _notaryCalendarSub?.cancel();
     if (_ownsAppointmentsStream) {
       _appointmentsSub?.cancel();
-    }
-    final aid = _attachedAttorneyId;
-    if (aid != null) {
-      HearingCalendarSyncService.instance.detachForAttorney(aid);
     }
     super.dispose();
   }
 
-  void _scheduleCalendarEventsUi(List<Map<String, dynamic>> events) {
-    _calendarUiDebounce?.cancel();
-    _calendarUiDebounce = Timer(const Duration(milliseconds: 280), () {
+  void _subscribeNotaryCalendar() {
+    final aid = _calendarAttorneyId();
+    if (aid.isEmpty) {
+      _notaryCalendarReady = true;
+      return;
+    }
+    _notaryCalendarSub?.cancel();
+    _notaryCalendarSub = _notaryService.watchNotaryCalendarRows(aid).listen(
+      (rows) {
+        if (!mounted) return;
+        _notaryCalendarRows = rows;
+        _notaryCalendarReady = true;
+        _scheduleEntriesIndexRebuild(immediate: true);
+        _hearingNavRevision.value++;
+        _maybeRevealHearingMonth();
+      },
+      onError: (_) {
+        if (!mounted) return;
+        _notaryCalendarReady = true;
+        _maybeRevealHearingMonth();
+      },
+    );
+  }
+
+  void _subscribeLiveHearings() {
+    final aid = HearingCalendarSyncService.overlayKey(_calendarAttorneyId());
+
+    _liveHearingsSub?.cancel();
+    _liveHearingsSub = _staffService.watchLiveHearingsForGrid(aid).listen(
+      (rows) {
+        if (rows.isNotEmpty) {
+          _applyAutomatedHearingRows(rows);
+          return;
+        }
+        _pendingLiveHearings = rows;
+        _scheduleDataUiFlush();
+      },
+      onError: (_) {},
+    );
+  }
+
+  String _calendarAttorneyId() {
+    final override = widget.attorneyId?.trim() ?? '';
+    if (override.isNotEmpty) return override;
+    final fromService = _authService.currentUser?.uid.trim() ?? '';
+    if (fromService.isNotEmpty) return fromService;
+    return FirebaseAuth.instance.currentUser?.uid.trim() ?? '';
+  }
+
+  void _handleAddPressed() {
+    final custom = widget.onAddPressed;
+    if (custom != null) {
+      custom();
+      return;
+    }
+    unawaited(_openNewAppointment());
+  }
+
+  Future<AppointmentModel?> _handleAddForDate(DateTime day) async {
+    final custom = widget.onAddForDate;
+    if (custom != null) {
+      await custom(day);
+      return null;
+    }
+    return _createAppointmentForDate(day);
+  }
+
+  Map<String, dynamic>? _rowFromHearingData(
+    String docId,
+    Map<String, dynamic> data,
+  ) {
+    try {
+      return _rowFromHearingDataImpl(docId, data);
+    } catch (e) {
+      debugPrint('[Calendar] skip hearing $docId: $e');
+      return null;
+    }
+  }
+
+  Map<String, dynamic>? _rowFromHearingDataImpl(
+    String docId,
+    Map<String, dynamic> data,
+  ) {
+    final aid = _calendarAttorneyId();
+    final mapped = CalendarLiveHearingMap.fromHearingDoc(
+      data,
+      docId,
+      aid,
+      fallbackToCreatedAt: true,
+    );
+    if (mapped != null) return mapped;
+    final caseNo = HearingCalendarFields.asDisplayString(data['caseNo']).isNotEmpty
+        ? HearingCalendarFields.asDisplayString(data['caseNo'])
+        : HearingCalendarFields.asDisplayString(data['caseNumber']);
+    if (!HearingNotificationFanoutService.isDisplayableHearingRow(data) &&
+        caseNo.isEmpty &&
+        (data['hearingDate'] == null)) {
+      return null;
+    }
+    final when = CalendarLiveHearingMap.parseHearingWhen(data) ??
+        (data['createdAt'] is Timestamp
+            ? (data['createdAt'] as Timestamp).toDate()
+            : data['updatedAt'] is Timestamp
+                ? (data['updatedAt'] as Timestamp).toDate()
+                : DateTime.now());
+    return CalendarLiveHearingMap.gridRow(
+      docId: docId,
+      attorneyId: aid,
+      when: when,
+      caseNo: caseNo,
+      clientName: HearingCalendarFields.asDisplayString(data['clientName']),
+      caseTitle: HearingCalendarFields.asDisplayString(data['caseTitle']),
+      courtBranch: HearingCalendarFields.asDisplayString(data['courtBranch']),
+      hearingTime: HearingCalendarFields.asDisplayString(data['hearingTime']),
+    );
+  }
+
+  /// Newest hearing/order rows — attorneyUid is not required.
+  Future<List<Map<String, dynamic>>> _fetchHearingsForCalendar() async {
+    final aid = HearingCalendarSyncService.overlayKey(_calendarAttorneyId());
+    try {
+      final query = _firestore
+          .collection('hearings')
+          .orderBy('createdAt', descending: true)
+          .limit(150);
+      QuerySnapshot<Map<String, dynamic>> snap;
+      try {
+        snap = await FirestoreQueryGet.hearings(query);
+      } catch (e) {
+        debugPrint('[Calendar] hearings fetch failed: $e');
+        return const [];
+      }
+      final rows = <Map<String, dynamic>>[];
+      for (final doc in snap.docs) {
+        final row = _rowFromHearingData(doc.id, doc.data());
+        if (row != null) rows.add(row);
+      }
+      return rows;
+    } catch (e) {
+      debugPrint('[Calendar] hearings fetch failed: $e');
+      return const [];
+    }
+  }
+
+  /// Fallback when the live overlay missed n8n / court-import hearings.
+  Future<void> _loadAutomatedHearings() async {
+    if (!mounted) return;
+    try {
+      var rows = await HearingCalendarSyncService.instance
+          .fetchAutomatedCalendarRows(
+            HearingCalendarSyncService.overlayKey(_calendarAttorneyId()),
+          );
+      final inbox = await HearingCalendarSyncService.instance
+          .fetchRowsFromHearingNotifications(
+            HearingCalendarSyncService.overlayKey(_calendarAttorneyId()),
+          );
+      rows = CalendarLiveHearingMap.mergeHearingRows(rows, inbox);
+      if (rows.isEmpty) {
+        rows = await _fetchHearingsForCalendar();
+      }
+      if (!mounted || rows.isEmpty) return;
+      _applyAutomatedHearingRows(rows);
+    } catch (e) {
+      debugPrint('[Calendar] automated hearings failed: $e');
+    }
+  }
+
+  void _applyAutomatedHearingRows(List<Map<String, dynamic>> rows) {
+    if (!mounted || rows.isEmpty) return;
+    final merged = CalendarLiveHearingMap.mergeHearingRows(
+      _liveHearingRows,
+      rows,
+    );
+    final fp = CalendarPerf.eventsFingerprint(merged);
+    _jumpToInboxHearingMonth(rows);
+    if (fp == _lastLiveHearingsFingerprint && _liveHearingRows.isNotEmpty) {
+      return;
+    }
+    _liveHearingRows = merged;
+    _lastLiveHearingsFingerprint = fp;
+    _lastEntriesIndexFingerprint = '';
+    _rebuildHearingNavCache();
+    _hearingNavRevision.value++;
+    if (!_followNewHearingMonth(_liveHearingRows)) {
+      _maybeRevealHearingMonth();
+    }
+    unawaited(_rebuildEntriesIndexAsync());
+  }
+
+  void _jumpToInboxHearingMonth(List<Map<String, dynamic>> rows) {
+    DateTime? when;
+    for (final r in rows) {
+      if (r['fromInbox'] != true) continue;
+      final d = _dateTimeFromField(r['eventDate']);
+      if (d == null) continue;
+      if (when == null || d.isAfter(when)) when = d;
+    }
+    if (when == null) return;
+    final view = _viewDateNotifier.value;
+    if (when.year == view.year && when.month == view.month) return;
+    _viewDateNotifier.value = DateTime(when.year, when.month);
+  }
+
+  void _seedSeenHearings(List<Map<String, dynamic>> rows) {
+    CalendarHearingNav.collectHearingIds(rows, _seenHearingDocIds);
+  }
+
+  void _scheduleFollowArm() {
+    if (_followNewHearings) return;
+    _armFollowTimer?.cancel();
+    _armFollowTimer = Timer(const Duration(seconds: 2), () {
       if (!mounted) return;
-      setState(() {
-        _calendarEvents = _mergeCalendarEventsFromServer(events);
-        _maybeFocusFirstHearingMonth();
-      });
+      _followNewHearings = true;
     });
+  }
+
+  /// Jumps to a hearing that arrived after the calendar finished its first load.
+  bool _followNewHearingMonth(List<Map<String, dynamic>> rows) {
+    if (!_followNewHearings) {
+      _seedSeenHearings(rows);
+      _scheduleFollowArm();
+      return false;
+    }
+    final when = CalendarHearingNav.newestUnseenHearingDate(
+      rows,
+      _seenHearingDocIds,
+      parseDate: _dateTimeFromField,
+    );
+    if (when == null) return false;
+    final view = _viewDateNotifier.value;
+    if (when.year == view.year && when.month == view.month) return true;
+    _viewDateNotifier.value = DateTime(when.year, when.month);
+    return true;
+  }
+
+  bool _eventDateInView(dynamic raw, DateTime view) {
+    final d = raw is DateTime ? raw : _dateTimeFromField(raw);
+    return d != null && d.year == view.year && d.month == view.month;
+  }
+
+  /// Do not jump away from a month that already has hearings or notary.
+  void _maybeRevealHearingMonth() {
+    if (_didRevealHearingMonth || !_notaryCalendarReady) return;
+    if (_liveHearingRows.isEmpty && _notaryCalendarRows.isEmpty) return;
+    final view = _viewDateNotifier.value;
+    final inView = _liveHearingRows.any(
+          (ev) => _eventDateInView(ev['eventDate'], view),
+        ) ||
+        _notaryCalendarRows.any(
+          (ev) => _eventDateInView(ev['eventDate'], view),
+        );
+    if (inView) {
+      _didRevealHearingMonth = true;
+      return;
+    }
+    DateTime? pick;
+    void consider(dynamic raw) {
+      final d = raw is DateTime ? raw : _dateTimeFromField(raw);
+      if (d == null) return;
+      if (pick == null || d.isAfter(pick!)) pick = d;
+    }
+
+    for (final ev in _liveHearingRows) {
+      consider(ev['eventDate']);
+    }
+    for (final ev in _notaryCalendarRows) {
+      consider(ev['eventDate']);
+    }
+    final jumpTo = pick;
+    if (jumpTo == null) return;
+    _didRevealHearingMonth = true;
+    _viewDateNotifier.value = DateTime(jumpTo.year, jumpTo.month);
+  }
+
+  void _scheduleCalendarEventsUi(List<Map<String, dynamic>> events) {
+    _pendingCalendarEvents = events;
+    _scheduleDataUiFlush();
+  }
+
+  String _calendarEventsFingerprint(List<Map<String, dynamic>> events) =>
+      CalendarPerf.eventsFingerprint(events);
+
+  String _appointmentsFingerprint(List<AppointmentModel> apps) =>
+      CalendarPerf.appointmentsFingerprint(apps);
+
+  void _scheduleDataUiFlush() {
+    _dataUiDebounce?.cancel();
+    final ms = _flushDataImmediately
+        ? CalendarPerf.openingCoalesceMs
+        : CalendarPerf.dataDebounceMs;
+    _dataUiDebounce = Timer(Duration(milliseconds: ms), () {
+      if (!mounted) return;
+      _applyPendingDataUi();
+      if (_flushDataImmediately) _flushDataImmediately = false;
+    });
+  }
+
+  void _applyPendingDataUi() {
+    if (!mounted) return;
+    final pendingCalendar = _pendingCalendarEvents;
+    final pendingAppointments = _pendingAppointments;
+    _pendingCalendarEvents = null;
+    _pendingAppointments = null;
+
+    var calendarChanged = false;
+    var appointmentsChanged = false;
+    var hearingsChanged = false;
+
+    if (_pendingLiveHearings != null) {
+      final rows = _pendingLiveHearings!;
+      _pendingLiveHearings = null;
+      final merged = rows.isEmpty
+          ? _liveHearingRows
+          : CalendarLiveHearingMap.mergeHearingRows(_liveHearingRows, rows);
+      final fp = CalendarPerf.eventsFingerprint(merged);
+      if (fp != _lastLiveHearingsFingerprint) {
+        _liveHearingRows = merged;
+        _lastLiveHearingsFingerprint = fp;
+        hearingsChanged = true;
+        _followNewHearingMonth(_liveHearingRows);
+      }
+    }
+
+    if (pendingCalendar != null) {
+      final fp = _calendarEventsFingerprint(pendingCalendar);
+      if (fp != _lastCalendarFingerprint) {
+        _calendarEvents = _mergeCalendarEventsFromServer(pendingCalendar);
+        final aid = _calendarAttorneyId();
+        if (aid.isNotEmpty) {
+          _calendarEventsCacheByAttorney[aid] = List<Map<String, dynamic>>.from(
+            _calendarEvents,
+          );
+        }
+        _lastCalendarFingerprint = fp;
+        calendarChanged = true;
+        _followNewHearingMonth(_calendarEvents);
+      }
+    }
+
+    void applyAppointmentsNow() {
+      if (pendingAppointments == null) return;
+      final fp = _appointmentsFingerprint(pendingAppointments);
+      if (fp == _lastAppointmentsFingerprint) return;
+      _appointments = pendingAppointments;
+      _lastAppointmentsFingerprint = fp;
+      appointmentsChanged = true;
+      _scheduleDeferredClientNamesLoad();
+      final uid = _calendarAttorneyId();
+      if (uid.isNotEmpty) {
+        unawaited(
+          _appointmentService.syncOccupiedTimeSlotsIfNeeded(uid, _appointments),
+        );
+      }
+    }
+
+    void commitUi() {
+      if (!calendarChanged && !appointmentsChanged && !hearingsChanged) {
+        return;
+      }
+      _rebuildHearingNavCache();
+      _scheduleEntriesIndexRebuild();
+      _hearingNavRevision.value++;
+    }
+
+    if (pendingCalendar != null && pendingAppointments != null) {
+      Future.microtask(() {
+        applyAppointmentsNow();
+        if (!appointmentsChanged || !mounted) return;
+        _rebuildHearingNavCache();
+        _scheduleEntriesIndexRebuild();
+        _hearingNavRevision.value++;
+      });
+      if (calendarChanged) commitUi();
+      return;
+    }
+
+    applyAppointmentsNow();
+    commitUi();
+  }
+
+  String _dayKey(DateTime day) => '${day.year}-${day.month}-${day.day}';
+
+  void _rebuildHearingNavCache() {
+    _cachedHearingNavEvents = _gridCalendarEvents()
+        .where(CalendarHearingNav.isHearingRow)
+        .toList();
   }
 
   /// Keeps Add Appointment rows visible until Firestore stream includes them.
@@ -263,57 +866,48 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
   }
 
   void _subscribeCalendarEvents() {
-    final user = _authService.currentUser;
-    if (user == null) return;
+    final aid = _calendarAttorneyId();
+    if (aid.isEmpty) return;
+    final cached = _calendarEventsCacheByAttorney[aid];
+    if (cached != null && cached.isNotEmpty) {
+      _calendarEvents = List<Map<String, dynamic>>.from(cached);
+      _lastCalendarFingerprint = _calendarEventsFingerprint(_calendarEvents);
+      _rebuildHearingNavCache();
+      _scheduleEntriesIndexRebuild();
+    }
     _calendarEventsSub?.cancel();
-    _calendarEventsSub = _staffService.getCalendarEvents(user.uid).listen(
-      _scheduleCalendarEventsUi,
-      onError: (_) {},
+    _calendarEventsSub = _staffService
+        .getCalendarEvents(aid)
+        .listen(_scheduleCalendarEventsUi, onError: (_) {});
+  }
+
+  List<Map<String, dynamic>> _hearingSiblingsForCase(String caseNo) {
+    final cn = caseNo.trim();
+    if (cn.isEmpty) return const [];
+    return _calendarEvents
+        .where(
+          (o) => HearingCalendarFields.asDisplayString(o['caseNo']) == cn,
+        )
+        .toList();
+  }
+
+  /// Hearing rows from `calendar_events` for the cross-month navigation banner.
+  List<Map<String, dynamic>> _allHearingNavEvents() =>
+      _effectiveHearingRows.isNotEmpty
+          ? _effectiveHearingRows
+          : _cachedHearingNavEvents;
+
+  /// Months with Firestore `hearings` not shown in the current calendar view.
+  List<DateTime> _hearingMonthsOutsideView(DateTime viewDate) {
+    return CalendarHearingNav.monthsOutsideView(
+      hearingRows: [..._allHearingNavEvents(), ..._notaryCalendarRows],
+      viewDate: viewDate,
+      parseDate: _dateTimeFromField,
     );
   }
 
-  /// Automated hearing entries from the live overlay plus the persisted synced
-  /// `calendar_events` (deduped by hearingDocId) so navigation stays resilient.
-  List<Map<String, dynamic>> _allHearingNavEvents() {
-    final out = <Map<String, dynamic>>[];
-    final seenHearingIds = <String>{};
-    void add(Map<String, dynamic> ev) {
-      final hid = (ev['hearingDocId'] as String?)?.trim() ?? '';
-      if (hid.isNotEmpty && !seenHearingIds.add(hid)) return;
-      out.add(ev);
-    }
-
-    for (final ev in _hearingOverlay) {
-      add(ev);
-    }
-    for (final ev in _calendarEvents) {
-      if (isFirestoreSyncedHearingCalendarRow(ev)) add(ev);
-    }
-    return out;
-  }
-
-  /// Months with Firestore `hearings` not shown in the current calendar view.
-  List<DateTime> _hearingMonthsOutsideView() {
-    final seen = <String>{};
-    final out = <DateTime>[];
-    for (final ev in _allHearingNavEvents()) {
-      final d = _dateTimeFromField(ev['eventDate']);
-      if (d == null) continue;
-      if (d.year == _viewDate.year && d.month == _viewDate.month) continue;
-      final key = '${d.year}-${d.month}';
-      if (seen.add(key)) {
-        out.add(DateTime(d.year, d.month));
-      }
-    }
-    out.sort((a, b) {
-      final c = a.year.compareTo(b.year);
-      return c != 0 ? c : a.month.compareTo(b.month);
-    });
-    return out;
-  }
-
-  Widget _buildHearingsOutsideMonthBanner() {
-    final months = _hearingMonthsOutsideView();
+  Widget _buildHearingsOutsideMonthBanner(DateTime viewDate) {
+    final months = _hearingMonthsOutsideView(viewDate);
     if (months.isEmpty) return const SizedBox.shrink();
     return Material(
       color: calendarGold.withValues(alpha: 0.35),
@@ -326,7 +920,7 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
           children: [
             const Icon(Icons.event_note, size: 18, color: Colors.black87),
             Text(
-              'Scheduled court hearings on file appear in another month — View:',
+              'Scheduled dates on file appear in another month — View:',
               style: TextStyle(
                 fontSize: 12,
                 fontWeight: FontWeight.w600,
@@ -342,9 +936,7 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
                   tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 ),
                 onPressed: () {
-                  setState(() {
-                    _viewDate = DateTime(m.year, m.month);
-                  });
+                  _viewDateNotifier.value = DateTime(m.year, m.month);
                 },
                 child: Text(
                   DateFormat('MMMM yyyy').format(m),
@@ -366,77 +958,9 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
 
   DateTime _calendarDay(DateTime d) => DateTime(d.year, d.month, d.day);
 
-  /// If Firestore hearings are in another month (e.g. April), open that month once.
-  void _maybeFocusFirstHearingMonth() {
-    if (_didAutoFocusHearingMonth) return;
-    final dates = <DateTime>[];
-    for (final row in _allHearingNavEvents()) {
-      final d = _dateTimeFromField(row['eventDate']);
-      if (d != null) dates.add(d);
-    }
-    if (dates.isEmpty) return;
-    dates.sort();
-    final hasInViewMonth = dates.any(
-      (d) => d.year == _viewDate.year && d.month == _viewDate.month,
-    );
-    if (hasInViewMonth) return;
-    _didAutoFocusHearingMonth = true;
-    // Prefer the nearest upcoming hearing month; fall back to the earliest.
-    final now = DateTime.now();
-    final monthStart = DateTime(now.year, now.month);
-    final upcoming = dates.where((d) => !d.isBefore(monthStart)).toList();
-    final target = upcoming.isNotEmpty ? upcoming.first : dates.first;
-    _viewDate = DateTime(target.year, target.month);
-  }
-
   List<_AttorneyCalendarEntry> _getEntriesForDate(DateTime date) {
     final day = DateTime(date.year, date.month, date.day);
-    final out = <_AttorneyCalendarEntry>[];
-    final syncedHearingIds = <String>{};
-    final appointmentIds = <String>{};
-
-    for (final apt in _appointments) {
-      if (apt.appointmentType == 'hearing_court') {
-        continue; // shown as manual calendar hearing after mirror
-      }
-      final aptDate = DateTime(
-        apt.appointmentDateTime.year,
-        apt.appointmentDateTime.month,
-        apt.appointmentDateTime.day,
-      );
-      if (aptDate == day) {
-        out.add(_AttorneyCalendarEntry.fromAppointment(apt));
-        if (apt.id.isNotEmpty) appointmentIds.add(apt.id);
-      }
-    }
-
-    void addHearing(Map<String, dynamic> ev) {
-      final eventDate = _dateTimeFromField(ev['eventDate']);
-      if (eventDate == null) return;
-      final evDay = DateTime(eventDate.year, eventDate.month, eventDate.day);
-      if (evDay != day) return;
-      final hid = (ev['hearingDocId'] as String?)?.trim() ?? '';
-      if (hid.isNotEmpty) {
-        if (syncedHearingIds.contains(hid)) return;
-        syncedHearingIds.add(hid);
-      }
-      out.add(_AttorneyCalendarEntry.fromHearing(ev));
-    }
-
-    // Overlay uses live `hearingDate` and is added first, so it wins on dedup.
-    for (final ev in _hearingOverlay) {
-      addHearing(ev);
-    }
-    // Include persisted `calendar_events` (incl. synced hearings) as a resilient
-    // fallback: addHearing() dedups by hearingDocId, so the live overlay is still
-    // preferred when present, but automated hearings stay visible even if the
-    // live `hearings` read fails or returns empty.
-    for (final ev in _calendarEvents) {
-      addHearing(ev);
-    }
-
-    out.sort((a, b) => a.startTime.compareTo(b.startTime));
-    return _dedupeCalendarEntriesForDay(out);
+    return _entriesByDayKey[_dayKey(day)] ?? const [];
   }
 
   /// Same case/hearing from overlay + calendar_events can appear twice.
@@ -451,22 +975,35 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
         continue;
       }
       final ev = e.hearingEvent!;
-      final hid = (ev['hearingDocId'] as String?)?.trim() ?? '';
-      final cn = (ev['caseNo'] as String?)?.trim().toLowerCase() ?? '';
+      if (NotaryService.isNotaryCalendarRow(ev)) {
+        final nid = (ev['notaryRequestId'] as String?)?.trim() ??
+            (ev['id'] as String?)?.trim() ??
+            '';
+        byKey[nid.isNotEmpty ? 'n:$nid' : 'n:${e.hashCode}'] = e;
+        continue;
+      }
+      final hid = HearingCalendarFields.asDisplayString(ev['hearingDocId']);
+      final cn = HearingCalendarFields.asDisplayString(ev['caseNo'])
+          .toLowerCase()
+          .replaceAll(RegExp(r'[^a-z0-9]'), '');
       final title = e.hearingTitle().trim().toLowerCase();
       final d = e.startTime;
       final dayKey = '${d.year}${d.month}${d.day}';
+      // Keep each hearing document. Same-case OCR copies still show if they
+      // are separate Firestore rows (October 28 had many of these).
       final key = hid.isNotEmpty
           ? 'h:$hid'
-          : 'c:${cn.isNotEmpty ? cn : title}:$dayKey';
+          : (cn.isNotEmpty ? 'case:$cn:$dayKey' : 'c:$title:$dayKey');
       final existing = byKey[key];
       if (existing == null) {
         byKey[key] = e;
         continue;
       }
-      final existingHid =
-          (existing.hearingEvent?['hearingDocId'] as String?)?.trim() ?? '';
-      if (existingHid.isEmpty && hid.isNotEmpty) {
+      final prevTitle =
+          HearingCalendarFields.asDisplayString(existing.hearingEvent?['caseTitle']);
+      final nextTitle =
+          HearingCalendarFields.asDisplayString(ev['caseTitle']);
+      if (nextTitle.length > prevTitle.length) {
         byKey[key] = e;
       }
     }
@@ -486,25 +1023,23 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       _ownsAppointmentsStream = false;
       _appointmentsSub = shared.listen((appointments) {
         if (!mounted) return;
-        final merged = _mergeAppointmentsFromStream(appointments);
-        setState(() => _appointments = merged);
-        _loadClientNames(merged);
+        _pendingAppointments = _mergeAppointmentsFromStream(appointments);
+        _scheduleDataUiFlush();
       });
       return;
     }
 
-    final user = _authService.currentUser;
-    if (user == null) return;
+    final aid = _calendarAttorneyId();
+    if (aid.isEmpty) return;
 
     _ownsAppointmentsStream = true;
     _appointmentsSub = _appointmentService
-        .getAttorneyAppointments(user.uid)
+        .getAttorneyAppointments(aid)
         .listen((appointments) {
-      if (!mounted) return;
-      final merged = _mergeAppointmentsFromStream(appointments);
-      setState(() => _appointments = merged);
-      _loadClientNames(merged);
-    });
+          if (!mounted) return;
+          _pendingAppointments = _mergeAppointmentsFromStream(appointments);
+          _scheduleDataUiFlush();
+        });
   }
 
   /// Keeps just-created rows visible until Firestore snapshot catches up.
@@ -597,90 +1132,115 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       return; // All names already cached
     }
 
-    // Fetch client names in parallel for better performance
-    final futures = uncachedClientIds.map((clientId) async {
-      try {
-        final clientDoc = await _firestore
-            .collection('users')
-            .doc(clientId)
-            .get();
+    final toFetch = uncachedClientIds.take(12).toList();
+    final results = <Map<String, dynamic>?>[];
+    for (var i = 0; i < toFetch.length; i += 4) {
+      final chunk = toFetch.sublist(
+        i,
+        i + 4 > toFetch.length ? toFetch.length : i + 4,
+      );
+      final futures = chunk.map((clientId) async {
+        try {
+          final clientDoc = await _firestore
+              .collection('users')
+              .doc(clientId)
+              .get();
 
-        if (clientDoc.exists) {
-          final clientData = clientDoc.data()!;
-          // Try multiple possible field names for full name
-          // Priority: fullName > full_name > name
-          final fullName =
-              clientData['fullName'] as String? ??
-              clientData['full_name'] as String? ??
-              '';
-          final name = clientData['name'] as String? ?? '';
-          final email = clientData['email'] as String? ?? '';
+          if (clientDoc.exists) {
+            final clientData = clientDoc.data()!;
+            final fullName =
+                clientData['fullName'] as String? ??
+                clientData['full_name'] as String? ??
+                '';
+            final name = clientData['name'] as String? ?? '';
+            final email = clientData['email'] as String? ?? '';
 
-          // Build display name: prefer fullName, fallback to name
-          // Never use email - always get from profile
-          String displayName = '';
-          if (fullName.isNotEmpty && fullName.trim().isNotEmpty) {
-            displayName = fullName.trim();
-          } else if (name.isNotEmpty && name.trim().isNotEmpty) {
-            displayName = name.trim();
+            String displayName = '';
+            if (fullName.isNotEmpty && fullName.trim().isNotEmpty) {
+              displayName = fullName.trim();
+            } else if (name.isNotEmpty && name.trim().isNotEmpty) {
+              displayName = name.trim();
+            }
+
+            return {
+              'clientId': clientId,
+              'displayName': displayName.isNotEmpty && !displayName.contains('@')
+                  ? displayName
+                  : '',
+              'email': email.isNotEmpty ? email : '',
+            };
           }
-
-          // Return both name and email
-          return {
-            'clientId': clientId,
-            'displayName': displayName.isNotEmpty && !displayName.contains('@')
-                ? displayName
-                : '',
-            'email': email.isNotEmpty ? email : '',
-          };
+        } catch (e) {
+          if (kDebugMode) {
+            debugPrint('Error loading client name for $clientId: $e');
+          }
         }
-      } catch (e) {
-        if (kDebugMode) debugPrint('Error loading client name for $clientId: $e');
-        // Return empty for failed requests
-      }
-      return null;
-    }).toList();
+        return null;
+      }).toList();
+      results.addAll(await Future.wait(futures));
+      await Future<void>.delayed(Duration.zero);
+    }
 
-    // Wait for all requests to complete
-    final results = await Future.wait(futures);
-
-    // Update cache with all results at once
+    // Update cache silently — names are only needed in detail dialogs, not the grid.
     if (mounted) {
       try {
-        setState(() {
-          final nameCache = _getClientNameCache();
-          final emailCache = _getClientEmailCache();
-          for (final result in results) {
-            if (result != null) {
-              final clientId = result['clientId'];
-              if (clientId != null) {
-                // Cache name if available
-                final displayName = result['displayName'];
-                if (displayName != null) {
-                  // Only cache valid names (not emails)
-                  final displayNameStr = displayName.toString();
-                  if (displayNameStr.isNotEmpty &&
-                      !_isEmailAddress(displayNameStr)) {
-                    nameCache[clientId.toString()] = displayNameStr;
-                  }
+        final nameCache = _getClientNameCache();
+        final emailCache = _getClientEmailCache();
+        for (final result in results) {
+          if (result != null) {
+            final clientId = result['clientId'];
+            if (clientId != null) {
+              final displayName = result['displayName'];
+              if (displayName != null) {
+                final displayNameStr = displayName.toString();
+                if (displayNameStr.isNotEmpty &&
+                    !_isEmailAddress(displayNameStr)) {
+                  nameCache[clientId.toString()] = displayNameStr;
                 }
-
-                // Cache email if available
-                final email = result['email'];
-                if (email != null) {
-                  final emailStr = email.toString();
-                  if (emailStr.isNotEmpty) {
-                    emailCache[clientId.toString()] = emailStr;
-                  }
+              }
+              final email = result['email'];
+              if (email != null) {
+                final emailStr = email.toString();
+                if (emailStr.isNotEmpty) {
+                  emailCache[clientId.toString()] = emailStr;
                 }
               }
             }
           }
-        });
+        }
       } catch (e) {
         if (kDebugMode) debugPrint('Error updating client caches: $e');
       }
     }
+  }
+
+  /// Grid-safe client label — never triggers Firestore from a cell build.
+  String _clientLabelForGrid(AppointmentModel appointment) {
+    if (appointment.clientId.isEmpty) {
+      final storedName = appointment.clientName;
+      if (storedName.isNotEmpty && !_isEmailAddress(storedName)) {
+        return storedName;
+      }
+      return 'Client';
+    }
+
+    try {
+      final cachedName = _getClientNameCache()[appointment.clientId];
+      if (cachedName != null &&
+          cachedName.isNotEmpty &&
+          !_isEmailAddress(cachedName)) {
+        return cachedName;
+      }
+    } catch (_) {}
+
+    final storedName = appointment.clientName;
+    if (storedName.isNotEmpty &&
+        !_isEmailAddress(storedName) &&
+        storedName.length > 2) {
+      return storedName;
+    }
+
+    return 'Client';
   }
 
   /// Get the full client name from profile, never show email
@@ -737,6 +1297,10 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     if (entry.appointment != null) {
       return _getAppointmentColor(entry.appointment!);
     }
+    if (entry.hearingEvent != null &&
+        NotaryService.isNotaryCalendarRow(entry.hearingEvent!)) {
+      return const Color(0xFF00897B);
+    }
     return hearingEventColor;
   }
 
@@ -766,15 +1330,14 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       );
       _appointments = rest;
     });
-    unawaited(_loadClientNames([apt]));
+    _scheduleEntriesIndexRebuild(immediate: true);
   }
 
   /// Best-effort Firestore refresh after create (calendar already has [apt]).
   Future<void> _refreshAppointmentFromFirestore(AppointmentModel apt) async {
     if (apt.id.isEmpty) return;
     try {
-      final doc =
-          await _firestore.collection('appointments').doc(apt.id).get();
+      final doc = await _firestore.collection('appointments').doc(apt.id).get();
       if (!doc.exists || !mounted) return;
       _mergeAppointmentIntoState(AppointmentModel.fromFirestore(doc));
     } catch (e) {
@@ -783,19 +1346,19 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
   }
 
   Future<AppointmentModel?> _fetchLatestAppointmentForDay(DateTime day) async {
-    final user = _authService.currentUser;
-    if (user == null) return null;
+    final aid = _calendarAttorneyId();
+    if (aid.isEmpty) return null;
     try {
       final snap = await _firestore
           .collection('appointments')
-          .where('attorneyId', isEqualTo: user.uid)
+          .where('attorneyId', isEqualTo: aid)
           .get();
       AppointmentModel? best;
       for (final doc in snap.docs) {
         final apt = AppointmentModel.fromFirestore(doc);
-        if (_calendarDay(apt.appointmentDateTime) != _calendarDay(day)) continue;
-        if (best == null ||
-            apt.createdAt.isAfter(best.createdAt)) {
+        if (_calendarDay(apt.appointmentDateTime) != _calendarDay(day))
+          continue;
+        if (best == null || apt.createdAt.isAfter(best.createdAt)) {
           best = apt;
         }
       }
@@ -887,20 +1450,23 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       );
       if (!exists) {
         _calendarEvents = [..._calendarEvents, manualRow];
+        _scheduleEntriesIndexRebuild(immediate: true);
       }
     });
   }
 
   /// Manual court hearings from Add Appointment also show in the day list.
   Future<void> _mirrorHearingCourtToCalendarEvent(AppointmentModel apt) async {
-    final attorneyId = apt.attorneyId ?? _authService.currentUser?.uid;
+    final attorneyId = apt.attorneyId ?? _calendarAttorneyId();
     if (attorneyId == null || attorneyId.isEmpty) return;
 
     String? caseNo;
     if (apt.caseId != null && apt.caseId!.trim().isNotEmpty) {
       try {
-        final caseSnap =
-            await _firestore.collection('cases').doc(apt.caseId).get();
+        final caseSnap = await _firestore
+            .collection('cases')
+            .doc(apt.caseId)
+            .get();
         caseNo = (caseSnap.data()?['caseNo'] as String?)?.trim();
       } catch (_) {
         /* optional */
@@ -954,6 +1520,7 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
             ),
             persisted,
           ];
+          _scheduleEntriesIndexRebuild(immediate: true);
         });
       }
     } else if (kDebugMode) {
@@ -1017,19 +1584,17 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
   Future<void> _openNewAppointment() async {
     final result = await Navigator.push<bool>(
       context,
-      MaterialPageRoute(
-        builder: (context) => const AppointmentSchedulerForm(),
-      ),
+      MaterialPageRoute(builder: (context) => const AppointmentSchedulerForm()),
     );
-    if (result == true) {
-      _bindAppointments();
+    if (result == true && mounted) {
+      _scheduleEntriesIndexRebuild(immediate: true);
     }
   }
 
   Widget _buildCalendarBody({required bool isMobile}) {
     return Column(
       children: [
-        if (widget.embedded && isMobile)
+        if (widget.embedded && isMobile && widget.showTopAddButton)
           Material(
             color: calendarBlue,
             child: SafeArea(
@@ -1041,21 +1606,52 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
                   children: [
                     IconButton(
                       icon: const Icon(Icons.add, color: Colors.white),
-                      onPressed: _openNewAppointment,
-                      tooltip: 'New Appointment',
+                      onPressed: _handleAddPressed,
+                      tooltip: widget.onAddPressed != null
+                          ? 'New Event'
+                          : 'New Appointment',
                     ),
                   ],
                 ),
               ),
             ),
           ),
-        _buildCalendarHeader(isMobile: isMobile),
-        _buildWeekdayRow(isMobile: isMobile),
-        _buildHearingsOutsideMonthBanner(),
         Expanded(
-          child: (isMobile || _viewMode == 'month')
-              ? _buildMonthView()
-              : _buildWeekView(),
+          child: Column(
+            children: [
+              ValueListenableBuilder<DateTime>(
+                valueListenable: _viewDateNotifier,
+                builder: (context, viewDate, _) => _buildCalendarHeader(
+                  isMobile: isMobile,
+                  viewDate: viewDate,
+                ),
+              ),
+              _buildWeekdayRow(isMobile: isMobile),
+              StableMergedListenableBuilder(
+                listenables: [_viewDateNotifier, _hearingNavRevision],
+                builder: (context, _) => _buildHearingsOutsideMonthBanner(
+                  _viewDateNotifier.value,
+                ),
+              ),
+              Expanded(
+                child: RepaintBoundary(
+                  child: StableMergedListenableBuilder(
+                    listenables: [
+                      _viewDateNotifier,
+                      _entriesRevisionNotifier,
+                      _hearingNavRevision,
+                    ],
+                    builder: (context, _) {
+                      final viewDate = _viewDateNotifier.value;
+                      return (isMobile || _viewMode == 'month')
+                          ? _buildMonthView(viewDate)
+                          : _buildWeekView(viewDate);
+                    },
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ],
     );
@@ -1106,8 +1702,10 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
             ),
           IconButton(
             icon: const Icon(Icons.add, color: Colors.white),
-            onPressed: _openNewAppointment,
-            tooltip: 'New Appointment',
+            onPressed: _handleAddPressed,
+            tooltip: widget.onAddPressed != null
+                ? 'New Event'
+                : 'New Appointment',
           ),
         ],
       ),
@@ -1115,78 +1713,200 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     );
   }
 
-  Widget _buildCalendarHeader({required bool isMobile}) {
-    return Container(
-      padding: EdgeInsets.all(isMobile ? 12 : 16),
-      color: calendarBlue,
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          IconButton(
-            icon: const Icon(Icons.chevron_left, color: Colors.white),
-            onPressed: () {
-              setState(() {
-                _viewDate = _viewMode == 'month' || isMobile
-                    ? DateTime(_viewDate.year, _viewDate.month - 1)
-                    : _viewDate.subtract(const Duration(days: 7));
-              });
-            },
-          ),
-          Flexible(
-            child: Text(
-              _viewMode == 'month' || isMobile
-                  ? DateFormat('MMMM yyyy').format(_viewDate)
-                  : 'Week of ${DateFormat('MMM dd').format(_viewDate)}',
-              style: TextStyle(
-                fontSize: isMobile ? 18 : 22,
-                fontWeight: FontWeight.bold,
-                color: Colors.white,
-              ),
-              textAlign: TextAlign.center,
+  Set<int> _yearsWithSchedules() {
+    final years = <int>{};
+    for (final key in _entriesByDayKey.keys) {
+      final y = int.tryParse(key.split('-').first);
+      if (y != null) years.add(y);
+    }
+    return years;
+  }
+
+  List<int> _yearPickerYears() {
+    final nowY = DateTime.now().year;
+    var minY = nowY - 3;
+    var maxY = nowY + 3;
+    for (final y in _yearsWithSchedules()) {
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    return [for (var y = minY; y <= maxY; y++) y];
+  }
+
+  DateTime _firstScheduleMonthInYear(int year) {
+    DateTime? first;
+    for (final key in _entriesByDayKey.keys) {
+      final parts = key.split('-');
+      if (parts.length < 2) continue;
+      final y = int.tryParse(parts[0]);
+      final m = int.tryParse(parts[1]);
+      if (y == null || m == null || y != year) continue;
+      final month = DateTime(y, m);
+      if (first == null || month.isBefore(first)) first = month;
+    }
+    return first ?? DateTime(year, 1);
+  }
+
+  Future<void> _pickCalendarYear(DateTime viewDate) async {
+    final years = _yearPickerYears();
+    final withSchedules = _yearsWithSchedules();
+    final picked = await showDialog<int>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text('Filter by year'),
+          contentPadding: const EdgeInsets.fromLTRB(8, 12, 8, 8),
+          content: SizedBox(
+            width: 280,
+            height: 320,
+            child: ListView.builder(
+              itemCount: years.length,
+              itemBuilder: (context, index) {
+                final year = years[index];
+                final selected = year == viewDate.year;
+                final hasSched = withSchedules.contains(year);
+                return ListTile(
+                  selected: selected,
+                  selectedTileColor: calendarGold.withValues(alpha: 0.35),
+                  title: Text(
+                    '$year',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontWeight: selected || hasSched
+                          ? FontWeight.w800
+                          : FontWeight.w500,
+                      fontSize: 18,
+                    ),
+                  ),
+                  subtitle: hasSched
+                      ? const Text(
+                          'Has scheduled events',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 11),
+                        )
+                      : null,
+                  onTap: () => Navigator.pop(ctx, year),
+                );
+              },
             ),
           ),
-          Row(
-            children: [
-              Container(
-                padding: EdgeInsets.symmetric(
-                  horizontal: isMobile ? 10 : 14,
-                  vertical: 6,
+        );
+      },
+    );
+    if (!mounted || picked == null) return;
+    _viewDateNotifier.value = _firstScheduleMonthInYear(picked);
+  }
+
+  /// Android 15/edge-to-edge often reports [MediaQuery.padding] as 0, so
+  /// [SafeArea] leaves the year chip under the status icons. [viewPadding]
+  /// is the raw inset and is never consumed.
+  double _headerStatusBarInset(BuildContext context) {
+    final mq = MediaQuery.of(context);
+    final top = mq.viewPadding.top >= mq.padding.top
+        ? mq.viewPadding.top
+        : mq.padding.top;
+    return top > 0 ? top : 32;
+  }
+
+  Widget _buildCalendarHeader({
+    required bool isMobile,
+    required DateTime viewDate,
+  }) {
+    final extraTop = widget.padHeaderForStatusBar
+        ? _headerStatusBarInset(context)
+        : 0.0;
+    return ColoredBox(
+      color: calendarBlue,
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(
+          isMobile ? 8 : 16,
+          extraTop + (isMobile ? 8 : 16),
+          isMobile ? 8 : 16,
+          isMobile ? 8 : 16,
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            IconButton(
+              icon: const Icon(Icons.chevron_left, color: Colors.white),
+              onPressed: () {
+                _viewDateNotifier.value = _viewMode == 'month' || isMobile
+                    ? DateTime(viewDate.year, viewDate.month - 1)
+                    : viewDate.subtract(const Duration(days: 7));
+              },
+            ),
+            Expanded(
+              child: Text(
+                _viewMode == 'month' || isMobile
+                    ? DateFormat('MMMM yyyy').format(viewDate)
+                    : 'Week of ${DateFormat('MMM dd').format(viewDate)}',
+                style: TextStyle(
+                  fontSize: isMobile ? 18 : 22,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
                 ),
-                decoration: BoxDecoration(
-                  color: calendarGold,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  DateFormat('yyyy').format(_viewDate),
-                  style: TextStyle(
-                    fontSize: isMobile ? 14 : 16,
-                    fontWeight: FontWeight.w700,
-                    color: Colors.black87,
+                textAlign: TextAlign.center,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Tooltip(
+                  message: 'Filter by year',
+                  child: Material(
+                    color: calendarGold,
+                    borderRadius: BorderRadius.circular(12),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () => unawaited(_pickCalendarYear(viewDate)),
+                      child: Padding(
+                        padding: EdgeInsets.symmetric(
+                          horizontal: isMobile ? 8 : 12,
+                          vertical: isMobile ? 8 : 6,
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              DateFormat('yyyy').format(viewDate),
+                              style: TextStyle(
+                                fontSize: isMobile ? 14 : 16,
+                                fontWeight: FontWeight.w700,
+                                color: Colors.black87,
+                              ),
+                            ),
+                            const Icon(
+                              Icons.arrow_drop_down,
+                              size: 18,
+                              color: Colors.black87,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
                   ),
                 ),
-              ),
-              IconButton(
-                icon: const Icon(Icons.chevron_right, color: Colors.white),
-                onPressed: () {
-                  setState(() {
-                    _viewDate = _viewMode == 'month' || isMobile
-                        ? DateTime(_viewDate.year, _viewDate.month + 1)
-                        : _viewDate.add(const Duration(days: 7));
-                  });
-                },
-              ),
-            ],
-          ),
-          if (!isMobile)
-            TextButton(
-              onPressed: () {
-                setState(() {
-                  _viewDate = DateTime.now();
-                });
-              },
-              child: const Text('Today'),
+                IconButton(
+                  icon: const Icon(Icons.chevron_right, color: Colors.white),
+                  onPressed: () {
+                    _viewDateNotifier.value = _viewMode == 'month' || isMobile
+                        ? DateTime(viewDate.year, viewDate.month + 1)
+                        : viewDate.add(const Duration(days: 7));
+                  },
+                ),
+              ],
             ),
-        ],
+            if (!isMobile)
+              TextButton(
+                onPressed: () {
+                  _viewDateNotifier.value = DateTime.now();
+                },
+                child: const Text('Today'),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -1221,63 +1941,34 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     );
   }
 
-  Widget _buildMonthView() {
-    final firstDayOfMonth = DateTime(_viewDate.year, _viewDate.month, 1);
-    final lastDayOfMonth = DateTime(_viewDate.year, _viewDate.month + 1, 0);
-    final firstDayWeekday = firstDayOfMonth.weekday;
-    final daysInMonth = lastDayOfMonth.day;
-
-    // Get all days to display (including previous/next month days)
-    final List<DateTime> days = [];
-    // Previous month days
-    for (int i = firstDayWeekday - 1; i > 0; i--) {
-      days.add(firstDayOfMonth.subtract(Duration(days: i)));
-    }
-    // Current month days
-    for (int i = 1; i <= daysInMonth; i++) {
-      days.add(DateTime(_viewDate.year, _viewDate.month, i));
-    }
-    // Next month days to fill the grid
-    final remainingDays = 42 - days.length; // 6 weeks * 7 days
-    for (int i = 1; i <= remainingDays; i++) {
-      days.add(DateTime(_viewDate.year, _viewDate.month + 1, i));
-    }
-
-    // Adjust cell size for web vs mobile – on web we use a more compact grid
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isWeb = screenWidth > 200;
-    final gridPadding = EdgeInsets.all(isWeb ? 8 : 16);
-    final spacing = isWeb ? 4.0 : 8.0;
-    // Slightly taller cells so hearing title + AI SCHD fit (reference-style grid).
-    final aspectRatio = isWeb ? 0.82 : 1.05;
-
-    return GridView.builder(
-      padding: gridPadding,
-      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 7,
-        childAspectRatio: aspectRatio,
-        crossAxisSpacing: spacing,
-        mainAxisSpacing: spacing,
-      ),
-      itemCount: days.length,
-      itemBuilder: (context, index) {
-        final day = days[index];
-        final isCurrentMonth = day.month == _viewDate.month;
-        final isToday =
-            day.year == DateTime.now().year &&
-            day.month == DateTime.now().month &&
-            day.day == DateTime.now().day;
-        final dayEntries = _getEntriesForDate(day);
-
-        return _buildDayCell(day, isCurrentMonth, isToday, dayEntries);
+  Widget _buildMonthView(DateTime viewDate) {
+    final isCompact = MediaQuery.sizeOf(context).width > 200;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final monthCellBodyHeight = CalendarPerf.monthGridCellBodyHeight(
+          gridHeight: constraints.maxHeight,
+          isCompact: isCompact,
+        );
+        return CalendarMonthGrid(
+          key: ValueKey('month-${viewDate.year}-${viewDate.month}'),
+          viewDate: viewDate,
+          isCompact: isCompact,
+          cellBuilder: (context, day, isCurrentMonth, isToday) {
+            return _buildDayCell(
+              day,
+              isCurrentMonth,
+              isToday,
+              _getEntriesForDate(day),
+              monthCellBodyHeight: monthCellBodyHeight,
+            );
+          },
+        );
       },
     );
   }
 
-  Widget _buildWeekView() {
-    final startOfWeek = _viewDate.subtract(
-      Duration(days: _viewDate.weekday - 1),
-    );
+  Widget _buildWeekView(DateTime viewDate) {
+    final startOfWeek = viewDate.subtract(Duration(days: viewDate.weekday - 1));
     final weekDays = List.generate(
       7,
       (i) => startOfWeek.add(Duration(days: i)),
@@ -1309,19 +2000,17 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       ),
       child: Column(
         children: [
-          // Day Header - tappable if has items
+          // Day number = add manual schedule (events stay tappable below).
           InkWell(
-            onTap: dayEntries.isNotEmpty
-                ? () => _showEntriesForDate(day, dayEntries)
-                : () async {
-                    final created = await _createAppointmentForDate(day);
-                    if (created != null && mounted) {
-                      await _openDayDialogAfterAppointmentAdded(
-                        day,
-                        created: created,
-                      );
-                    }
-                  },
+            onTap: () async {
+              final created = await _handleAddForDate(day);
+              if (created != null && mounted) {
+                await _openDayDialogAfterAppointmentAdded(
+                  day,
+                  created: created,
+                );
+              }
+            },
             child: Container(
               padding: const EdgeInsets.all(8),
               decoration: BoxDecoration(
@@ -1376,6 +2065,8 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
                           ),
                         ),
                       ],
+                      const SizedBox(width: 4),
+                      Icon(Icons.add, size: 12, color: Colors.grey[600]),
                     ],
                   ),
                 ],
@@ -1383,18 +2074,19 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
             ),
           ),
           Expanded(
-            child: ListView.builder(
-              padding: const EdgeInsets.all(4),
-              physics: const NeverScrollableScrollPhysics(),
-              itemCount: dayEntries.length,
-              itemBuilder: (context, index) {
-                return _buildCalendarEntrySlot(dayEntries[index]);
-              },
+            child: ClipRect(
+              child: ListView.builder(
+                padding: const EdgeInsets.all(4),
+                physics: const ClampingScrollPhysics(),
+                itemCount: dayEntries.length,
+                itemBuilder: (context, index) =>
+                    _buildCalendarEntrySlot(dayEntries[index]),
+              ),
             ),
           ),
           InkWell(
             onTap: () async {
-              final created = await _createAppointmentForDate(day);
+              final created = await _handleAddForDate(day);
               if (created != null && mounted) {
                 await _openDayDialogAfterAppointmentAdded(
                   day,
@@ -1412,13 +2104,153 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     );
   }
 
+  Widget _buildCompactDayEntry(
+    _AttorneyCalendarEntry entry, {
+    VoidCallback? onOpen,
+  }) {
+    final label = entry.appointment != null
+        ? _clientLabelForGrid(entry.appointment!)
+        : entry.calendarCellLabel().isNotEmpty
+            ? entry.calendarCellLabel()
+            : entry.hearingTitle();
+    return InkWell(
+      onTap: () => Future.microtask(
+        () => onOpen != null ? onOpen() : _showEntryDetails(entry),
+      ),
+      child: Container(
+        width: double.infinity,
+        height: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+        decoration: BoxDecoration(
+          color: _getEntryColor(entry),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    DateFormat('hh:mm a').format(entry.startTime),
+                    style: const TextStyle(
+                      fontSize: 7.5,
+                      height: 1,
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (entry.isAiScheduled)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 2,
+                      vertical: 1,
+                    ),
+                    decoration: BoxDecoration(
+                      color: calendarGold,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                    child: const Text(
+                      'AI',
+                      style: TextStyle(
+                        fontSize: 5.5,
+                        height: 1,
+                        color: Colors.black87,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 1),
+            Text(
+              label,
+              style: const TextStyle(
+                fontSize: 8,
+                height: 1.05,
+                color: Colors.white,
+                fontWeight: FontWeight.w500,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDayCellEntryColumn(
+    List<_AttorneyCalendarEntry> entries, {
+    required double bodyHeight,
+    required DateTime day,
+  }) {
+    void openDay() => _openDayEntries(day, entries.isEmpty ? null : entries.first);
+    if (entries.isEmpty) return const SizedBox.shrink();
+    final layout = CalendarPerf.layoutDayCellEntries(
+      bodyHeight: bodyHeight,
+      totalEntries: entries.length,
+    );
+    if (layout.shown <= 0) {
+      if (!layout.showMore) return const SizedBox.shrink();
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+        child: Text(
+          '+${entries.length} more',
+          style: TextStyle(fontSize: 9, color: Colors.grey[600]),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+      );
+    }
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (var i = 0; i < layout.shown; i++)
+          SizedBox(
+            height: layout.chipHeight,
+            child: ClipRect(
+              child: _buildCompactDayEntry(entries[i], onOpen: openDay),
+            ),
+          ),
+        if (layout.showMore)
+          SizedBox(
+            height: CalendarPerf.monthCellMoreRowHeight,
+            child: InkWell(
+              onTap: openDay,
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: Text(
+                    '+${entries.length - layout.shown} more',
+                    style: TextStyle(fontSize: 9, color: Colors.grey[600]),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
   Widget _buildDayCell(
     DateTime day,
     bool isCurrentMonth,
     bool isToday,
-    List<_AttorneyCalendarEntry> entries,
-  ) {
+    List<_AttorneyCalendarEntry> entries, {
+    double? monthCellBodyHeight,
+  }) {
     return Container(
+      clipBehavior: Clip.hardEdge,
       decoration: BoxDecoration(
         color: isToday
             ? calendarBlue.withOpacity(0.08)
@@ -1433,25 +2265,24 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           InkWell(
-            onTap: entries.isNotEmpty
-                ? () => _showEntriesForDate(day, entries)
-                : () async {
-                    final created = await _createAppointmentForDate(day);
-                    if (created != null && mounted) {
-                      await _openDayDialogAfterAppointmentAdded(
-                        day,
-                        created: created,
-                      );
-                    }
-                  },
+            onTap: () async {
+              final created = await _handleAddForDate(day);
+              if (created != null && mounted) {
+                await _openDayDialogAfterAppointmentAdded(
+                  day,
+                  created: created,
+                );
+              }
+            },
             child: Padding(
-              padding: const EdgeInsets.all(8),
+              padding: const EdgeInsets.fromLTRB(4, 4, 4, 2),
               child: Row(
                 children: [
                   Text(
                     '${day.day}',
                     style: TextStyle(
                       fontSize: 12,
+                      height: 1.1,
                       fontWeight: isToday ? FontWeight.w600 : FontWeight.normal,
                       color: isCurrentMonth
                           ? (isToday
@@ -1463,119 +2294,81 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
                     ),
                   ),
                   if (entries.isNotEmpty) ...[
-                    const SizedBox(width: 4),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 6,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: calendarBlue,
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Text(
-                        '${entries.length}',
-                        style: const TextStyle(
-                          fontSize: 9,
-                          color: Colors.white,
-                          fontWeight: FontWeight.bold,
+                    const SizedBox(width: 2),
+                    Flexible(
+                      child: GestureDetector(
+                        onTap: () => _openDayEntries(day),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 4,
+                            vertical: 1,
+                          ),
+                          decoration: BoxDecoration(
+                            color: calendarBlue,
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(
+                            '${entries.length}',
+                            style: const TextStyle(
+                              fontSize: 8,
+                              height: 1,
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
                         ),
                       ),
                     ),
                   ],
+                  const Spacer(),
+                  Icon(Icons.add, size: 12, color: Colors.grey[500]),
                 ],
               ),
             ),
           ),
           Expanded(
-            child: ListView.builder(
-              padding: const EdgeInsets.symmetric(horizontal: 4),
-              physics: const NeverScrollableScrollPhysics(),
-              itemCount: (entries.length > 3 ? 3 : entries.length) +
-                  (entries.length > 3 ? 1 : 0),
-              itemBuilder: (context, index) {
-                final shownCount = entries.length > 3 ? 3 : entries.length;
-                if (index >= shownCount) {
-                  return Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 4,
-                      vertical: 2,
+            child: monthCellBodyHeight != null
+                ? SizedBox(
+                    height: monthCellBodyHeight,
+                    width: double.infinity,
+                    child: ClipRect(
+                      child: Align(
+                        alignment: Alignment.topLeft,
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(2, 0, 2, 0),
+                          child: _buildDayCellEntryColumn(
+                            entries,
+                            bodyHeight: monthCellBodyHeight,
+                            day: day,
+                          ),
+                        ),
+                      ),
                     ),
-                    child: Text(
-                      '+${entries.length - 3} more',
-                      style: TextStyle(fontSize: 9, color: Colors.grey[600]),
-                    ),
-                  );
-                }
-                final entry = entries[index];
-                return InkWell(
-                  onTap: () => _showEntryDetails(entry),
-                  child: Container(
-                    margin: const EdgeInsets.only(bottom: 2),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 4,
-                      vertical: 2,
-                    ),
-                    decoration: BoxDecoration(
-                      color: _getEntryColor(entry),
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Expanded(
-                              child: Text(
-                                DateFormat('hh:mm a').format(entry.startTime),
-                                style: const TextStyle(
-                                  fontSize: 8,
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.bold,
-                                ),
+                  )
+                : LayoutBuilder(
+                    builder: (context, constraints) {
+                      final bodyHeight = constraints.maxHeight;
+                      return SizedBox(
+                        height: bodyHeight,
+                        width: double.infinity,
+                        child: ClipRect(
+                          child: Align(
+                            alignment: Alignment.topLeft,
+                            child: Padding(
+                              padding: const EdgeInsets.fromLTRB(2, 0, 2, 0),
+                              child: _buildDayCellEntryColumn(
+                                entries,
+                                bodyHeight: bodyHeight,
+                                day: day,
                               ),
                             ),
-                            if (entry.isAiScheduled)
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 3,
-                                  vertical: 1,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: calendarGold,
-                                  borderRadius: BorderRadius.circular(3),
-                                ),
-                                child: const Text(
-                                  'AI',
-                                  style: TextStyle(
-                                    fontSize: 6,
-                                    color: Colors.black87,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                              ),
-                          ],
-                        ),
-                        Text(
-                          entry.appointment != null
-                              ? _getClientDisplayName(entry.appointment!)
-                              : entry.calendarCellLabel().isNotEmpty
-                                  ? entry.calendarCellLabel()
-                                  : entry.hearingTitle(),
-                          style: const TextStyle(
-                            fontSize: 9,
-                            color: Colors.white,
-                            fontWeight: FontWeight.w500,
                           ),
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
                         ),
-                      ],
-                    ),
+                      );
+                    },
                   ),
-                );
-              },
-            ),
           ),
         ],
       ),
@@ -1606,7 +2399,7 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
                     ),
                   ),
                   Text(
-                    _getClientDisplayName(apt),
+                    _clientLabelForGrid(apt),
                     style: const TextStyle(fontSize: 12, color: Colors.white),
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
@@ -1677,9 +2470,40 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
   void _showEntryDetails(_AttorneyCalendarEntry entry) {
     if (entry.appointment != null) {
       _showAppointmentDetails(entry.appointment!);
-    } else if (entry.hearingEvent != null) {
-      _showHearingEventDetails(entry.hearingEvent!);
+      return;
     }
+    final ev = entry.hearingEvent;
+    if (ev != null && NotaryService.isNotaryCalendarRow(ev)) {
+      final id = (ev['notaryRequestId'] as String?)?.trim() ?? '';
+      if (id.isEmpty) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => AttorneyNotaryRequestDetailScreen(
+            requestId: id,
+            actingAsStaff: widget.actingAsStaff,
+          ),
+        ),
+      );
+      return;
+    }
+    if (ev != null) {
+      _showHearingEventDetails(ev);
+    }
+  }
+
+  /// Cell shows 3, dialog must list those same 3 — not only the tapped chip.
+  void _openDayEntries(DateTime day, [_AttorneyCalendarEntry? tapped]) {
+    final all = _getEntriesForDate(day);
+    if (all.length > 1) {
+      _showEntriesForDate(day, all);
+      return;
+    }
+    if (all.length == 1) {
+      _showEntryDetails(all.first);
+      return;
+    }
+    if (tapped != null) _showEntryDetails(tapped);
   }
 
   /// Show all items (appointments + court/automation events) for a date
@@ -1687,6 +2511,7 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     DateTime date,
     List<_AttorneyCalendarEntry> entries,
   ) {
+    if (!mounted) return;
     // Must live outside [StatefulBuilder]'s builder — that builder re-runs on
     // every setState and would otherwise reset the list to [entries].
     var dayEntries = List<_AttorneyCalendarEntry>.from(entries);
@@ -1730,238 +2555,274 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
               Flexible(
                 child: StatefulBuilder(
                   builder: (context, setDialogState) {
-                    final apptN =
-                        dayEntries.where((e) => e.appointment != null).length;
+                    final apptN = dayEntries
+                        .where((e) => e.appointment != null)
+                        .length;
                     final calN = dayEntries.length - apptN;
-                    final aiN =
-                        dayEntries.where((e) => e.isAiScheduled).length;
+                    final aiN = dayEntries.where((e) => e.isAiScheduled).length;
 
                     return Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Flexible(
                           child: SingleChildScrollView(
-                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            '${dayEntries.length} scheduled item${dayEntries.length != 1 ? 's' : ''}',
-                            style: TextStyle(
-                              fontSize: 14,
-                              color: Colors.grey[700],
-                            ),
-                          ),
-                          if (apptN > 0 || calN > 0) ...[
-                            const SizedBox(height: 4),
-                            Text(
-                              [
-                                if (apptN > 0)
-                                  '$apptN client appointment${apptN != 1 ? 's' : ''}',
-                                if (apptN > 0 && calN > 0) ' · ',
-                                if (calN > 0)
-                                  '$calN calendar event${calN != 1 ? 's' : ''}'
-                                  '${aiN > 0 ? ' ($aiN AI)' : ''}',
-                              ].join(),
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: Colors.grey[600],
-                              ),
-                            ),
-                          ],
-                          const SizedBox(height: 16),
-                          ...List.generate(dayEntries.length, (index) {
-                    final entry = dayEntries[index];
-                    final apt = entry.appointment;
-                    if (apt != null) {
-                      return Card(
-                        margin: const EdgeInsets.only(bottom: 12),
-                        child: InkWell(
-                          onTap: () {
-                            Navigator.pop(dialogContext);
-                            _showAppointmentDetails(apt);
-                          },
-                          child: Padding(
-                            padding: const EdgeInsets.all(16),
+                            padding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Row(
-                                  children: [
-                                    Expanded(
-                                      child: Text(
-                                        _getClientDisplayName(apt),
-                                        style: const TextStyle(
-                                          fontSize: 16,
-                                          fontWeight: FontWeight.bold,
-                                        ),
-                                      ),
-                                    ),
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 8,
-                                        vertical: 4,
-                                      ),
-                                      decoration: BoxDecoration(
-                                        color: _getAppointmentColor(
-                                          apt,
-                                        ).withOpacity(0.1),
-                                        borderRadius: BorderRadius.circular(8),
-                                        border: Border.all(
-                                          color: _getAppointmentColor(apt),
-                                          width: 1,
-                                        ),
-                                      ),
-                                      child: Text(
-                                        _getAppointmentTypeLabel(
-                                          apt.appointmentType,
-                                        ),
-                                        style: TextStyle(
-                                          fontSize: 11,
-                                          color: _getAppointmentColor(apt),
-                                          fontWeight: FontWeight.bold,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
+                                Text(
+                                  '${dayEntries.length} scheduled item${dayEntries.length != 1 ? 's' : ''}',
+                                  style: TextStyle(
+                                    fontSize: 14,
+                                    color: Colors.grey[700],
+                                  ),
                                 ),
-                                const SizedBox(height: 8),
-                                Row(
-                                  children: [
-                                    Icon(
-                                      Icons.access_time,
-                                      size: 16,
+                                if (apptN > 0 || calN > 0) ...[
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    [
+                                      if (apptN > 0)
+                                        '$apptN client appointment${apptN != 1 ? 's' : ''}',
+                                      if (apptN > 0 && calN > 0) ' · ',
+                                      if (calN > 0)
+                                        '$calN calendar event${calN != 1 ? 's' : ''}'
+                                            '${aiN > 0 ? ' ($aiN AI)' : ''}',
+                                    ].join(),
+                                    style: TextStyle(
+                                      fontSize: 12,
                                       color: Colors.grey[600],
                                     ),
-                                    const SizedBox(width: 4),
-                                    Text(
-                                      DateFormat(
-                                        'hh:mm a',
-                                      ).format(apt.appointmentDateTime),
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        color: Colors.grey[700],
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                if (apt.caseTitle != null) ...[
-                                  const SizedBox(height: 4),
-                                  Row(
-                                    children: [
-                                      Icon(
-                                        Icons.folder_outlined,
-                                        size: 16,
-                                        color: Colors.grey[600],
-                                      ),
-                                      const SizedBox(width: 4),
-                                      Expanded(
-                                        child: Text(
-                                          'Case: ${apt.caseTitle}',
-                                          style: TextStyle(
-                                            fontSize: 13,
-                                            color: Colors.grey[700],
-                                          ),
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                        ),
-                                      ),
-                                    ],
                                   ),
                                 ],
+                                const SizedBox(height: 16),
+                                ...List.generate(dayEntries.length, (index) {
+                                  final entry = dayEntries[index];
+                                  final apt = entry.appointment;
+                                  if (apt != null) {
+                                    return Card(
+                                      margin: const EdgeInsets.only(bottom: 12),
+                                      child: InkWell(
+                                        onTap: () {
+                                          Navigator.pop(dialogContext);
+                                          _showAppointmentDetails(apt);
+                                        },
+                                        child: Padding(
+                                          padding: const EdgeInsets.all(16),
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Row(
+                                                children: [
+                                                  Expanded(
+                                                    child: Text(
+                                                      _getClientDisplayName(
+                                                        apt,
+                                                      ),
+                                                      style: const TextStyle(
+                                                        fontSize: 16,
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  Container(
+                                                    padding:
+                                                        const EdgeInsets.symmetric(
+                                                          horizontal: 8,
+                                                          vertical: 4,
+                                                        ),
+                                                    decoration: BoxDecoration(
+                                                      color:
+                                                          _getAppointmentColor(
+                                                            apt,
+                                                          ).withOpacity(0.1),
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            8,
+                                                          ),
+                                                      border: Border.all(
+                                                        color:
+                                                            _getAppointmentColor(
+                                                              apt,
+                                                            ),
+                                                        width: 1,
+                                                      ),
+                                                    ),
+                                                    child: Text(
+                                                      _getAppointmentTypeLabel(
+                                                        apt.appointmentType,
+                                                      ),
+                                                      style: TextStyle(
+                                                        fontSize: 11,
+                                                        color:
+                                                            _getAppointmentColor(
+                                                              apt,
+                                                            ),
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                              const SizedBox(height: 8),
+                                              Row(
+                                                children: [
+                                                  Icon(
+                                                    Icons.access_time,
+                                                    size: 16,
+                                                    color: Colors.grey[600],
+                                                  ),
+                                                  const SizedBox(width: 4),
+                                                  Text(
+                                                    DateFormat(
+                                                      'hh:mm a',
+                                                    ).format(
+                                                      apt.appointmentDateTime,
+                                                    ),
+                                                    style: TextStyle(
+                                                      fontSize: 14,
+                                                      color: Colors.grey[700],
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                              if (apt.caseTitle != null) ...[
+                                                const SizedBox(height: 4),
+                                                Row(
+                                                  children: [
+                                                    Icon(
+                                                      Icons.folder_outlined,
+                                                      size: 16,
+                                                      color: Colors.grey[600],
+                                                    ),
+                                                    const SizedBox(width: 4),
+                                                    Expanded(
+                                                      child: Text(
+                                                        'Case: ${apt.caseTitle}',
+                                                        style: TextStyle(
+                                                          fontSize: 13,
+                                                          color:
+                                                              Colors.grey[700],
+                                                        ),
+                                                        maxLines: 1,
+                                                        overflow: TextOverflow
+                                                            .ellipsis,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ],
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    );
+                                  }
+                                  final ev = entry.hearingEvent!;
+                                  return Card(
+                                    margin: const EdgeInsets.only(bottom: 12),
+                                    color: hearingEventColor.withOpacity(0.06),
+                                    child: InkWell(
+                                      onTap: () {
+                                        Navigator.pop(dialogContext);
+                                        _showHearingEventDetails(ev);
+                                      },
+                                      child: Padding(
+                                        padding: const EdgeInsets.all(16),
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Row(
+                                              children: [
+                                                Expanded(
+                                                  child: Text(
+                                                    entry.hearingTitle(),
+                                                    style: const TextStyle(
+                                                      fontSize: 16,
+                                                      fontWeight:
+                                                          FontWeight.bold,
+                                                    ),
+                                                  ),
+                                                ),
+                                                if (entry.isAiScheduled)
+                                                  Container(
+                                                    margin:
+                                                        const EdgeInsets.only(
+                                                          left: 8,
+                                                        ),
+                                                    padding:
+                                                        const EdgeInsets.symmetric(
+                                                          horizontal: 8,
+                                                          vertical: 4,
+                                                        ),
+                                                    decoration: BoxDecoration(
+                                                      color: calendarGold,
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            8,
+                                                          ),
+                                                    ),
+                                                    child: Text(
+                                                      _aiSchedLabel,
+                                                      style: const TextStyle(
+                                                        fontSize: 10,
+                                                        fontWeight:
+                                                            FontWeight.w800,
+                                                        color: Colors.black87,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                Container(
+                                                  margin: const EdgeInsets.only(
+                                                    left: 8,
+                                                  ),
+                                                  padding:
+                                                      const EdgeInsets.symmetric(
+                                                        horizontal: 8,
+                                                        vertical: 4,
+                                                      ),
+                                                  decoration: BoxDecoration(
+                                                    color: hearingEventColor
+                                                        .withOpacity(0.12),
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                          8,
+                                                        ),
+                                                    border: Border.all(
+                                                      color: hearingEventColor,
+                                                      width: 1,
+                                                    ),
+                                                  ),
+                                                  child: Text(
+                                                    entry.hearingTypeLabel(),
+                                                    style: const TextStyle(
+                                                      fontSize: 11,
+                                                      color: hearingEventColor,
+                                                      fontWeight:
+                                                          FontWeight.bold,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                            const SizedBox(height: 8),
+                                            HearingCalendarEventBody(
+                                              data: ev,
+                                              dense: true,
+                                              maxLines: 3,
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                }),
                               ],
                             ),
                           ),
-                        ),
-                      );
-                    }
-                    final ev = entry.hearingEvent!;
-                    return Card(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      color: hearingEventColor.withOpacity(0.06),
-                      child: InkWell(
-                        onTap: () {
-                          Navigator.pop(dialogContext);
-                          _showHearingEventDetails(ev);
-                        },
-                        child: Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: Text(
-                                      entry.hearingTitle(),
-                                      style: const TextStyle(
-                                        fontSize: 16,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                  ),
-                                  if (entry.isAiScheduled)
-                                    Container(
-                                      margin: const EdgeInsets.only(left: 8),
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 8,
-                                        vertical: 4,
-                                      ),
-                                      decoration: BoxDecoration(
-                                        color: calendarGold,
-                                        borderRadius: BorderRadius.circular(8),
-                                      ),
-                                      child: Text(
-                                        _aiSchedLabel,
-                                        style: const TextStyle(
-                                          fontSize: 10,
-                                          fontWeight: FontWeight.w800,
-                                          color: Colors.black87,
-                                        ),
-                                      ),
-                                    ),
-                                  Container(
-                                    margin: const EdgeInsets.only(left: 8),
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 8,
-                                      vertical: 4,
-                                    ),
-                                    decoration: BoxDecoration(
-                                      color: hearingEventColor.withOpacity(
-                                        0.12,
-                                      ),
-                                      borderRadius: BorderRadius.circular(8),
-                                      border: Border.all(
-                                        color: hearingEventColor,
-                                        width: 1,
-                                      ),
-                                    ),
-                                    child: Text(
-                                      entry.hearingTypeLabel(),
-                                      style: const TextStyle(
-                                        fontSize: 11,
-                                        color: hearingEventColor,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 8),
-                              HearingCalendarEventBody(
-                                data: ev,
-                                dense: true,
-                                maxLines: 3,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    );
-                          }),
-                        ],
-                      ),
-                    ),
                         ),
                         Padding(
                           padding: const EdgeInsets.fromLTRB(0, 8, 0, 0),
@@ -1969,13 +2830,13 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
                             width: double.infinity,
                             child: ElevatedButton.icon(
                               onPressed: () async {
-                                final created =
-                                    await _createAppointmentForDate(date);
+                                final created = await _handleAddForDate(date);
                                 if (created == null || !context.mounted) {
                                   return;
                                 }
-                                final showDay =
-                                    _calendarDay(created.appointmentDateTime);
+                                final showDay = _calendarDay(
+                                  created.appointmentDateTime,
+                                );
                                 final updated = _entriesForDateWithAppointment(
                                   showDay,
                                   _getEntriesForDate(showDay),
@@ -1989,8 +2850,9 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
                               style: ElevatedButton.styleFrom(
                                 backgroundColor: calendarBlue,
                                 foregroundColor: Colors.white,
-                                padding:
-                                    const EdgeInsets.symmetric(vertical: 14),
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 14,
+                                ),
                               ),
                             ),
                           ),
@@ -2012,27 +2874,25 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     final hearingDocId = (ev['hearingDocId'] as String?)?.trim() ?? '';
     if (hearingDocId.isNotEmpty) {
       try {
-        final snap =
-            await _firestore.collection('hearings').doc(hearingDocId).get();
+        final snap = await _firestore
+            .collection('hearings')
+            .doc(hearingDocId)
+            .get();
         if (snap.exists && snap.data() != null) {
           final hd = snap.data()!;
           final caseMaps = <Map<String, dynamic>>[];
           final caseId = (hd['caseId'] as String?)?.trim() ?? '';
           if (caseId.isNotEmpty) {
-            final caseSnap =
-                await _firestore.collection('cases').doc(caseId).get();
+            final caseSnap = await _firestore
+                .collection('cases')
+                .doc(caseId)
+                .get();
             if (caseSnap.exists && caseSnap.data() != null) {
               caseMaps.add({'id': caseSnap.id, ...caseSnap.data()!});
             }
           }
           final cn = (hd['caseNo'] as String?)?.trim() ?? '';
-          final siblings = _hearingOverlay
-              .where(
-                (o) =>
-                    cn.isNotEmpty &&
-                    (o['caseNo'] as String?)?.trim() == cn,
-              )
-              .toList();
+          final siblings = _hearingSiblingsForCase(cn);
           display = await HearingCalendarFields.loadMergedHearingForDisplay(
             hearingDocId: hearingDocId,
             hearingData: hd,
@@ -2171,7 +3031,9 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
                   data: ev,
                   hearingDocId: (ev['hearingDocId'] as String?)?.trim(),
                   calendarOnly: true,
-                  siblingRows: _hearingOverlay,
+                  siblingRows: _hearingSiblingsForCase(
+                    (ev['caseNo'] as String?)?.trim() ?? '',
+                  ),
                 ),
                 const SizedBox(height: 24),
                 Align(

@@ -1,7 +1,8 @@
 import 'dart:async' show StreamSubscription, Timer, unawaited;
 
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart' show debugPrint, kDebugMode, kIsWeb;
+import 'package:flutter/foundation.dart'
+    show debugPrint, kDebugMode, kIsWeb, ValueListenable;
 import 'package:get/get.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -14,9 +15,14 @@ import '../../models/case_model.dart';
 import '../../models/user_model.dart';
 import '../../models/appointment_model.dart';
 import '../../widgets/common/case_card.dart';
+import '../../widgets/case/case_status_filter_button.dart';
+import '../../utils/case_status_filter.dart';
 import '../../widgets/common/lazy_indexed_stack.dart';
-import '../../widgets/admin/stat_card.dart';
+import '../../widgets/common/nav_unread_dot.dart';
 import '../../widgets/attorney/attorney_thin_nav_rail.dart';
+import '../../widgets/attorney/attorney_ui_theme.dart';
+import '../../widgets/attorney/attorney_top_bar.dart';
+import '../../widgets/admin/stat_card.dart';
 import '../../theme/app_theme.dart';
 import '../case/case_detail_page.dart';
 import '../chat/chat_list_page.dart';
@@ -24,17 +30,19 @@ import '../auth/login_page.dart';
 import '../../screens/attorney/appointment_calendar_view.dart';
 
 import '../../widgets/attorney/reminders_bell_button.dart';
-import '../../widgets/common/app_icon_button.dart';
 import '../../pages/attorney/attorney_profile_page.dart';
 import '../../pages/attorney/confirm_appointment_schedule_page.dart';
 import '../../services/chat_service.dart';
-import '../../services/hearing_notification_fanout_service.dart';
+import '../../services/hearing_calendar_sync_service.dart';
+import '../../services/fcm_service.dart';
+import '../../services/calendar_session_cleanup.dart';
 import '../../screens/attorney/attorney_case_requests_screen.dart';
 import '../../screens/attorney/attorney_create_case_screen.dart';
 import '../../screens/attorney/attorney_client_chat_screen.dart';
 import '../../screens/attorney/attorney_tasks_screen.dart';
 import '../../screens/attorney/attorney_create_task_screen.dart';
 import '../../screens/billing/billing_management_screen.dart';
+import '../../widgets/attorney/upcoming_appointment_tile.dart';
 
 class AttorneyDashboard extends StatefulWidget {
   const AttorneyDashboard({super.key});
@@ -60,16 +68,20 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
   String _activeItem = 'dashboard';
   int _selectedBottomNavIndex = 0;
   bool _isAvailable = true;
+  final ValueNotifier<String> _headerSearchQuery = ValueNotifier('');
+  final ValueNotifier<String> _casesStatusFilter =
+      ValueNotifier(CaseStatusFilter.active);
+  final ValueNotifier<bool> _closedCasesFolder = ValueNotifier(false);
 
   StreamSubscription<List<CaseModel>>? _casesSub;
   StreamSubscription<List<AppointmentModel>>? _appointmentsSub;
-  StreamSubscription? _chatsSub;
+  StreamSubscription<int>? _unreadCountSub;
   Stream<List<AppointmentModel>>? _sharedAppointmentsStream;
   Stream<List<CaseModel>>? _sharedCasesStream;
   bool _dashboardStreamsAttached = false;
-  Timer? _unreadDebounce;
   Timer? _dashboardDebounce;
   Timer? _calendarPrewarmTimer;
+  bool _hearingSyncAttached = false;
   Map<String, dynamic> _stats = {};
   List<CaseModel> _myCases = [];
   // Pending appointment requests from clients (status == 'pending')
@@ -77,19 +89,33 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
   List<AppointmentModel> _pendingRequests = [];
   // Upcoming confirmed/scheduled appointments
   List<AppointmentModel> _upcomingAppointments = [];
+  final Map<String, String> _upcomingClientNames = {};
+  final Map<String, String> _upcomingClientEmails = {};
   int _unreadCount = 0;
-  String _casesSearchQuery = '';
 
-  Object get _dashboardTabRevision => Object.hash(
+  Object get _dashboardTabRevision {
+    try {
+      return Object.hash(
         _stats['totalCases'],
         _stats['activeCases'],
         _stats['completedCases'],
         _stats['pendingCases'],
         _stats['upcomingAppointments'],
-        _myCases.length,
         _pendingRequests.length,
-        _upcomingAppointments.length,
       );
+    } catch (_) {
+      return 'dashboard';
+    }
+  }
+
+  /// Header shows the user's name unless it is the generic placeholder "attorney".
+  String? get _headerTitle {
+    final name = (_currentUser?.fullName ?? _currentUser?.name ?? '').trim();
+    if (name.isEmpty || name.toLowerCase() == 'attorney') {
+      return null;
+    }
+    return name;
+  }
 
   @override
   void initState() {
@@ -106,41 +132,50 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       final uid = FirebaseAuth.instance.currentUser?.uid;
       if (uid == null || uid.isEmpty) return;
 
+      unawaited(FCMService().initialize().catchError((_) {}));
+      unawaited(FCMService().saveTokenForUser(uid).catchError((_) {}));
       if (kIsWeb) {
-        Timer(const Duration(seconds: 8), () {
+        Timer(const Duration(milliseconds: 400), () {
           if (!mounted) return;
-          unawaited(_loadUnreadCount());
+          _attachUnreadWatcher();
         });
         _calendarPrewarmTimer = Timer(const Duration(seconds: 25), () {
           if (!mounted) return;
           _mobileTabStackKey.currentState?.prewarm(4);
-        });
-        Timer(const Duration(seconds: 3), () {
-          if (!mounted) return;
-          unawaited(
-            HearingNotificationFanoutService.instance.prepareBellCount(uid),
-          );
+          _desktopTabStackKey.currentState?.prewarm(6);
         });
       } else {
-        Timer(const Duration(seconds: 8), () {
+        Timer(const Duration(seconds: 6), () {
           if (!mounted) return;
-          unawaited(_loadUnreadCount());
-          unawaited(
-            HearingNotificationFanoutService.instance.prepareBellCount(uid),
-          );
+          _attachUnreadWatcher();
         });
       }
     });
   }
 
+  /// Schedules a late calendar_events backfill. Display uses live hearings.
+  void _ensureHearingCalendarSync() {
+    final uid = FirebaseAuth.instance.currentUser?.uid?.trim();
+    if (uid == null || uid.isEmpty || _hearingSyncAttached) return;
+    _hearingSyncAttached = true;
+    HearingCalendarSyncService.instance.attachForAttorney(uid);
+  }
+
   @override
   void dispose() {
+    _headerSearchQuery.dispose();
+    _casesStatusFilter.dispose();
+    _closedCasesFolder.dispose();
     _casesSub?.cancel();
     _appointmentsSub?.cancel();
-    _chatsSub?.cancel();
-    _unreadDebounce?.cancel();
+    _unreadCountSub?.cancel();
     _dashboardDebounce?.cancel();
     _calendarPrewarmTimer?.cancel();
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid != null && uid.isNotEmpty) {
+      HearingCalendarSyncService.instance.detachForAttorney(uid);
+    }
+    CalendarSessionCleanup.onLogout();
     super.dispose();
   }
 
@@ -161,27 +196,131 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     );
   }
 
-  Widget _buildRemindersBellIcon() {
+  Widget _buildAttorneyTopBar({EdgeInsetsGeometry? padding}) {
+    return AttorneyTopBar(
+      notification: _buildRemindersBellIcon(lightSurface: true),
+      padding: padding ?? const EdgeInsets.fromLTRB(24, 20, 24, 8),
+      findHits: _headerSearchHits,
+      onQueryChanged: (query) => _headerSearchQuery.value = query.trim(),
+      onSubmitted: _onHeaderSearchSubmitted,
+    );
+  }
+
+  String _safeText(Object? value) {
+    if (value == null) return '';
+    final text = '$value';
+    if (text == 'null' || text == 'undefined') return '';
+    return text;
+  }
+
+  List<AttorneySearchHit> _headerSearchHits(String raw) {
+    try {
+      final q = _safeText(raw).trim().toLowerCase();
+      if (q.isEmpty) return const [];
+
+      final hits = <AttorneySearchHit>[];
+
+      for (final c in _myCases) {
+        final title = _safeText(c.caseTitle);
+        final type = _safeText(c.caseType);
+        final description = _safeText(c.caseDescription);
+        final hay = '$title $type $description'.toLowerCase();
+        if (!hay.contains(q) && !caseTitleMatchesSearch(c, raw)) continue;
+        hits.add(
+          AttorneySearchHit(
+            title: title,
+            subtitle: 'Case · $type',
+            icon: Icons.folder_outlined,
+            onTap: () {
+              Get.to(() => CaseDetailPage(caseId: c.id));
+            },
+          ),
+        );
+        if (hits.length >= 8) return hits;
+      }
+
+      for (final a in _allAppointments) {
+        final clientName = _safeText(a.clientName);
+        final caseTitle = _safeText(a.caseTitle);
+        final notes = _safeText(a.notes);
+        final status = _safeText(a.status).toLowerCase();
+        final hay = '$clientName $caseTitle $notes $status';
+        if (!hay.contains(q)) continue;
+        final pending = status == 'pending';
+        hits.add(
+          AttorneySearchHit(
+            title: clientName.isNotEmpty ? clientName : 'Appointment',
+            subtitle: pending
+                ? 'Pending appointment'
+                : DateFormat('MMM d, y · h:mm a').format(a.appointmentDateTime),
+            icon: pending ? Icons.pending_outlined : Icons.event_outlined,
+            onTap: () => _handleItemSelected(pending ? 'pending' : 'calendar'),
+          ),
+        );
+        if (hits.length >= 8) return hits;
+      }
+
+      return hits;
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  void _onHeaderSearchSubmitted(String query) {
+    _headerSearchQuery.value = query.trim();
+    if (query.trim().isEmpty) return;
+    final hasCase = _myCases.any((c) => caseTitleMatchesSearch(c, query));
+    final hasClosed = _myCases.any(
+      (c) =>
+          CaseStatusFilter.isCompleted(c.status) &&
+          caseTitleMatchesSearch(c, query),
+    );
+    if (hasClosed && !hasCase) {
+      _handleItemSelected('closed_cases');
+      return;
+    }
+    _handleItemSelected(hasCase ? 'cases' : 'calendar');
+  }
+
+  Widget _buildRemindersBellIcon({bool lightSurface = false}) {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
       return Icon(
         Icons.notifications_active,
-        color: Colors.white.withValues(alpha: 0.8),
+        color: lightSurface
+            ? AttorneyUi.primary
+            : Colors.white.withValues(alpha: 0.8),
       );
     }
 
-    return RemindersBellButton(userId: user.uid);
+    return RemindersBellButton(
+      key: ValueKey<String>('attorney_bell_${user.uid}'),
+      userId: user.uid,
+      lightSurface: lightSurface,
+    );
   }
 
-  Widget _buildMessageIcon() {
-    return AppIconButton.appBar(
-      icon: Icons.message_outlined,
-      tooltip: _unreadCount > 0 ? 'Messages ($_unreadCount unread)' : 'Messages',
-      badgeCount: _unreadCount,
-      onPressed: () async {
-        await Get.to(() => const ChatListPage());
-        if (mounted) unawaited(_loadUnreadCount());
-      },
+  Widget _navIconWithBadge(
+    IconData icon, {
+    int badge = 0,
+    Color? color,
+    double size = 24,
+  }) {
+    return navIconWithBadge(
+      icon,
+      badge: badge,
+      color: color,
+      iconSize: size,
+    );
+  }
+
+  void _attachUnreadWatcher() {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    _unreadCountSub?.cancel();
+    _unreadCountSub = _chatService.watchUnreadCount(uid).listen(
+      _applyUnreadCount,
+      onError: (_) {},
     );
   }
 
@@ -192,17 +331,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     try {
       final count = await _chatService.getUnreadCount(user.uid);
       _applyUnreadCount(count);
-
-      // Live chat stream on dashboard caused post-login freezes (web especially).
-      if (!kIsWeb) {
-        await _chatsSub?.cancel();
-        _chatsSub = _chatService.getUserChats(user.uid).listen((_) {
-          _scheduleUnreadCountRefresh(user.uid);
-        });
-      }
-    } catch (_) {
-      // Non-critical; avoid console noise on tab switches.
-    }
+    } catch (_) {}
   }
 
   Future<void> _loadUserData() async {
@@ -210,25 +339,29 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     if (user == null) return;
 
     try {
-      final userDoc = await _firestore.collection('users').doc(user.uid).get();
+      DocumentSnapshot<Map<String, dynamic>> userDoc;
+      try {
+        userDoc = await _firestore
+            .collection('users')
+            .doc(user.uid)
+            .get(const GetOptions(source: Source.cache))
+            .timeout(const Duration(milliseconds: 800));
+        if (!userDoc.exists) {
+          userDoc = await _firestore
+              .collection('users')
+              .doc(user.uid)
+              .get()
+              .timeout(const Duration(seconds: 1));
+        }
+      } catch (_) {
+        return;
+      }
       if (userDoc.exists && mounted) {
         final userData = userDoc.data()!;
         setState(() {
           _currentUser = UserModel.fromFirestore(userData, user.uid);
           _isAvailable = _currentUser?.isAvailable ?? true;
         });
-
-        // Automatically set user to online when they open the dashboard
-        if (!_isAvailable) {
-          await _firestore.collection('users').doc(user.uid).update({
-            'isAvailable': true,
-          });
-          if (mounted) {
-            setState(() {
-              _isAvailable = true;
-            });
-          }
-        }
       }
     } catch (_) {
       // Non-critical; avoid console noise on tab switches.
@@ -243,15 +376,22 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     }
     _dashboardStreamsAttached = true;
 
+    Timer(const Duration(milliseconds: 700), () {
+      if (!mounted) return;
+      _attachDashboardStreams(user.uid);
+    });
+  }
+
+  void _attachDashboardStreams(String uid) {
     try {
       final casesStream = _sharedCasesStream ??=
-          _caseService.getCasesForUser(user.uid, 'attorney');
+          _caseService.getCasesForUser(uid, 'attorney');
       _sharedAppointmentsStream ??= _appointmentService.getAttorneyAppointments(
-        user.uid,
+        uid,
       );
       final appointmentsStream = _sharedAppointmentsStream!;
 
-      await _casesSub?.cancel();
+      unawaited(_casesSub?.cancel());
       _casesSub = casesStream.listen(
         (cases) {
           if (!mounted) return;
@@ -262,24 +402,23 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
         onError: (_) {},
       );
 
-      await _appointmentsSub?.cancel();
+      unawaited(_appointmentsSub?.cancel());
       _appointmentsSub = appointmentsStream.listen(
         (appointments) {
           if (!mounted) return;
-          final now = DateTime.now();
-          _allAppointments = appointments;
-          _pendingRequests = appointments
-              .where((apt) => apt.status.toLowerCase() == 'pending')
-              .toList();
-          _upcomingAppointments = appointments
-              .where(
-                (apt) =>
-                    apt.status.toLowerCase() != 'pending' &&
-                    apt.appointmentDateTime.isAfter(now),
-              )
-              .take(5)
-              .toList();
-          _stats = _computeStats();
+          try {
+            _allAppointments = appointments;
+            _pendingRequests = appointments
+                .where((apt) => apt.status.toLowerCase() == 'pending')
+                .toList();
+            _upcomingAppointments = _selectUpcomingAppointments(appointments);
+            _stats = _computeStats();
+          } catch (_) {
+            _allAppointments = appointments;
+            _upcomingAppointments = const [];
+            _pendingRequests = const [];
+            _stats = _computeStats();
+          }
           _scheduleDashboardRebuild();
         },
         onError: (_) {},
@@ -289,22 +428,237 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     }
   }
 
+  /// One accepted/scheduled booking per date+time. Pending requests and
+  /// leftover request rows never appear here.
+  List<AppointmentModel> _selectUpcomingAppointments(
+    List<AppointmentModel>? appointments,
+  ) {
+    try {
+      final source = appointments ?? const <AppointmentModel>[];
+      final now = DateTime.now();
+      final convertedRequestIds = <String>{};
+      for (final apt in source) {
+        final requestId = apt.requestId?.trim() ?? '';
+        if (requestId.isNotEmpty) convertedRequestIds.add(requestId);
+      }
+
+      final visible = <AppointmentModel>[];
+      for (final apt in source) {
+        final status = apt.status.toLowerCase().trim();
+        if (status == 'pending' ||
+            status == 'declined' ||
+            status == 'cancelled' ||
+            status == 'accepted' ||
+            status == 'completed') {
+          continue;
+        }
+        final occupies = status == 'upcoming' ||
+            status == 'confirmed' ||
+            status == 'scheduled' ||
+            status == 'rescheduled';
+        if (!occupies) continue;
+        if (!apt.appointmentDateTime.isAfter(now)) continue;
+        if (convertedRequestIds.contains(apt.id)) continue;
+        visible.add(apt);
+      }
+
+      visible.sort((a, b) {
+        final rank = _upcomingKeepRank(b) - _upcomingKeepRank(a);
+        if (rank != 0) return rank;
+        return a.appointmentDateTime.compareTo(b.appointmentDateTime);
+      });
+
+      // Same clock time = same booking. Keep the accepted/confirmed row only.
+      final byMinute = <String, AppointmentModel>{};
+      for (final apt in visible) {
+        final t = apt.appointmentDateTime;
+        final key = '${t.year}-${t.month}-${t.day}-${t.hour}-${t.minute}';
+        byMinute.putIfAbsent(key, () => apt);
+      }
+
+      final upcoming = byMinute.values.toList()
+        ..sort(
+          (a, b) => a.appointmentDateTime.compareTo(b.appointmentDateTime),
+        );
+      return upcoming.take(5).toList();
+    } catch (_) {
+      return const <AppointmentModel>[];
+    }
+  }
+
+  int _upcomingKeepRank(AppointmentModel apt) {
+    switch (apt.status.toLowerCase().trim()) {
+      case 'confirmed':
+        return 4;
+      case 'scheduled':
+        return 3;
+      case 'upcoming':
+        return 2;
+      case 'rescheduled':
+        return 1;
+      default:
+        return 0;
+    }
+  }
+
+  bool _looksLikeEmail(String? value) {
+    final text = (value ?? '').trim();
+    return text.contains('@') && text.contains('.');
+  }
+
+  bool _isGenericClientLabel(String? value) {
+    final text = (value ?? '').trim().toLowerCase();
+    return text.isEmpty ||
+        text == 'client' ||
+        text == 'user' ||
+        text == 'someone';
+  }
+
+  String _upcomingClientName(AppointmentModel apt) {
+    try {
+      final id = apt.clientId.trim();
+      final emailKey = _looksLikeEmail(apt.clientName)
+          ? apt.clientName.trim().toLowerCase()
+          : (_upcomingClientEmails[id] ?? '').toLowerCase();
+      final cached = _upcomingClientNames[id] ??
+          (emailKey.isNotEmpty ? _upcomingClientNames[emailKey] : null) ??
+          '';
+      if (cached.isNotEmpty &&
+          !_looksLikeEmail(cached) &&
+          !_isGenericClientLabel(cached)) {
+        return cached;
+      }
+      final stored = apt.clientName.trim();
+      if (stored.isNotEmpty &&
+          !_looksLikeEmail(stored) &&
+          !_isGenericClientLabel(stored)) {
+        return stored;
+      }
+      return '';
+    } catch (_) {
+      final stored = apt.clientName.trim();
+      if (stored.isNotEmpty &&
+          !_looksLikeEmail(stored) &&
+          !_isGenericClientLabel(stored)) {
+        return stored;
+      }
+      return '';
+    }
+  }
+
+  String _upcomingClientEmail(AppointmentModel apt) {
+    try {
+      final cached = _upcomingClientEmails[apt.clientId.trim()] ?? '';
+      if (cached.isNotEmpty) return cached;
+      final stored = apt.clientName.trim();
+      if (_looksLikeEmail(stored)) return stored;
+      return '';
+    } catch (_) {
+      final stored = apt.clientName.trim();
+      return _looksLikeEmail(stored) ? stored : '';
+    }
+  }
+
+  String _displayNameFromUserData(Map<String, dynamic> data) {
+    final resolved = UserModel.resolveDisplayName(data).trim();
+    if (resolved.isNotEmpty &&
+        !_looksLikeEmail(resolved) &&
+        !_isGenericClientLabel(resolved)) {
+      return resolved;
+    }
+    return '';
+  }
+
+  Future<Map<String, String>?> _loadClientProfile({
+    required String clientId,
+    String? emailHint,
+  }) async {
+    Map<String, dynamic>? data;
+    if (clientId.isNotEmpty) {
+      final doc = await _firestore.collection('users').doc(clientId).get();
+      if (doc.exists) data = doc.data();
+    }
+    if (data == null && emailHint != null && _looksLikeEmail(emailHint)) {
+      final snap = await _firestore
+          .collection('users')
+          .where('email', isEqualTo: emailHint.trim())
+          .limit(1)
+          .get();
+      if (snap.docs.isNotEmpty) data = snap.docs.first.data();
+    }
+    if (data == null) return null;
+    return {
+      'name': _displayNameFromUserData(data),
+      'email': (data['email'] as String?)?.trim() ?? '',
+    };
+  }
+
+  Future<void> _hydrateUpcomingClientProfiles(
+    List<AppointmentModel>? appointments,
+  ) async {
+    final source = appointments ?? const <AppointmentModel>[];
+    if (source.isEmpty) return;
+
+    var changed = false;
+    for (final apt in source) {
+      try {
+        final clientId = apt.clientId.trim();
+        final emailHint = _looksLikeEmail(apt.clientName)
+            ? apt.clientName.trim()
+            : (_upcomingClientEmails[clientId] ?? '');
+        final existingName = clientId.isEmpty
+            ? ''
+            : (_upcomingClientNames[clientId] ?? '');
+        if (existingName.isNotEmpty &&
+            !_looksLikeEmail(existingName) &&
+            !_isGenericClientLabel(existingName) &&
+            (clientId.isEmpty || _upcomingClientEmails.containsKey(clientId))) {
+          continue;
+        }
+
+        final profile = await _loadClientProfile(
+          clientId: clientId,
+          emailHint: emailHint.isNotEmpty ? emailHint : null,
+        );
+        if (profile == null) continue;
+        final cacheKey = clientId.isNotEmpty ? clientId : (profile['email'] ?? '');
+        if (cacheKey.isEmpty) continue;
+
+        final name = profile['name'] ?? '';
+        final email = profile['email'] ?? '';
+        void store(String key, String field, Map<String, String> cache) {
+          if (key.isEmpty || field.isEmpty) return;
+          cache[key] = field;
+          cache[key.toLowerCase()] = field;
+        }
+
+        if (name.isNotEmpty) {
+          store(cacheKey, name, _upcomingClientNames);
+          store(clientId, name, _upcomingClientNames);
+          store(email, name, _upcomingClientNames);
+          changed = true;
+        }
+        if (email.isNotEmpty) {
+          store(cacheKey, email, _upcomingClientEmails);
+          store(clientId, email, _upcomingClientEmails);
+          changed = true;
+        }
+      } catch (_) {}
+    }
+    if (changed && mounted) {
+      _scheduleDashboardRebuild();
+    }
+  }
+
   void _scheduleDashboardRebuild() {
     _dashboardDebounce?.cancel();
     _dashboardDebounce = Timer(const Duration(milliseconds: 250), () {
       if (!mounted) return;
-      setState(() {});
-    });
-  }
-
-  void _scheduleUnreadCountRefresh(String userId) {
-    _unreadDebounce?.cancel();
-    _unreadDebounce = Timer(const Duration(milliseconds: 500), () async {
-      if (!mounted) return;
       try {
-        final next = await _chatService.getUnreadCount(userId);
-        _applyUnreadCount(next);
+        _upcomingAppointments = _selectUpcomingAppointments(_allAppointments);
+        _stats = _computeStats();
       } catch (_) {}
+      setState(() {});
     });
   }
 
@@ -314,20 +668,32 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
   }
 
   Map<String, dynamic> _computeStats() {
-    final totalCases = _myCases.length;
-    final activeCases = _myCases
-        .where((c) => c.status == 'in_progress' || c.status == 'active')
-        .length;
-    final completedCases = _myCases
-        .where((c) => c.status == 'completed')
-        .length;
-    return {
-      'totalCases': totalCases,
-      'activeCases': activeCases,
-      'completedCases': completedCases,
-      'pendingCases': _pendingRequests.length,
-      'upcomingAppointments': _upcomingAppointments.length,
-    };
+    try {
+      final totalCases = _myCases
+          .where((c) => !CaseStatusFilter.isCompleted(c.status))
+          .length;
+      final activeCases = _myCases
+          .where((c) => CaseStatusFilter.isInProgress(c.status))
+          .length;
+      final completedCases = _myCases
+          .where((c) => CaseStatusFilter.isCompleted(c.status))
+          .length;
+      return {
+        'totalCases': totalCases,
+        'activeCases': activeCases,
+        'completedCases': completedCases,
+        'pendingCases': _pendingRequests.length,
+        'upcomingAppointments': _upcomingAppointments.length,
+      };
+    } catch (_) {
+      return {
+        'totalCases': 0,
+        'activeCases': 0,
+        'completedCases': 0,
+        'pendingCases': 0,
+        'upcomingAppointments': 0,
+      };
+    }
   }
 
   Future<void> _toggleAvailability() async {
@@ -433,7 +799,14 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     }
   }
 
-  void _handleItemSelected(String item) {
+  void _handleItemSelected(String item, {String? caseFilter}) {
+    if (item == 'cases') {
+      _closedCasesFolder.value = false;
+      _casesStatusFilter.value = caseFilter ?? CaseStatusFilter.active;
+    } else if (item == 'closed_cases') {
+      _closedCasesFolder.value = true;
+      _casesStatusFilter.value = CaseStatusFilter.completed;
+    }
     switch (item) {
       case 'create_case':
         Navigator.push(
@@ -453,13 +826,17 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
         });
         return;
       case 'messages':
-        Get.to(() => const ChatListPage());
+        setState(() => _activeItem = 'messages');
+        unawaited(_loadUnreadCount());
         return;
     }
 
     int? bottomIndex;
     switch (item) {
       case 'cases':
+        bottomIndex = 1;
+        break;
+      case 'closed_cases':
         bottomIndex = 1;
         break;
       case 'case_requests':
@@ -471,9 +848,6 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       case 'calendar':
         bottomIndex = 4;
         break;
-      case 'settings':
-        bottomIndex = 5;
-        break;
     }
 
     setState(() {
@@ -482,11 +856,13 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
         _selectedBottomNavIndex = bottomIndex;
       }
     });
+    if (item == 'calendar') _ensureHearingCalendarSync();
   }
 
   int _desktopTabIndex() {
     switch (_activeItem) {
       case 'cases':
+      case 'closed_cases':
         return 1;
       case 'case_requests':
         return 2;
@@ -514,11 +890,10 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       backgroundColor: const Color.fromARGB(255, 158, 182, 215),
       appBar: !isDesktop
           ? AppBar(
-              // No drawer on mobile anymore, so no menu button
               automaticallyImplyLeading: false,
               title: Text(
-                _currentUser?.fullName ?? _currentUser?.name ?? 'Attorney',
-                style: TextStyle(
+                _headerTitle ?? '',
+                style: const TextStyle(
                   fontSize: 18,
                   fontWeight: FontWeight.bold,
                   color: Colors.white,
@@ -528,11 +903,23 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
               iconTheme: const IconThemeData(color: Colors.white),
               actions: [
                 _buildRemindersBellIcon(),
-                _buildMessageIcon(),
+                IconButton(
+                  icon: const Icon(Icons.person),
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => const AttorneyProfilePage(),
+                      ),
+                    );
+                  },
+                  tooltip: 'Profile',
+                ),
               ],
             )
           : null,
       body: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           // Thin Navigation Rail - Desktop only (Web optimized)
           if (isDesktop)
@@ -542,6 +929,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
               onLogout: _handleLogout,
               isAvailable: _isAvailable,
               onAvailabilityChanged: (value) => _toggleAvailability(),
+              messageUnreadCount: _unreadCount,
             ),
 
           // Main Content
@@ -576,13 +964,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                             color: Colors.white,
                           ),
                         ),
-                        Row(
-                          children: [
-                            _buildRemindersBellIcon(),
-                            const SizedBox(width: 8),
-                            _buildMessageIcon(),
-                          ],
-                        ),
+                        _buildRemindersBellIcon(),
                       ],
                     ),
                   ),
@@ -622,7 +1004,12 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                       _buildBottomNavItem(Icons.inbox, 'Requests', 2),
                       _buildBottomNavItem(Icons.pending, 'Pending', 3),
                       _buildBottomNavItem(Icons.calendar_today, 'Calendar', 4),
-                      _buildBottomNavItem(Icons.settings, 'Settings', 5),
+                      _buildBottomNavItem(
+                        Icons.message_outlined,
+                        'Messages',
+                        5,
+                        badge: _unreadCount,
+                      ),
                     ],
                   ),
                 ),
@@ -641,7 +1028,11 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
         index: _selectedBottomNavIndex,
         activeTabRevision: _selectedBottomNavIndex == 0
             ? _dashboardTabRevision
-            : 'mobile_tab_$_selectedBottomNavIndex',
+            : _selectedBottomNavIndex == 1
+                ? 'attorney_cases_tab_v4'
+                : _selectedBottomNavIndex == 4
+                    ? 'attorney_calendar_overlay_v6'
+                    : 'mobile_tab_$_selectedBottomNavIndex',
         builders: [
           () => _buildDashboardView(),
           () => _buildCasesView(isMobile: true),
@@ -655,7 +1046,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
             initialAppointments: _allAppointments,
             sharedAppointmentsStream: _sharedAppointmentsStream,
           ),
-          () => const AttorneyProfilePage(embedded: true),
+          () => const ChatListPage(),
         ],
       );
     }
@@ -666,7 +1057,11 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       index: _desktopTabIndex(),
       activeTabRevision: _desktopTabIndex() == 0
           ? _dashboardTabRevision
-          : 'desktop_tab_${_desktopTabIndex()}',
+          : _desktopTabIndex() == 1
+              ? 'attorney_cases_tab_v4'
+              : _desktopTabIndex() == 6
+                  ? 'attorney_calendar_overlay_v6'
+                  : 'desktop_tab_${_desktopTabIndex()}',
       builders: [
         () => _buildDashboardView(),
         () => _buildCasesView(isMobile: false),
@@ -717,7 +1112,6 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Header
           Container(
             margin: const EdgeInsets.only(bottom: 24),
             padding: const EdgeInsets.all(24),
@@ -748,7 +1142,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                   child: const Icon(Icons.gavel, color: Colors.white, size: 32),
                 ),
                 const SizedBox(width: 20),
-                Expanded(
+                const Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -760,12 +1154,12 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                           color: Colors.white,
                         ),
                       ),
-                      const SizedBox(height: 4),
+                      SizedBox(height: 4),
                       Text(
                         'Manage your cases and appointments',
                         style: TextStyle(
                           fontSize: 14,
-                          color: Colors.white.withOpacity(0.9),
+                          color: Colors.white70,
                         ),
                       ),
                     ],
@@ -774,8 +1168,6 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
               ],
             ),
           ),
-
-          // Stats Grid
           GridView.count(
             crossAxisCount: crossAxisCount,
             shrinkWrap: true,
@@ -791,6 +1183,10 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                 icon: Icons.folder_outlined,
                 iconColor: AppTheme.royalBlue,
                 percentageChange: '+3.4%',
+                onTap: () => _handleItemSelected(
+                  'cases',
+                  caseFilter: CaseStatusFilter.active,
+                ),
               ),
               StatCard(
                 title: 'Active Cases',
@@ -799,6 +1195,10 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                 icon: Icons.work_outline,
                 iconColor: const Color(0xFF48BB78),
                 percentageChange: '+1.2%',
+                onTap: () => _handleItemSelected(
+                  'cases',
+                  caseFilter: CaseStatusFilter.inProgress,
+                ),
               ),
               StatCard(
                 title: 'Completed Cases',
@@ -807,6 +1207,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                 icon: Icons.check_circle_outline,
                 iconColor: const Color(0xFFED8936),
                 percentageChange: '+0.8%',
+                onTap: () => _handleItemSelected('closed_cases'),
               ),
               StatCard(
                 title: 'Pending Requests',
@@ -816,6 +1217,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                 iconColor: const Color(0xFFF56565),
                 isPositiveChange: false,
                 percentageChange: '-2.1%',
+                onTap: () => _handleItemSelected('pending'),
               ),
               StatCard(
                 title: 'Upcoming Appointments',
@@ -823,13 +1225,29 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                 description: 'Scheduled meetings',
                 icon: Icons.calendar_today_outlined,
                 iconColor: const Color(0xFF764BA2),
+                onTap: () {
+                  setState(() {
+                    if (isDesktop) {
+                      _activeItem = 'calendar';
+                    } else {
+                      _selectedBottomNavIndex = 4;
+                      _activeItem = 'calendar';
+                    }
+                  });
+                  _ensureHearingCalendarSync();
+                },
               ),
             ],
           ),
-
           const SizedBox(height: 32),
+          ..._dashboardBody(isDesktop: isDesktop),
+        ],
+      ),
+    );
+  }
 
-          // Create Case Button (below dashboard stats)
+  List<Widget> _dashboardBody({required bool isDesktop}) {
+    return [
           Container(
             padding: const EdgeInsets.all(20),
             decoration: BoxDecoration(
@@ -848,7 +1266,8 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                 Navigator.push(
                       context,
                       MaterialPageRoute(
-                        builder: (context) => const AttorneyCreateCaseScreen(),
+                        builder: (context) =>
+                            const AttorneyCreateCaseScreen(),
                       ),
                     )
                     .then((created) {
@@ -867,7 +1286,9 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                     })
                     .catchError((error) {
                       if (mounted) {
-                        if (kDebugMode) debugPrint('Navigation error: $error');
+                        if (kDebugMode) {
+                          debugPrint('Navigation error: $error');
+                        }
                       }
                     });
               },
@@ -1073,16 +1494,14 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
               }
             },
           ),
-        ],
-      ),
-    );
+    ];
   }
 
   Widget _buildUpcomingAppointmentsSection() {
+    final upcoming = _selectUpcomingAppointments(_allAppointments);
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        // Soft blue-tinted card to match dashboard background/theme
         color: const Color(0xFFF5F7FF),
         borderRadius: BorderRadius.circular(16),
         boxShadow: [
@@ -1115,7 +1534,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
             ],
           ),
           const SizedBox(height: 16),
-          if (_upcomingAppointments.isEmpty)
+          if (upcoming.isEmpty)
             Padding(
               padding: const EdgeInsets.all(12),
               child: Text(
@@ -1124,65 +1543,12 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
               ),
             )
           else
-            ..._upcomingAppointments.take(5).map((appointment) {
-              return Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Container(
-                      width: 40,
-                      height: 40,
-                      decoration: BoxDecoration(
-                        color: AppTheme.royalBlue.withOpacity(0.08),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: const Icon(
-                        Icons.event_available,
-                        color: AppTheme.royalBlue,
-                        size: 22,
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            DateFormat(
-                              'MMM dd, yyyy – hh:mm a',
-                            ).format(appointment.appointmentDateTime),
-                            style: TextStyle(
-                              fontSize: 13,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            'Client: ${appointment.clientName}',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: const Color(0xFF6D6D6D),
-                            ),
-                          ),
-                          if (appointment.caseTitle != null &&
-                              appointment.caseTitle!.trim().isNotEmpty)
-                            Text(
-                              appointment.caseTitle!,
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: const Color(0xFF6D6D6D),
-                              ),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              );
-            }),
+            ...upcoming.take(5).map(
+              (appointment) => UpcomingAppointmentTile(
+                key: ValueKey('upcoming_${appointment.id}'),
+                appointment: appointment,
+              ),
+            ),
         ],
       ),
     );
@@ -1192,8 +1558,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        // Soft red-tinted card to match pending stats card styling
-        color: const Color(0xFFFFF5F5),
+        color: const Color(0xFFF5F7FF),
         borderRadius: BorderRadius.circular(16),
         boxShadow: [
           BoxShadow(
@@ -1250,209 +1615,16 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     if (user == null) {
       return const Center(child: Text('Not logged in'));
     }
-
-    return StreamBuilder<List<CaseModel>>(
-      stream: _caseService.getCasesForUser(user.uid, 'attorney'),
-      builder: (context, snapshot) {
-        final List<CaseModel> cases =
-            snapshot.data ?? List<CaseModel>.from(_myCases);
-        if (snapshot.hasError && cases.isEmpty) {
-          return _mobileTabShell(
-            child: Center(
-              child: Padding(
-                padding: const EdgeInsets.all(24.0),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Icon(
-                      Icons.error_outline,
-                      size: 64,
-                      color: Colors.red,
-                    ),
-                    const SizedBox(height: 16),
-                    const Text(
-                      'Could not load cases',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.red),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          );
-        }
-        final filteredCases = cases.where((c) {
-          if (_casesSearchQuery.isEmpty) return true;
-          return c.caseTitle.toLowerCase().contains(
-            _casesSearchQuery.toLowerCase(),
-          );
-        }).toList();
-
-        if (isMobile) {
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16.0,
-                  vertical: 12.0,
-                ),
-                child: TextField(
-                  decoration: InputDecoration(
-                    hintText: 'Search cases by title...',
-                    prefixIcon: const Icon(Icons.search),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    filled: true,
-                    fillColor: Colors.white,
-                  ),
-                  onChanged: (value) {
-                    setState(() => _casesSearchQuery = value);
-                  },
-                ),
-              ),
-              if (filteredCases.isEmpty)
-                Expanded(
-                  child: ListView(
-                    physics: const AlwaysScrollableScrollPhysics(
-                      parent: BouncingScrollPhysics(),
-                    ),
-                    children: [
-                      SizedBox(
-                        height: MediaQuery.of(context).size.height * 0.35,
-                        child: Center(
-                          child: Text(
-                            _casesSearchQuery.isNotEmpty
-                                ? 'No cases match your search'
-                                : 'No cases yet',
-                            style: const TextStyle(
-                              fontSize: 16,
-                              color: Colors.grey,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                )
-              else
-                Expanded(
-                  child: ListView.builder(
-                    physics: const AlwaysScrollableScrollPhysics(
-                      parent: BouncingScrollPhysics(),
-                    ),
-                    padding: const EdgeInsets.all(16),
-                    itemCount: filteredCases.length,
-                    itemBuilder: (context, index) {
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 12),
-                        child: CaseCard(
-                          caseModel: filteredCases[index],
-                          onTap: () {
-                            Get.to(
-                              () => CaseDetailPage(
-                                caseId: filteredCases[index].id,
-                              ),
-                            );
-                          },
-                        ),
-                      );
-                    },
-                  ),
-                ),
-            ],
-          );
-        }
-
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Padding(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 24.0,
-                vertical: 16.0,
-              ),
-              child: TextField(
-                decoration: InputDecoration(
-                  hintText: 'Search cases by title...',
-                  prefixIcon: const Icon(Icons.search),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  filled: true,
-                  fillColor: Colors.white,
-                ),
-                onChanged: (value) {
-                  setState(() {
-                    _casesSearchQuery = value;
-                  });
-                },
-              ),
-            ),
-            if (filteredCases.isEmpty)
-              Expanded(
-                child: Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const Icon(
-                        Icons.folder_open,
-                        size: 64,
-                        color: Colors.grey,
-                      ),
-                      const SizedBox(height: 16),
-                      Text(
-                        _casesSearchQuery.isNotEmpty
-                            ? 'No pending cases match your search'
-                            : 'No requested cases yet',
-                        style: const TextStyle(
-                          fontSize: 18,
-                          color: Colors.grey,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              )
-            else
-              Expanded(
-                child: SingleChildScrollView(
-                  physics: const AlwaysScrollableScrollPhysics(
-                    parent: BouncingScrollPhysics(),
-                  ),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 24,
-                    vertical: 8,
-                  ),
-                  child: GridView.builder(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    gridDelegate:
-                        const SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: 3,
-                          crossAxisSpacing: 16,
-                          mainAxisSpacing: 16,
-                          childAspectRatio: 1.4, // Making cards less tall
-                        ),
-                    itemCount: filteredCases.length,
-                    itemBuilder: (context, index) {
-                      return CaseCard(
-                        caseModel: filteredCases[index],
-                        onTap: () {
-                          Get.to(
-                            () =>
-                                CaseDetailPage(caseId: filteredCases[index].id),
-                          );
-                        },
-                      );
-                    },
-                  ),
-                ),
-              ),
-          ],
-        );
-      },
+    return _AttorneyCasesTab(
+      key: const ValueKey('attorney_cases_tab_v4'),
+      attorneyId: user.uid,
+      isMobile: isMobile,
+      fallbackCases: _myCases,
+      caseService: _caseService,
+      mobileTabShell: _mobileTabShell,
+      headerSearch: _headerSearchQuery,
+      statusFilter: _casesStatusFilter,
+      closedFolder: _closedCasesFolder,
     );
   }
 
@@ -1524,20 +1696,16 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
               parent: BouncingScrollPhysics(),
             ),
             padding: const EdgeInsets.all(24),
-            child: GridView.builder(
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 3,
-                crossAxisSpacing: 16,
-                mainAxisSpacing: 16,
-                childAspectRatio: 1.2,
-              ),
-              itemCount: displayPending.length,
-              itemBuilder: (context, index) {
-                final appointment = displayPending[index];
-                return _buildPendingRequestCard(appointment);
-              },
+            child: Wrap(
+              spacing: 16,
+              runSpacing: 16,
+              children: [
+                for (final appointment in displayPending)
+                  SizedBox(
+                    width: 320,
+                    child: _buildPendingRequestCard(appointment),
+                  ),
+              ],
             ),
           );
         }
@@ -1556,13 +1724,18 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       case 4:
         return 'calendar';
       case 5:
-        return 'settings';
+        return 'messages';
       default:
         return 'dashboard';
     }
   }
 
-  Widget _buildBottomNavItem(IconData icon, String label, int index) {
+  Widget _buildBottomNavItem(
+    IconData icon,
+    String label,
+    int index, {
+    int badge = 0,
+  }) {
     final isActive = _selectedBottomNavIndex == index;
     return Expanded(
       child: Material(
@@ -1574,6 +1747,12 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
               _selectedBottomNavIndex = index;
               _activeItem = _activeItemForBottomNavIndex(index);
             });
+            if (index == 1) {
+              _closedCasesFolder.value = false;
+              _casesStatusFilter.value = CaseStatusFilter.active;
+            }
+            if (index == 4) _ensureHearingCalendarSync();
+            if (index == 5) unawaited(_loadUnreadCount());
           },
           borderRadius: BorderRadius.circular(12),
           child: SizedBox(
@@ -1582,9 +1761,9 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Icon(
+                _navIconWithBadge(
                   icon,
-                  size: 24,
+                  badge: badge,
                   color: isActive
                       ? AppTheme.royalBlue
                       : const Color(0xFF6D6D6D),
@@ -1612,6 +1791,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
 
   /// Card UI for a single pending appointment request
   Widget _buildPendingRequestCard(AppointmentModel appointment) {
+    final compact = kIsWeb;
     return InkWell(
       borderRadius: BorderRadius.circular(12),
       onTap: () => _showPendingRequestDetails(appointment),
@@ -1628,7 +1808,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
           ],
         ),
         child: Padding(
-          padding: const EdgeInsets.all(16),
+          padding: EdgeInsets.all(compact ? 12 : 16),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
@@ -1698,7 +1878,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                 ),
               ],
               // Action buttons row
-              const SizedBox(height: 12),
+              SizedBox(height: compact ? 8 : 12),
               Row(
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
@@ -2013,6 +2193,398 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
   }
 }
 
+/// Matches case title/type against search text (supports partial + multi-word).
+bool caseTitleMatchesSearch(CaseModel caseModel, String rawQuery) {
+  final query = '$rawQuery'.trim().toLowerCase();
+  if (query.isEmpty || query == 'null' || query == 'undefined') return true;
+
+  String normalize(String s) => s
+      .toLowerCase()
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .replaceAll(' vs. ', ' vs ')
+      .replaceAll(' v. ', ' vs ')
+      .trim();
+
+  final haystack = normalize('${caseModel.caseTitle} ${caseModel.caseType}');
+  final normalizedQuery = normalize(query);
+
+  if (haystack.contains(normalizedQuery)) return true;
+
+  final words = normalizedQuery.split(' ').where((w) => w.length >= 2);
+  if (words.isEmpty) return haystack.contains(normalizedQuery);
+  return words.every(haystack.contains);
+}
+
+/// Self-contained Cases tab — search state lives here so [LazyIndexedStack]
+/// cache does not block filter updates.
+class _AttorneyCasesTab extends StatefulWidget {
+  const _AttorneyCasesTab({
+    super.key,
+    required this.attorneyId,
+    required this.isMobile,
+    required this.fallbackCases,
+    required this.caseService,
+    required this.mobileTabShell,
+    required this.headerSearch,
+    required this.statusFilter,
+    required this.closedFolder,
+  });
+
+  final String attorneyId;
+  final bool isMobile;
+  final List<CaseModel> fallbackCases;
+  final CaseService caseService;
+  final Widget Function({required Widget child}) mobileTabShell;
+  final ValueListenable<String> headerSearch;
+  final ValueNotifier<String> statusFilter;
+  final ValueNotifier<bool> closedFolder;
+
+  @override
+  State<_AttorneyCasesTab> createState() => _AttorneyCasesTabState();
+}
+
+class _AttorneyCasesTabState extends State<_AttorneyCasesTab> {
+  final TextEditingController _searchController = TextEditingController();
+  String _searchQuery = '';
+  String _statusFilter = CaseStatusFilter.active;
+  bool _closedFolder = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.headerSearch.addListener(_applyHeaderSearch);
+    widget.statusFilter.addListener(_applyStatusFilter);
+    widget.closedFolder.addListener(_applyClosedFolder);
+    _statusFilter = widget.statusFilter.value;
+    _closedFolder = widget.closedFolder.value;
+    final q = widget.headerSearch.value;
+    _searchQuery = q;
+    if (q.isNotEmpty) {
+      _searchController.text = q;
+    }
+  }
+
+  @override
+  void didUpdateWidget(_AttorneyCasesTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.headerSearch != widget.headerSearch) {
+      oldWidget.headerSearch.removeListener(_applyHeaderSearch);
+      widget.headerSearch.addListener(_applyHeaderSearch);
+      _applyHeaderSearch();
+    }
+    if (oldWidget.statusFilter != widget.statusFilter) {
+      oldWidget.statusFilter.removeListener(_applyStatusFilter);
+      widget.statusFilter.addListener(_applyStatusFilter);
+      _applyStatusFilter();
+    }
+    if (oldWidget.closedFolder != widget.closedFolder) {
+      oldWidget.closedFolder.removeListener(_applyClosedFolder);
+      widget.closedFolder.addListener(_applyClosedFolder);
+      _applyClosedFolder();
+    }
+  }
+
+  void _applyHeaderSearch() {
+    final q = widget.headerSearch.value;
+    if (!mounted) return;
+    if (q == _searchQuery && _searchController.text == q) return;
+    setState(() {
+      _searchQuery = q;
+      if (_searchController.text != q) {
+        _searchController.value = TextEditingValue(
+          text: q,
+          selection: TextSelection.collapsed(offset: q.length),
+        );
+      }
+    });
+  }
+
+  void _applyStatusFilter() {
+    final next = widget.statusFilter.value;
+    if (!mounted) return;
+    if (next == _statusFilter) return;
+    setState(() => _statusFilter = next);
+  }
+
+  void _applyClosedFolder() {
+    final next = widget.closedFolder.value;
+    if (!mounted) return;
+    if (next == _closedFolder) return;
+    setState(() => _closedFolder = next);
+  }
+
+  @override
+  void dispose() {
+    widget.headerSearch.removeListener(_applyHeaderSearch);
+    widget.statusFilter.removeListener(_applyStatusFilter);
+    widget.closedFolder.removeListener(_applyClosedFolder);
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  void _onSearchChanged(String value) {
+    setState(() => _searchQuery = value);
+  }
+
+  void _clearSearch() {
+    _searchController.clear();
+    setState(() => _searchQuery = '');
+  }
+
+  InputDecoration _searchDecoration() {
+    return InputDecoration(
+      hintText: _closedFolder
+          ? 'Search closed cases...'
+          : 'Search cases by title...',
+      prefixIcon: const Icon(Icons.search),
+      suffixIcon: _searchQuery.isNotEmpty
+          ? IconButton(
+              icon: const Icon(Icons.clear),
+              onPressed: _clearSearch,
+              tooltip: 'Clear search',
+            )
+          : null,
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+      filled: true,
+      fillColor: Colors.white,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<List<CaseModel>>(
+      stream: widget.caseService.getCasesForUser(widget.attorneyId, 'attorney'),
+      builder: (context, snapshot) {
+        final cases = snapshot.data ?? List<CaseModel>.from(widget.fallbackCases);
+
+        if (snapshot.hasError && cases.isEmpty) {
+          return widget.mobileTabShell(
+            child: const Center(
+              child: Padding(
+                padding: EdgeInsets.all(24),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.error_outline, size: 64, color: Colors.red),
+                    SizedBox(height: 16),
+                    Text(
+                      'Could not load cases',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.red),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        }
+
+        final filter = _closedFolder
+            ? CaseStatusFilter.completed
+            : (_statusFilter == CaseStatusFilter.all
+                ? CaseStatusFilter.active
+                : _statusFilter);
+        final filteredCases = cases
+            .where((c) => CaseStatusFilter.matches(c, filter))
+            .where((c) => caseTitleMatchesSearch(c, _searchQuery))
+            .toList();
+
+        String emptyMessage() {
+          if (_searchQuery.trim().isNotEmpty) {
+            return 'No cases match your search';
+          }
+          if (_closedFolder) {
+            return 'No closed cases';
+          }
+          if (_statusFilter != CaseStatusFilter.active &&
+              _statusFilter != CaseStatusFilter.all) {
+            return 'No ${CaseStatusFilter.label(_statusFilter).toLowerCase()} cases';
+          }
+          return 'No cases yet';
+        }
+
+        Widget filterControl({Color? iconColor}) {
+          if (_closedFolder) return const SizedBox.shrink();
+          return CaseStatusFilterButton(
+            selected: _statusFilter == CaseStatusFilter.all
+                ? CaseStatusFilter.active
+                : _statusFilter,
+            iconColor: iconColor ?? AppTheme.royalBlue,
+            values: CaseStatusFilter.attorneyMyCaseValues,
+            onSelected: (value) {
+              widget.statusFilter.value = value;
+              setState(() => _statusFilter = value);
+            },
+          );
+        }
+
+        Widget folderLink() {
+          return TextButton(
+            onPressed: () {
+              final nextClosed = !_closedFolder;
+              widget.closedFolder.value = nextClosed;
+              widget.statusFilter.value = nextClosed
+                  ? CaseStatusFilter.completed
+                  : CaseStatusFilter.active;
+              setState(() {
+                _closedFolder = nextClosed;
+                _statusFilter = widget.statusFilter.value;
+              });
+            },
+            child: Text(_closedFolder ? 'My Cases' : 'Closed cases'),
+          );
+        }
+
+        if (widget.isMobile) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 12,
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _searchController,
+                        decoration: _searchDecoration(),
+                        onChanged: _onSearchChanged,
+                        textInputAction: TextInputAction.search,
+                      ),
+                    ),
+                    folderLink(),
+                    filterControl(),
+                  ],
+                ),
+              ),
+              if (filteredCases.isEmpty)
+                Expanded(
+                  child: ListView(
+                    physics: const AlwaysScrollableScrollPhysics(
+                      parent: BouncingScrollPhysics(),
+                    ),
+                    children: [
+                      SizedBox(
+                        height: MediaQuery.of(context).size.height * 0.35,
+                        child: Center(
+                          child: Text(
+                            emptyMessage(),
+                            style: const TextStyle(
+                              fontSize: 16,
+                              color: Colors.grey,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                )
+              else
+                Expanded(
+                  child: ListView.builder(
+                    physics: const AlwaysScrollableScrollPhysics(
+                      parent: BouncingScrollPhysics(),
+                    ),
+                    padding: const EdgeInsets.all(16),
+                    itemCount: filteredCases.length,
+                    itemBuilder: (context, index) {
+                      final caseModel = filteredCases[index];
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: CaseCard(
+                          caseModel: caseModel,
+                          onTap: () {
+                            Get.to(
+                              () => CaseDetailPage(caseId: caseModel.id),
+                            );
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                ),
+            ],
+          );
+        }
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _searchController,
+                      decoration: _searchDecoration(),
+                      onChanged: _onSearchChanged,
+                      textInputAction: TextInputAction.search,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  filterControl(),
+                ],
+              ),
+            ),
+            if (filteredCases.isEmpty)
+              Expanded(
+                child: Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.folder_open, size: 64, color: Colors.grey),
+                      const SizedBox(height: 16),
+                      Text(
+                        emptyMessage(),
+                        style: const TextStyle(fontSize: 18, color: Colors.grey),
+                      ),
+                    ],
+                  ),
+                ),
+              )
+            else
+              Expanded(
+                child: SingleChildScrollView(
+                  physics: const AlwaysScrollableScrollPhysics(
+                    parent: BouncingScrollPhysics(),
+                  ),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 24,
+                    vertical: 8,
+                  ),
+                  child: GridView.builder(
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    gridDelegate:
+                        const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 3,
+                      crossAxisSpacing: 12,
+                      mainAxisSpacing: 12,
+                      mainAxisExtent: 158,
+                    ),
+                    itemCount: filteredCases.length,
+                    itemBuilder: (context, index) {
+                      final caseModel = filteredCases[index];
+                      return CaseCard(
+                        caseModel: caseModel,
+                        onTap: () {
+                          Get.to(() => CaseDetailPage(caseId: caseModel.id));
+                        },
+                      );
+                    },
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
 class _NavBarItem extends StatefulWidget {
   final String title;
   final IconData icon;
@@ -2045,17 +2617,11 @@ class _NavBarItemState extends State<_NavBarItem> {
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
           decoration: BoxDecoration(
             color: widget.isActive
-                ? AppTheme.royalBlue.withOpacity(0.1)
+                ? AppTheme.sidebarActive
                 : (_isHovered
-                      ? AppTheme.royalBlue.withOpacity(0.05)
+                      ? AppTheme.sidebarActive.withOpacity(0.6)
                       : Colors.transparent),
             borderRadius: BorderRadius.circular(8),
-            border: widget.isActive
-                ? Border.all(
-                    color: AppTheme.royalBlue.withOpacity(0.3),
-                    width: 1,
-                  )
-                : null,
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
@@ -2064,9 +2630,9 @@ class _NavBarItemState extends State<_NavBarItem> {
                 widget.icon,
                 size: 18,
                 color: widget.isActive
-                    ? AppTheme.royalBlue
+                    ? AppTheme.sidebarActiveText
                     : (_isHovered
-                          ? AppTheme.royalBlue.withOpacity(0.7)
+                          ? AppTheme.sidebarActiveText.withOpacity(0.7)
                           : AppTheme.mutedText),
               ),
               const SizedBox(width: 8),
@@ -2078,9 +2644,9 @@ class _NavBarItemState extends State<_NavBarItem> {
                       ? FontWeight.w600
                       : FontWeight.w500,
                   color: widget.isActive
-                      ? AppTheme.royalBlue
+                      ? AppTheme.sidebarActiveText
                       : (_isHovered
-                            ? AppTheme.royalBlue.withOpacity(0.8)
+                            ? AppTheme.sidebarActiveText.withOpacity(0.8)
                             : AppTheme.mutedText),
                   letterSpacing: 0.2,
                 ),

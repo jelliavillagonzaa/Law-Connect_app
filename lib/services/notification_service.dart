@@ -73,6 +73,12 @@ class NotificationService {
             AndroidFlutterLocalNotificationsPlugin
           >()
           ?.createNotificationChannel(fcmChannel);
+
+      await _notifications
+          .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin
+          >()
+          ?.requestNotificationsPermission();
     }
 
     _isInitialized = true;
@@ -92,7 +98,7 @@ class NotificationService {
     if (kIsWeb) return;
     if (!_isInitialized) await initialize();
 
-    const NotificationDetails notificationDetails = NotificationDetails(
+    final NotificationDetails notificationDetails = NotificationDetails(
       android: AndroidNotificationDetails(
         'law_connect_channel',
         'LawConnect Notifications',
@@ -100,6 +106,11 @@ class NotificationService {
         importance: Importance.high,
         priority: Priority.high,
         playSound: true,
+        enableVibration: true,
+        styleInformation: BigTextStyleInformation(
+          body,
+          contentTitle: title,
+        ),
       ),
       iOS: DarwinNotificationDetails(
         presentAlert: true,

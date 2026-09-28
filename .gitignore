@@ -57,9 +57,12 @@ supabase/.temp
 .env
 .env.*
 functions/.env*
+serviceAccount.json
+*firebase-adminsdk*.json
 **/local.properties
 lib/supabase/supabase_local_overrides.dart
 client_export/lib/supabase/supabase_local_overrides.dart
+lib/config/semaphore_local_overrides.dart
 
 # Node / Firebase cache
 node_modules/

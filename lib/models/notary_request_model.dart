@@ -8,12 +8,15 @@ class NotaryRequestModel {
   final List<String> documents; // Legacy: URLs only
   final List<Map<String, String>>? documentsWithNames; // New: {name, url}
   final String? notes;
+  final DateTime? preferredDateTime;
+  final List<String> bringDocuments;
   final String status; // pending, accepted, declined, completed
   final DateTime createdAt;
   final DateTime? updatedAt;
   final DateTime? releaseDate;
   final DateTime? releaseTime;
   final String? declineReason;
+  final String? scheduleMoveReason;
 
   NotaryRequestModel({
     required this.id,
@@ -23,12 +26,15 @@ class NotaryRequestModel {
     required this.documents,
     this.documentsWithNames,
     this.notes,
+    this.preferredDateTime,
+    this.bringDocuments = const [],
     required this.status,
     required this.createdAt,
     this.updatedAt,
     this.releaseDate,
     this.releaseTime,
     this.declineReason,
+    this.scheduleMoveReason,
   });
 
   factory NotaryRequestModel.fromFirestore(DocumentSnapshot doc) {
@@ -67,12 +73,19 @@ class NotaryRequestModel {
       documents: documents,
       documentsWithNames: documentsWithNames,
       notes: data['notes'],
+      preferredDateTime: (data['preferredDateTime'] as Timestamp?)?.toDate(),
+      bringDocuments: data['bringDocuments'] is List
+          ? List<String>.from(
+              (data['bringDocuments'] as List).map((e) => e.toString()),
+            )
+          : const [],
       status: data['status'] ?? 'pending',
       createdAt: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
       updatedAt: (data['updatedAt'] as Timestamp?)?.toDate(),
       releaseDate: (data['releaseDate'] as Timestamp?)?.toDate(),
       releaseTime: (data['releaseTime'] as Timestamp?)?.toDate(),
       declineReason: data['declineReason'],
+      scheduleMoveReason: (data['scheduleMoveReason'] as String?)?.trim(),
     );
   }
 
@@ -87,10 +100,17 @@ class NotaryRequestModel {
 
     if (attorneyId != null) map['attorneyId'] = attorneyId;
     if (notes != null && notes!.isNotEmpty) map['notes'] = notes;
+    if (preferredDateTime != null) {
+      map['preferredDateTime'] = Timestamp.fromDate(preferredDateTime!);
+    }
+    if (bringDocuments.isNotEmpty) map['bringDocuments'] = bringDocuments;
     if (updatedAt != null) map['updatedAt'] = Timestamp.fromDate(updatedAt!);
     if (releaseDate != null) map['releaseDate'] = Timestamp.fromDate(releaseDate!);
     if (releaseTime != null) map['releaseTime'] = Timestamp.fromDate(releaseTime!);
     if (declineReason != null && declineReason!.isNotEmpty) map['declineReason'] = declineReason;
+    if (scheduleMoveReason != null && scheduleMoveReason!.isNotEmpty) {
+      map['scheduleMoveReason'] = scheduleMoveReason;
+    }
 
     return map;
   }
@@ -102,12 +122,15 @@ class NotaryRequestModel {
     String? serviceType,
     List<String>? documents,
     String? notes,
+    DateTime? preferredDateTime,
+    List<String>? bringDocuments,
     String? status,
     DateTime? createdAt,
     DateTime? updatedAt,
     DateTime? releaseDate,
     DateTime? releaseTime,
     String? declineReason,
+    String? scheduleMoveReason,
   }) {
     return NotaryRequestModel(
       id: id ?? this.id,
@@ -116,12 +139,15 @@ class NotaryRequestModel {
       serviceType: serviceType ?? this.serviceType,
       documents: documents ?? this.documents,
       notes: notes ?? this.notes,
+      preferredDateTime: preferredDateTime ?? this.preferredDateTime,
+      bringDocuments: bringDocuments ?? this.bringDocuments,
       status: status ?? this.status,
       createdAt: createdAt ?? this.createdAt,
       updatedAt: updatedAt ?? this.updatedAt,
       releaseDate: releaseDate ?? this.releaseDate,
       releaseTime: releaseTime ?? this.releaseTime,
       declineReason: declineReason ?? this.declineReason,
+      scheduleMoveReason: scheduleMoveReason ?? this.scheduleMoveReason,
     );
   }
 }

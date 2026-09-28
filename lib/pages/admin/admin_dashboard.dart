@@ -4,18 +4,23 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import '../../pages/case/case_detail_page.dart';
 import '../../widgets/admin/admin_sidebar.dart';
 import '../../widgets/admin/admin_header.dart';
-import '../../widgets/admin/stat_card.dart';
+import '../../widgets/admin/activity_item.dart';
+import '../../widgets/admin/admin_ui_theme.dart';
+import '../../widgets/admin/alert_card.dart';
+import '../../widgets/admin/dashboard_card.dart';
+import '../../widgets/admin/header_hero.dart';
 import '../../screens/admin/user_management_screen.dart';
+import '../../services/system_settings_service.dart';
 import '../../screens/admin/case_oversight_screen.dart';
 import '../../screens/admin/archive_storage_screen.dart';
 import '../../screens/admin/backup_settings_screen.dart';
 import '../../screens/admin/system_logs_screen.dart';
 import '../../screens/admin/reports_analytics_screen.dart';
 import '../../screens/admin/system_settings_screen.dart';
-import '../../theme/app_theme.dart';
-import '../client/client_landing_page.dart';
+import '../../routes/portal_navigation.dart';
 import '../../utils/quiet_console.dart';
 
 class AdminDashboard extends StatefulWidget {
@@ -29,14 +34,19 @@ class _AdminDashboardState extends State<AdminDashboard> {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
   String _activeItem = 'dashboard';
-  bool _isLoading = true;
   Map<String, dynamic> _stats = {};
   List<Map<String, dynamic>> _recentActivity = [];
   List<Map<String, dynamic>> _systemAlerts = [];
   /// Role filter when opening User Management from a stat card (sidebar resets to all).
   String _userManagementRoleFilter = 'all';
+  /// Name/email filter when opening User Management from header search.
+  String _userManagementSearch = '';
   /// Status filter when opening Case Oversight from a stat card (sidebar resets to all).
   String _caseOversightStatusFilter = 'all';
+
+  List<Map<String, String>> _searchUsers = const [];
+  List<Map<String, String>> _searchCases = const [];
+  List<Map<String, String>> _searchLogs = const [];
 
   @override
   void initState() {
@@ -48,7 +58,6 @@ class _AdminDashboardState extends State<AdminDashboard> {
 
   Future<void> _loadDashboardData() async {
     if (!mounted) return;
-    setState(() => _isLoading = true);
     try {
       // Count queries — never download entire users/cases collections (UI freeze).
       final countResults = await Future.wait([
@@ -70,13 +79,18 @@ class _AdminDashboardState extends State<AdminDashboard> {
       final activeCases = countResults[6].count ?? 0;
 
       // Load recent activity (system logs)
-      final logsSnapshot = await _firestore
-          .collection('system_logs')
-          .orderBy('timestamp', descending: true)
-          .limit(5)
-          .get();
+      QuerySnapshot<Map<String, dynamic>> logsSnapshot;
+      try {
+        logsSnapshot = await _firestore
+            .collection('system_logs')
+            .orderBy('timestamp', descending: true)
+            .limit(30)
+            .get();
+      } catch (_) {
+        logsSnapshot = await _firestore.collection('system_logs').limit(30).get();
+      }
 
-      final recentActivity = logsSnapshot.docs.map((doc) {
+      final recentActivity = logsSnapshot.docs.take(5).map((doc) {
         final data = doc.data();
         return {
           'id': doc.id,
@@ -94,7 +108,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
           .get();
 
       final alerts = <Map<String, dynamic>>[];
-      if (settingsDoc.exists) {
+      final notify = await SystemSettingsService.instance.load();
+      if (notify.systemAlerts && settingsDoc.exists) {
         final data = settingsDoc.data();
         if (data?['maintenanceMode'] == true) {
           alerts.add({
@@ -105,6 +120,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
           });
         }
       }
+
+      final searchIndex = await _loadSearchIndex(logsSnapshot);
 
       setState(() {
         _stats = {
@@ -118,12 +135,210 @@ class _AdminDashboardState extends State<AdminDashboard> {
         };
         _recentActivity = recentActivity;
         _systemAlerts = alerts;
-        _isLoading = false;
+        _searchUsers = searchIndex.users;
+        _searchCases = searchIndex.cases;
+        _searchLogs = searchIndex.logs;
       });
     } catch (e) {
-      setState(() => _isLoading = false);
       appLog('Error loading dashboard data: $e');
     }
+  }
+
+  String _safeText(Object? value) {
+    if (value == null) return '';
+    final text = '$value';
+    if (text == 'null' || text == 'undefined') return '';
+    return text.trim();
+  }
+
+  Future<
+      ({
+        List<Map<String, String>> users,
+        List<Map<String, String>> cases,
+        List<Map<String, String>> logs,
+      })> _loadSearchIndex(
+    QuerySnapshot<Map<String, dynamic>> logsSnapshot,
+  ) async {
+    var users = <Map<String, String>>[];
+    var cases = <Map<String, String>>[];
+    try {
+      final snaps = await Future.wait([
+        _firestore.collection('users').limit(50).get(),
+        _firestore.collection('cases').limit(50).get(),
+      ]);
+      users = snaps[0].docs.map((doc) {
+        final data = doc.data();
+        final name = _safeText(
+          data['name'] ??
+              data['fullName'] ??
+              '${_safeText(data['firstName'])} ${_safeText(data['lastName'])}',
+        );
+        final email = _safeText(data['email']);
+        final role = _safeText(data['role']);
+        return {
+          'id': doc.id,
+          'title': name.isNotEmpty ? name : (email.isNotEmpty ? email : 'User'),
+          'subtitle': [
+            if (role.isNotEmpty) role,
+            if (email.isNotEmpty) email,
+          ].join(' · '),
+          'hay': '$name $email $role'.toLowerCase(),
+          'role': role,
+        };
+      }).toList();
+      cases = snaps[1].docs.map((doc) {
+        final data = doc.data();
+        final title = _safeText(data['caseTitle']);
+        final type = _safeText(data['caseType']);
+        final status = _safeText(data['status']);
+        final description = _safeText(data['caseDescription']);
+        return {
+          'id': doc.id,
+          'title': title.isNotEmpty ? title : 'Untitled case',
+          'subtitle': [
+            'Case',
+            if (type.isNotEmpty) type,
+            if (status.isNotEmpty) status,
+          ].join(' · '),
+          'hay': '$title $type $status $description'.toLowerCase(),
+        };
+      }).toList();
+    } catch (e) {
+      appLog('Error loading admin search index: $e');
+    }
+
+    final logs = logsSnapshot.docs.map((doc) {
+      final data = doc.data();
+      final action = _safeText(data['action']);
+      final userName = _safeText(data['userName']);
+      final details = _safeText(data['details']);
+      return {
+        'id': doc.id,
+        'title': action.isNotEmpty ? action : 'System log',
+        'subtitle': [
+          'Log',
+          if (userName.isNotEmpty) userName,
+        ].join(' · '),
+        'hay': '$action $userName $details'.toLowerCase(),
+      };
+    }).toList();
+
+    return (users: users, cases: cases, logs: logs);
+  }
+
+  List<AdminSearchHit> _headerSearchHits(String raw) {
+    try {
+      final q = _safeText(raw).toLowerCase();
+      if (q.isEmpty) return const [];
+
+      final hits = <AdminSearchHit>[];
+
+      void addHit({
+        required String title,
+        required String subtitle,
+        required IconData icon,
+        required VoidCallback onTap,
+      }) {
+        if (hits.length >= 8) return;
+        hits.add(
+          AdminSearchHit(
+            title: title,
+            subtitle: subtitle,
+            icon: icon,
+            onTap: onTap,
+          ),
+        );
+      }
+
+      for (final row in _searchUsers) {
+        if (!(row['hay'] ?? '').contains(q)) continue;
+        addHit(
+          title: row['title'] ?? 'User',
+          subtitle: row['subtitle'] ?? 'User',
+          icon: Icons.person_outline,
+          onTap: () => _openUsersFiltered(
+            'all',
+            search: row['title'] ?? q,
+          ),
+        );
+        if (hits.length >= 8) return hits;
+      }
+
+      for (final row in _searchCases) {
+        if (!(row['hay'] ?? '').contains(q)) continue;
+        final caseId = row['id'] ?? '';
+        addHit(
+          title: row['title'] ?? 'Case',
+          subtitle: row['subtitle'] ?? 'Case',
+          icon: Icons.folder_outlined,
+          onTap: () {
+            if (caseId.isEmpty) {
+              _openCasesFiltered('all');
+              return;
+            }
+            Get.to(() => CaseDetailPage(caseId: caseId));
+          },
+        );
+        if (hits.length >= 8) return hits;
+      }
+
+      for (final row in _searchLogs) {
+        if (!(row['hay'] ?? '').contains(q)) continue;
+        addHit(
+          title: row['title'] ?? 'Log',
+          subtitle: row['subtitle'] ?? 'Log',
+          icon: Icons.receipt_long_outlined,
+          onTap: () => _handleItemSelected('logs'),
+        );
+        if (hits.length >= 8) return hits;
+      }
+
+      if (hits.isEmpty && q.length >= 2) {
+        if (q.contains('user') ||
+            q.contains('client') ||
+            q.contains('attorney') ||
+            q.contains('staff') ||
+            'users'.startsWith(q)) {
+          addHit(
+            title: 'User management',
+            subtitle: 'Open users',
+            icon: Icons.people_outline,
+            onTap: () => _openUsersFiltered('all', search: raw.trim()),
+          );
+        }
+        if (q.contains('case') || 'cases'.startsWith(q)) {
+          addHit(
+            title: 'Case oversight',
+            subtitle: 'Open cases',
+            icon: Icons.folder_outlined,
+            onTap: () => _openCasesFiltered('all'),
+          );
+        }
+        if (q.contains('log') || 'logs'.startsWith(q)) {
+          addHit(
+            title: 'System logs',
+            subtitle: 'Open activity logs',
+            icon: Icons.receipt_long_outlined,
+            onTap: () => _handleItemSelected('logs'),
+          );
+        }
+      }
+
+      return hits;
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  void _onHeaderSearchSubmitted(String query) {
+    final q = query.trim();
+    if (q.isEmpty) return;
+    final hits = _headerSearchHits(q);
+    if (hits.isNotEmpty) {
+      hits.first.onTap();
+      return;
+    }
+    _openUsersFiltered('all', search: q);
   }
 
   void _closeMobileDrawerIfNeeded() {
@@ -133,10 +348,11 @@ class _AdminDashboardState extends State<AdminDashboard> {
     }
   }
 
-  void _openUsersFiltered(String role) {
+  void _openUsersFiltered(String role, {String? search}) {
     setState(() {
       _activeItem = 'users';
       _userManagementRoleFilter = role;
+      _userManagementSearch = search?.trim() ?? '';
     });
     _closeMobileDrawerIfNeeded();
   }
@@ -155,6 +371,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
         _activeItem = item;
         if (item == 'users') {
           _userManagementRoleFilter = 'all';
+          _userManagementSearch = '';
         } else if (item == 'cases') {
           _caseOversightStatusFilter = 'all';
         }
@@ -168,9 +385,9 @@ class _AdminDashboardState extends State<AdminDashboard> {
   Future<void> _handleLogout() async {
     try {
       await FirebaseAuth.instance.signOut();
-      Get.offAll(() => const ClientLandingPage());
+      navigateAfterLogout();
     } catch (e) {
-      Get.offAll(() => const ClientLandingPage());
+      navigateAfterLogout();
     }
   }
 
@@ -186,84 +403,100 @@ class _AdminDashboardState extends State<AdminDashboard> {
             ? 20.0
             : 16.0;
 
+        final page = switch (_activeItem) {
+          'users' => UserManagementScreen(
+              inline: true,
+              initialRoleFilter: _userManagementRoleFilter == 'all'
+                  ? null
+                  : _userManagementRoleFilter,
+              initialSearchQuery: _userManagementSearch.isEmpty
+                  ? null
+                  : _userManagementSearch,
+            ),
+          'cases' => CaseOversightScreen(
+              inline: true,
+              initialStatusFilter: _caseOversightStatusFilter == 'all'
+                  ? null
+                  : _caseOversightStatusFilter,
+              onOpenArchiveStorage: () {
+                Get.to(
+                  () => ArchiveStorageScreen(
+                    onOpenBackup: () =>
+                        Get.to(() => const BackupSettingsScreen()),
+                  ),
+                );
+              },
+            ),
+          'logs' => const SystemLogsScreen(inline: true),
+          'reports' => ReportsAnalyticsScreen(
+              inline: true,
+              onNavigateToUsers: ({String role = 'all'}) =>
+                  _openUsersFiltered(role),
+              onNavigateToCases: ({String status = 'all'}) =>
+                  _openCasesFiltered(status),
+            ),
+          'settings' => const SystemSettingsScreen(inline: true),
+          _ => _buildDashboardContent(horizontalPadding),
+        };
+
+        if (_activeItem == 'users' ||
+            _activeItem == 'cases' ||
+            _activeItem == 'logs' ||
+            _activeItem == 'reports' ||
+            _activeItem == 'settings') {
+          return SizedBox(
+            width: constraints.maxWidth,
+            height: constraints.maxHeight,
+            child: Container(
+              constraints: constraints.maxWidth > 1600
+                  ? const BoxConstraints(maxWidth: 1600)
+                  : null,
+              margin: constraints.maxWidth > 1600
+                  ? EdgeInsets.symmetric(
+                      horizontal: (constraints.maxWidth - 1600) / 2,
+                    )
+                  : null,
+              child: page,
+            ),
+          );
+        }
+
         return SizedBox(
           width: constraints.maxWidth,
           height: constraints.maxHeight,
-          child: Container(
-            constraints: constraints.maxWidth > 1600
-                ? const BoxConstraints(maxWidth: 1600)
-                : null,
-            margin: constraints.maxWidth > 1600
-                ? EdgeInsets.symmetric(
-                    horizontal: (constraints.maxWidth - 1600) / 2,
-                  )
-                : null,
-            child: switch (_activeItem) {
-            'users' => UserManagementScreen(
-                inline: true,
-                initialRoleFilter: _userManagementRoleFilter == 'all'
-                    ? null
-                    : _userManagementRoleFilter,
-              ),
-            'cases' => CaseOversightScreen(
-                inline: true,
-                initialStatusFilter: _caseOversightStatusFilter == 'all'
-                    ? null
-                    : _caseOversightStatusFilter,
-                onOpenArchiveStorage: () {
-                  Get.to(
-                    () => ArchiveStorageScreen(
-                      onOpenBackup: () =>
-                          Get.to(() => const BackupSettingsScreen()),
-                    ),
-                  );
-                },
-              ),
-            'logs' => const SystemLogsScreen(inline: true),
-            'reports' => ReportsAnalyticsScreen(
-                inline: true,
-                onNavigateToUsers: ({String role = 'all'}) =>
-                    _openUsersFiltered(role),
-                onNavigateToCases: ({String status = 'all'}) =>
-                    _openCasesFiltered(status),
-              ),
-            'settings' => const SystemSettingsScreen(inline: true),
-            'dashboard' => _buildDashboardContent(horizontalPadding),
-            _ => _buildDashboardContent(horizontalPadding),
-          },
-          ),
+          child: page,
         );
       },
     );
   }
 
   Widget _buildDashboardContent([double horizontalPadding = 16.0]) {
-    if (_isLoading) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
-    return RefreshIndicator(
-      onRefresh: _loadDashboardData,
-      child: SingleChildScrollView(
-        physics: const AlwaysScrollableScrollPhysics(),
-        padding: EdgeInsets.symmetric(
-          horizontal: horizontalPadding,
-          vertical: 16,
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        AdminHeader(
+          findHits: _headerSearchHits,
+          onSubmitted: _onHeaderSearchSubmitted,
         ),
-        child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Header
-          const AdminHeader(),
-
-          const SizedBox(height: 24),
-
-          // Stats Grid
+        Expanded(
+          child: RefreshIndicator(
+            onRefresh: _loadDashboardData,
+            child: SingleChildScrollView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              padding: EdgeInsets.fromLTRB(
+                horizontalPadding,
+                16,
+                horizontalPadding,
+                24,
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
           LayoutBuilder(
             builder: (context, constraints) {
               final screenWidth = MediaQuery.of(context).size.width;
               final crossAxisCount = screenWidth > 1600
-                  ? 6
+                  ? 4
                   : screenWidth > 1200
                   ? 4
                   : screenWidth > 800
@@ -271,83 +504,86 @@ class _AdminDashboardState extends State<AdminDashboard> {
                   : screenWidth > 600
                   ? 2
                   : 1;
+              final cardHeight = screenWidth > 800 ? 88.0 : 84.0;
 
-              return GridView.count(
-                crossAxisCount: crossAxisCount,
+              return GridView(
+                clipBehavior: Clip.none,
                 shrinkWrap: true,
                 physics: const NeverScrollableScrollPhysics(),
-                mainAxisSpacing: 12,
-                crossAxisSpacing: 12,
-                childAspectRatio: screenWidth > 1600
-                    ? 1.2
-                    : screenWidth > 1200
-                    ? 1.25
-                    : 1.3,
+                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: crossAxisCount,
+                  mainAxisSpacing: 10,
+                  crossAxisSpacing: 10,
+                  mainAxisExtent: cardHeight,
+                ),
                 children: [
-                  StatCard(
+                  DashboardCard(
                     title: 'Total Users',
                     value: '${_stats['totalUsers'] ?? 0}',
-                    description: 'All registered users',
+                    subtitle: 'All registered users',
                     icon: Icons.people_outlined,
-                    iconColor: AppTheme.royalBlue,
-                    backgroundColor: AppTheme.royalBlue.withOpacity(0.1),
+                    iconColor: const Color(0xFF2C5282),
+                    pastel: const Color(0xFFD6E6F8),
                     percentageChange: '+12%',
                     onTap: () => _openUsersFiltered('all'),
                   ),
-                  StatCard(
+                  DashboardCard(
                     title: 'Total Clients',
                     value: '${_stats['totalClients'] ?? 0}',
-                    description: 'Active clients',
+                    subtitle: 'Active clients',
                     icon: Icons.person_outline,
-                    iconColor: const Color(0xFF2D7A4F),
-                    backgroundColor: const Color(0xFF2D7A4F).withOpacity(0.1),
+                    iconColor: const Color(0xFF2F7A4F),
+                    pastel: const Color(0xFFD8F0DC),
                     percentageChange: '+8%',
                     onTap: () => _openUsersFiltered('client'),
                   ),
-                  StatCard(
+                  DashboardCard(
                     title: 'Attorneys',
                     value: '${_stats['attorneys'] ?? 0}',
-                    description: 'Registered attorneys',
+                    subtitle: 'Registered attorneys',
                     icon: Icons.badge_outlined,
-                    iconColor: const Color(0xFFB8860B),
-                    backgroundColor: const Color(0xFFB8860B).withOpacity(0.1),
+                    iconColor: const Color(0xFFE56A1A),
+                    pastel: const Color(0xFFFFE8D6),
+                    percentageChange: '+6%',
                     onTap: () => _openUsersFiltered('attorney'),
                   ),
-                  StatCard(
+                  DashboardCard(
                     title: 'Staff',
                     value: '${_stats['staff'] ?? 0}',
-                    description: 'Registered staff',
+                    subtitle: 'Registered staff',
                     icon: Icons.support_agent,
-                    iconColor: const Color(0xFF5C4BA5),
-                    backgroundColor: const Color(0xFF5C4BA5).withOpacity(0.12),
+                    iconColor: const Color(0xFF5A5478),
+                    pastel: const Color(0xFFE6E0F6),
+                    percentageChange: '+3%',
                     onTap: () => _openUsersFiltered('staff'),
                   ),
-                  StatCard(
+                  DashboardCard(
                     title: 'Total Cases',
                     value: '${_stats['totalCases'] ?? 0}',
-                    description: 'All cases',
+                    subtitle: 'All cases',
                     icon: Icons.folder_outlined,
-                    iconColor: AppTheme.deepNavy,
-                    backgroundColor: AppTheme.deepNavy.withOpacity(0.1),
+                    iconColor: const Color(0xFFB42318),
+                    pastel: const Color(0xFFFFE4E1),
                     percentageChange: '+15%',
                     onTap: () => _openCasesFiltered('all'),
                   ),
-                  StatCard(
+                  DashboardCard(
                     title: 'Pending Cases',
                     value: '${_stats['pendingCases'] ?? 0}',
-                    description: 'Awaiting review',
+                    subtitle: 'Awaiting review',
                     icon: Icons.pending_outlined,
-                    iconColor: const Color(0xFFC55A3F),
-                    backgroundColor: const Color(0xFFC55A3F).withOpacity(0.1),
+                    iconColor: const Color(0xFFB45309),
+                    pastel: const Color(0xFFFEF3C7),
+                    percentageChange: '+4%',
                     onTap: () => _openCasesFiltered('pending'),
                   ),
-                  StatCard(
+                  DashboardCard(
                     title: 'Active Cases',
                     value: '${_stats['activeCases'] ?? 0}',
-                    description: 'In progress',
+                    subtitle: 'In progress',
                     icon: Icons.work_outline,
-                    iconColor: const Color(0xFF2E5C8A),
-                    backgroundColor: const Color(0xFF2E5C8A).withOpacity(0.1),
+                    iconColor: const Color(0xFF1D4E89),
+                    pastel: const Color(0xFFD6E6F8),
                     percentageChange: '+5%',
                     onTap: () => _openCasesFiltered('active'),
                   ),
@@ -355,15 +591,11 @@ class _AdminDashboardState extends State<AdminDashboard> {
               );
             },
           ),
-
-          const SizedBox(height: 32),
-
-          // Bottom Section - Recent Activity and Alerts
+          const SizedBox(height: 16),
           LayoutBuilder(
             builder: (context, constraints) {
               final screenWidth = MediaQuery.of(context).size.width;
               if (screenWidth > 900) {
-                // Desktop: Side by side
                 return Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -372,79 +604,80 @@ class _AdminDashboardState extends State<AdminDashboard> {
                     Expanded(flex: 1, child: _buildSystemAlerts()),
                   ],
                 );
-              } else {
-                // Mobile: Stacked
-                return Column(
-                  children: [
-                    _buildRecentActivity(),
-                    const SizedBox(height: 16),
-                    _buildSystemAlerts(),
-                  ],
-                );
               }
+              return Column(
+                children: [
+                  _buildRecentActivity(),
+                  const SizedBox(height: 24),
+                  _buildSystemAlerts(),
+                ],
+              );
             },
           ),
-
-          const SizedBox(height: 32),
-        ],
-      ),
-      ),
+          const SizedBox(height: 24),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 
   Widget _buildRecentActivity() {
     return Container(
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.05),
-            blurRadius: 10,
-            offset: const Offset(0, 4),
-          ),
-        ],
+        color: AdminUi.card,
+        borderRadius: BorderRadius.circular(AdminUi.radius),
+        boxShadow: AdminUi.cardShadow,
+        border: Border.all(color: AdminUi.line),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
+          const Row(
             children: [
-              Icon(Icons.history, color: AppTheme.royalBlue, size: 24),
-              const SizedBox(width: 12),
+              _SectionGlyph(icon: Icons.timeline_rounded, color: AdminUi.primary),
+              SizedBox(width: 10),
               Text(
                 'Recent Activity',
                 style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                  color: const Color(0xFF1C1C1C),
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  color: AdminUi.text,
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 12),
           if (_recentActivity.isEmpty)
-            Padding(
-              padding: const EdgeInsets.all(20),
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 16),
               child: Center(
                 child: Text(
                   'No recent activity',
                   style: TextStyle(
                     fontSize: 14,
-                    color: const Color(0xFF6D6D6D),
+                    fontWeight: FontWeight.w500,
+                    color: AdminUi.muted,
                   ),
                 ),
               ),
             )
           else
-            ..._recentActivity.map((activity) => _buildActivityItem(activity)),
+            ...List.generate(_recentActivity.length, (index) {
+              return _buildActivityItem(
+                _recentActivity[index],
+                isLast: index == _recentActivity.length - 1,
+              );
+            }),
         ],
       ),
     );
   }
 
-  Widget _buildActivityItem(Map<String, dynamic> activity) {
+  Widget _buildActivityItem(Map<String, dynamic> activity, {bool isLast = false}) {
     final timestamp = activity['timestamp'] as Timestamp?;
     String timeAgo = 'Just now';
     if (timestamp != null) {
@@ -453,197 +686,158 @@ class _AdminDashboardState extends State<AdminDashboard> {
       final difference = now.difference(time);
 
       if (difference.inDays > 0) {
-        timeAgo = '${difference.inDays}d ago';
+        timeAgo =
+            '${difference.inDays} day${difference.inDays == 1 ? '' : 's'} ago';
       } else if (difference.inHours > 0) {
-        timeAgo = '${difference.inHours}h ago';
+        timeAgo =
+            '${difference.inHours} hour${difference.inHours == 1 ? '' : 's'} ago';
       } else if (difference.inMinutes > 0) {
-        timeAgo = '${difference.inMinutes}m ago';
+        timeAgo =
+            '${difference.inMinutes} minute${difference.inMinutes == 1 ? '' : 's'} ago';
       }
     }
 
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 16),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            width: 40,
-            height: 40,
-            decoration: BoxDecoration(
-              color: AppTheme.royalBlue.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Icon(
-              Icons.info_outline,
-              color: AppTheme.royalBlue,
-              size: 20,
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  activity['action']
-                          ?.toString()
-                          .replaceAll('_', ' ')
-                          .toUpperCase() ??
-                      'Unknown',
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                    color: const Color(0xFF1C1C1C),
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  '${activity['userName'] ?? 'Unknown user'}',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: const Color(0xFF6D6D6D),
-                  ),
-                ),
-                if (activity['details'] != null) ...[
-                  const SizedBox(height: 2),
-                  Text(
-                    activity['details'].toString(),
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: const Color(0xFF6D6D6D),
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ],
-              ],
-            ),
-          ),
-          Text(
-            timeAgo,
-            style: TextStyle(fontSize: 11, color: const Color(0xFF6D6D6D)),
-          ),
-        ],
-      ),
+    final action = activity['action']?.toString() ?? 'Unknown';
+    final title = _prettyAction(action);
+    final details = activity['details']?.toString();
+    final icon = _iconForAction(action);
+    final accent = _colorForAction(action);
+
+    return ActivityItem(
+      title: title,
+      subtitle: '${activity['userName'] ?? 'Unknown user'}',
+      timestamp: timeAgo,
+      details: details,
+      isLast: isLast,
+      icon: icon,
+      accent: accent,
     );
+  }
+
+  String _prettyAction(String action) {
+    final words = action.replaceAll('_', ' ').toLowerCase().split(' ');
+    if (words.isEmpty || words.first.isEmpty) return action;
+    return '${words.first[0].toUpperCase()}${words.first.substring(1)} ${words.skip(1).join(' ')}'
+        .trim();
+  }
+
+  IconData _iconForAction(String action) {
+    final key = action.toLowerCase();
+    if (key.contains('login') || key.contains('sign')) return Icons.login_rounded;
+    if (key.contains('create') || key.contains('add')) return Icons.add_circle_outline;
+    if (key.contains('update') || key.contains('edit')) return Icons.edit_outlined;
+    if (key.contains('delete') || key.contains('remove')) return Icons.delete_outline;
+    if (key.contains('case')) return Icons.folder_outlined;
+    if (key.contains('user')) return Icons.person_outline;
+    return Icons.history_rounded;
+  }
+
+  Color _colorForAction(String action) {
+    final key = action.toLowerCase();
+    if (key.contains('delete') || key.contains('remove')) return AdminUi.danger;
+    if (key.contains('create') || key.contains('add')) return AdminUi.success;
+    if (key.contains('update') || key.contains('edit')) return AdminUi.warning;
+    if (key.contains('login')) return AdminUi.info;
+    return AdminUi.primary;
   }
 
   Widget _buildSystemAlerts() {
     return Container(
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.05),
-            blurRadius: 10,
-            offset: const Offset(0, 4),
-          ),
-        ],
+        color: AdminUi.card,
+        borderRadius: BorderRadius.circular(AdminUi.radius),
+        boxShadow: AdminUi.cardShadow,
+        border: Border.all(color: AdminUi.line),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
+          const Row(
             children: [
-              Icon(
-                Icons.notifications_outlined,
-                color: const Color(0xFFC55A3F),
-                size: 24,
-              ),
-              const SizedBox(width: 12),
+              _SectionGlyph(icon: Icons.notifications_outlined, color: AdminUi.danger),
+              SizedBox(width: 10),
               Text(
                 'System Alerts',
                 style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                  color: const Color(0xFF1C1C1C),
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  color: AdminUi.text,
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 20),
-          if (_systemAlerts.isEmpty)
-            Padding(
-              padding: const EdgeInsets.all(20),
-              child: Center(
-                child: Column(
-                  children: [
-                    Icon(
-                      Icons.check_circle_outline,
-                      size: 48,
-                      color: Colors.green.withOpacity(0.5),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      'All systems operational',
-                      style: TextStyle(
-                        fontSize: 14,
-                        color: const Color(0xFF6D6D6D),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            )
-          else
-            ..._systemAlerts.map((alert) => _buildAlertItem(alert)),
+          const SizedBox(height: 12),
+          ..._buildAlertCards(),
         ],
       ),
     );
   }
 
-  Widget _buildAlertItem(Map<String, dynamic> alert) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: alert['type'] == 'warning'
-            ? Colors.orange.withOpacity(0.1)
-            : Colors.red.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: alert['type'] == 'warning'
-              ? Colors.orange.withOpacity(0.3)
-              : Colors.red.withOpacity(0.3),
+  List<Widget> _buildAlertCards() {
+    final cards = <Widget>[];
+
+    if (_systemAlerts.isEmpty) {
+      cards.add(
+        const AlertCard(
+          title: 'All systems operational',
+          description: 'No active maintenance or critical alerts right now.',
+          timestamp: 'Live',
+          icon: Icons.check_circle_outline,
+          tone: AlertTone.success,
         ),
+      );
+    } else {
+      cards.addAll(_systemAlerts.map(_buildAlertItem));
+    }
+
+    final pending = _stats['pendingCases'] as int? ?? 0;
+    if (pending > 0) {
+      cards.add(
+        AlertCard(
+          title: '$pending case${pending == 1 ? '' : 's'} pending review',
+          description: 'Requires admin attention before assignment.',
+          timestamp: 'Today',
+          icon: Icons.error_outline_rounded,
+          tone: AlertTone.danger,
+        ),
+      );
+    }
+
+    final users = _stats['totalUsers'] as int? ?? 0;
+    cards.add(
+      AlertCard(
+        title: 'Platform monitoring is live',
+        description:
+            'Tracking $users registered user${users == 1 ? '' : 's'} across the system.',
+        timestamp: 'Live',
+        icon: Icons.shield_outlined,
+        tone: AlertTone.info,
       ),
-      child: Row(
-        children: [
-          Icon(
-            alert['icon'] ?? Icons.warning,
-            color: alert['type'] == 'warning' ? Colors.orange : Colors.red,
-            size: 20,
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  alert['title'] ?? 'Alert',
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                    color: const Color(0xFF1C1C1C),
-                  ),
-                ),
-                if (alert['message'] != null) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    alert['message'],
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: const Color(0xFF6D6D6D),
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ),
-        ],
-      ),
+    );
+
+    return cards;
+  }
+
+  Widget _buildAlertItem(Map<String, dynamic> alert) {
+    final type = (alert['type'] ?? '').toString().toLowerCase();
+    final title = (alert['title'] ?? 'Alert').toString();
+    final tone = switch (type) {
+      'error' || 'danger' => AlertTone.danger,
+      'info' => AlertTone.info,
+      'success' => AlertTone.success,
+      _ => title.toLowerCase().contains('maintenance')
+          ? AlertTone.danger
+          : AlertTone.warning,
+    };
+    final timestamp = alert['timestamp']?.toString();
+
+    return AlertCard(
+      title: title,
+      description: alert['message']?.toString() ?? '',
+      timestamp: timestamp ?? 'Active',
+      icon: alert['icon'] as IconData? ?? Icons.warning_amber_rounded,
+      tone: tone,
     );
   }
 
@@ -652,7 +846,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
     final isMobile = MediaQuery.of(context).size.width < 768;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F4F4),
+      backgroundColor: AdminUi.background,
       body: Row(
         children: [
           // Sidebar - Desktop
@@ -674,36 +868,30 @@ class _AdminDashboardState extends State<AdminDashboard> {
                   if (isMobile)
                     Container(
                       padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 12,
+                        horizontal: 12,
+                        vertical: 10,
                       ),
-                      decoration: BoxDecoration(
-                        color: Colors.white,
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withOpacity(0.05),
-                            blurRadius: 5,
-                            offset: const Offset(0, 2),
-                          ),
-                        ],
+                      decoration: const BoxDecoration(
+                        gradient: AdminUi.navyGradient,
                       ),
                       child: Builder(
                         builder: (BuildContext scaffoldContext) {
                           return Row(
                             children: [
                               IconButton(
-                                icon: const Icon(Icons.menu),
+                                icon: const Icon(Icons.menu_rounded),
+                                color: Colors.white,
                                 onPressed: () {
                                   Scaffold.of(scaffoldContext).openDrawer();
                                 },
                               ),
-                              const SizedBox(width: 12),
-                              Text(
+                              const SizedBox(width: 4),
+                              const Text(
                                 'Admin Dashboard',
                                 style: TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.bold,
-                                  color: const Color(0xFF1C1C1C),
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white,
                                 ),
                               ),
                             ],
@@ -723,6 +911,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
       // Mobile Sidebar Drawer
       drawer: isMobile
           ? Drawer(
+              width: AdminUi.sidebarWidth,
+              backgroundColor: AdminUi.primary,
               child: AdminSidebar(
                 activeItem: _activeItem,
                 onItemSelected: _handleItemSelected,
@@ -730,6 +920,26 @@ class _AdminDashboardState extends State<AdminDashboard> {
               ),
             )
           : null,
+    );
+  }
+}
+
+class _SectionGlyph extends StatelessWidget {
+  const _SectionGlyph({required this.icon, required this.color});
+
+  final IconData icon;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 36,
+      height: 36,
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Icon(icon, size: 18, color: color),
     );
   }
 }

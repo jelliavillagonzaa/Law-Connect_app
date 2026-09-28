@@ -11,13 +11,13 @@ class PasswordResetEmailService {
   // Note: You can use the same template as OTP or create a new one
   // If using OTP template, it will work but message will mention OTP
   // For best results, create a new template with: to_email, to_name, message, app_name
-  static const String _serviceId = 'service_h595leh'; // Same service as OTP
+  static const String _serviceId = 'service_55uzrrn'; // Same service as OTP
   static const String _templateId =
-      'template_eae41pq'; // Using OTP template for now
+      'template_h3geajd'; // Using OTP template for now
   // TODO: Create a dedicated password reset template in EmailJS and update _templateId
 
   // EmailJS Public Key (same as OTP service)
-  static const String _publicKey = 'public_tMoNNXN_4cNoa_j7w';
+  static const String _publicKey = '5hqM06GrxyJLvL7fM';
 
   static const String _emailjsApiUrl =
       'https://api.emailjs.com/api/v1.0/email/send';
@@ -37,9 +37,7 @@ class PasswordResetEmailService {
   }) async {
     try {
       // Validate public key
-      if (_publicKey == 'YOUR_PUBLIC_KEY_HERE' ||
-          _publicKey.isEmpty ||
-          !_publicKey.startsWith('public_')) {
+      if (_publicKey == 'YOUR_PUBLIC_KEY_HERE' || _publicKey.isEmpty) {
         if (kDebugMode) {
           debugPrint('❌ PASSWORD RESET EMAIL: Invalid Public Key!');
         }
@@ -50,6 +48,7 @@ class PasswordResetEmailService {
       // Note: The actual reset link will be sent by Firebase
       // This EmailJS email serves as a notification and ensures inbox delivery
       final templateParams = <String, dynamic>{
+        'email': email,
         'to_email': email,
         'to_name': name ?? 'User',
         'app_name': 'LawConnect',

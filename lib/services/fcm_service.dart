@@ -1,10 +1,18 @@
+import 'dart:async' show unawaited;
+
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart'
     show kDebugMode, debugPrint, kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:get/get.dart';
+import '../utils/out_of_system_notice.dart';
+import 'chat_session.dart';
+import '../utils/hearing_notification_formatter.dart';
+import 'hearing_notification_fanout_service.dart';
 import 'notification_service.dart';
 import 'firestore_mirror_helper.dart';
+import 'system_settings_service.dart';
 import 'web_notification.dart';
 
 /// FCM Service for sending push notifications
@@ -91,12 +99,24 @@ class FCMService {
           }
         }
       } else {
-        // Web platform - get token directly
+        await _messaging.requestPermission(
+          alert: true,
+          badge: true,
+          sound: true,
+        );
         await _initializeToken();
       }
 
       // Set up message handlers (works on all platforms)
       _setupMessageHandlers();
+
+      final signedInUid = FirebaseAuth.instance.currentUser?.uid;
+      if (signedInUid != null &&
+          signedInUid.isNotEmpty &&
+          _fcmToken != null &&
+          _fcmToken!.isNotEmpty) {
+        await _saveTokenToFirestore(_fcmToken!, signedInUid);
+      }
 
       _isInitialized = true;
 
@@ -172,7 +192,10 @@ class FCMService {
             '🔄 FCM Token refreshed: ${newToken.substring(0, newToken.length > 20 ? 20 : newToken.length)}...',
           );
         }
-        _saveTokenToFirestore(newToken);
+        final uid = FirebaseAuth.instance.currentUser?.uid;
+        if (uid != null && uid.isNotEmpty) {
+          _saveTokenToFirestore(newToken, uid);
+        }
       });
     } catch (e) {
       if (kDebugMode) {
@@ -185,6 +208,33 @@ class FCMService {
   void _setupMessageHandlers() {
     // Handle foreground messages - SHOW LOCAL NOTIFICATION
     FirebaseMessaging.onMessage.listen((RemoteMessage message) async {
+      if (_isCourtEmailIngestMessage(message)) {
+        if (kDebugMode) {
+          debugPrint(
+            '⏭️ Skipping court email ingest push (IMAP disabled): '
+            '${message.notification?.title}',
+          );
+        }
+        final uid = FirebaseAuth.instance.currentUser?.uid;
+        if (uid != null && uid.isNotEmpty) {
+          unawaited(
+            HearingNotificationFanoutService.instance
+                .purgeCourtEmailIngestNotices(uid),
+          );
+        }
+        return;
+      }
+
+      if (_isHearingRecordUpdateMessage(message)) {
+        if (kDebugMode) {
+          debugPrint(
+            '⏭️ Skipping duplicate hearing-update push: '
+            '${message.notification?.title}',
+          );
+        }
+        return;
+      }
+
       if (kDebugMode) {
         debugPrint(
           '📨 Foreground message received: ${message.notification?.title}',
@@ -192,9 +242,29 @@ class FCMService {
         debugPrint('📦 Data: ${message.data}');
       }
 
-      if (message.notification != null) {
-        final title = message.notification!.title ?? 'Notification';
-        final body = message.notification!.body ?? '';
+      final type = '${message.data['type'] ?? ''}'.toLowerCase();
+      if (type == 'new_message') {
+        final openChat = ChatSession.openChatId;
+        final chatId = '${message.data['chatId'] ?? ''}'.trim();
+        if (openChat != null && chatId.isNotEmpty && openChat == chatId) {
+          return;
+        }
+      }
+      final isHearingPush = type.contains('hearing') ||
+          (message.data['caseNo'] ?? '').toString().trim().isNotEmpty;
+      final title = message.notification?.title ??
+          (isHearingPush
+              ? 'Court hearing / order — ${message.data['caseNo'] ?? ''}'.trim()
+              : 'Notification');
+      final rawBody = message.notification?.body ?? '';
+      final body = isHearingPush
+          ? HearingNotificationFormatter.buildPopupBody({
+              ...message.data,
+              'message': rawBody,
+            })
+          : rawBody;
+
+      if (title.isNotEmpty && (body.isNotEmpty || isHearingPush)) {
 
         try {
           await _showForegroundLocalNotification(
@@ -210,11 +280,13 @@ class FCMService {
           }
         }
 
-        try {
-          await _saveNotificationToFirestore(message);
-        } catch (e) {
-          if (kDebugMode) {
-            debugPrint('❌ Error saving foreground notification: $e');
+        if (type != 'new_message') {
+          try {
+            await _saveNotificationToFirestore(message);
+          } catch (e) {
+            if (kDebugMode) {
+              debugPrint('❌ Error saving foreground notification: $e');
+            }
           }
         }
       }
@@ -331,27 +403,98 @@ class FCMService {
     }
   }
 
+  String get _tokenPlatform {
+    if (kIsWeb) return 'web';
+    if (_isAndroid()) return 'android';
+    if (_isIOS()) return 'ios';
+    return 'other';
+  }
+
   Future<void> _saveTokenToFirestore(String token, [String? userId]) async {
     try {
-      if (userId != null) {
-        final patch = <String, dynamic>{
-          'fcmToken': token,
-          'fcmTokenUpdatedAt': FieldValue.serverTimestamp(),
-        };
-        final result = await HybridDatastore.update(
-          collection: 'users',
-          id: userId,
-          patch: patch,
-        );
-        if (!result.isSuccess) throw Exception(result.failureMessage);
-        if (kDebugMode) {
-          debugPrint('✅ FCM token saved to Firestore for user: $userId');
-        }
+      final uid = (userId != null && userId.isNotEmpty)
+          ? userId
+          : FirebaseAuth.instance.currentUser?.uid;
+      if (uid == null || uid.isEmpty) return;
+      final patch = <String, dynamic>{
+        'fcmToken': token,
+        'fcmTokenUpdatedAt': FieldValue.serverTimestamp(),
+        'fcmTokens.${_tokenPlatform}': token,
+      };
+      final result = await HybridDatastore.update(
+        collection: 'users',
+        id: uid,
+        patch: patch,
+      );
+      if (!result.isSuccess) throw Exception(result.failureMessage);
+      if (kDebugMode) {
+        debugPrint('✅ FCM token saved to Firestore for user: $uid');
       }
     } catch (e) {
       if (kDebugMode) {
         debugPrint('❌ Error saving token to Firestore: $e');
       }
+    }
+  }
+
+  /// Phone and browser tokens for one user. The sender is never included.
+  Future<List<String>> tokensForUser(String userId) async {
+    try {
+      final userDoc = await _firestore.collection('users').doc(userId).get();
+      if (!userDoc.exists) return const [];
+      final data = userDoc.data();
+      if (data == null) return const [];
+      final out = <String>{};
+      void add(dynamic raw) {
+        if (raw is String && raw.length > 20) out.add(raw);
+      }
+
+      add(data['fcmToken']);
+      final map = data['fcmTokens'];
+      if (map is Map) {
+        for (final value in map.values) {
+          add(value);
+        }
+      }
+      return out.toList();
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('❌ Error reading FCM tokens: $e');
+      }
+      return const [];
+    }
+  }
+
+  /// Push a chat message to one recipient's devices. Does not notify the sender.
+  Future<void> sendChatPush({
+    required String userId,
+    required String title,
+    required String body,
+    required String chatId,
+    required String senderId,
+    required String senderName,
+  }) async {
+    if (userId.isEmpty || userId == senderId) return;
+    final settings = await SystemSettingsService.instance.load();
+    if (!settings.allowsPush(const {'type': 'new_message'})) return;
+
+    final tokens = await tokensForUser(userId);
+    if (tokens.isEmpty) return;
+
+    final data = <String, dynamic>{
+      'type': 'new_message',
+      'chatId': chatId,
+      'senderId': senderId,
+      'senderName': senderName,
+      'userId': userId,
+    };
+    for (final token in tokens) {
+      await sendNotificationToToken(
+        fcmToken: token,
+        title: title,
+        body: body,
+        data: data,
+      );
     }
   }
 
@@ -445,6 +588,14 @@ class FCMService {
     Map<String, dynamic>? data,
   }) async {
     try {
+      final settings = await SystemSettingsService.instance.load();
+      if (!settings.allowsPush(data)) {
+        if (kDebugMode) {
+          debugPrint('ℹ️ Push skipped by Notification Settings');
+        }
+        return false;
+      }
+
       if (kDebugMode) {
         debugPrint('═══════════════════════════════════════');
         debugPrint('📤 SENDING FCM NOTIFICATION');
@@ -604,6 +755,7 @@ class FCMService {
 
   /// Save notification to Firestore when received
   Future<void> _saveNotificationToFirestore(RemoteMessage message) async {
+    if (_isCourtEmailIngestMessage(message)) return;
     try {
       // Get userId from message data or current user
       String? userId = message.data['userId'] as String?;
@@ -675,13 +827,18 @@ class FCMService {
           }
           break;
         case 'new_message':
-          // Navigate to chat
-          final chatId = data['chatId'] as String?;
-          if (chatId != null) {
-            // Get.toNamed('/Chat', arguments: {'chatId': chatId});
-            if (kDebugMode) {
-              debugPrint('📍 Would navigate to chat: $chatId');
-            }
+          final chatId = '${data['chatId'] ?? ''}'.trim();
+          final senderId = '${data['senderId'] ?? ''}'.trim();
+          final senderName = '${data['senderName'] ?? 'Message'}'.trim();
+          if (chatId.isNotEmpty && senderId.isNotEmpty) {
+            Get.toNamed(
+              '/ChatMessage',
+              arguments: {
+                'chatId': chatId,
+                'senderId': senderId,
+                'senderName': senderName.isEmpty ? 'Message' : senderName,
+              },
+            );
           }
           break;
         case 'court_email_ingest':
@@ -704,5 +861,35 @@ class FCMService {
         debugPrint('❌ Error handling notification tap: $e');
       }
     }
+  }
+
+  bool _isCourtEmailIngestMessage(RemoteMessage message) {
+    final title = message.notification?.title ?? '';
+    final body = message.notification?.body ?? '';
+    if (isOutOfSystemCourtNoticeTitle(title) ||
+        isOutOfSystemPumpedNoticeText('$title\n$body')) {
+      return true;
+    }
+
+    final type = (message.data['type'] as String? ?? '').toLowerCase();
+    if (type == 'court_email_ingest') return true;
+    if (type.startsWith('court_') && !type.contains('hearing')) return true;
+
+    final queueDocId = ((message.data['queueDocId'] ??
+                message.data['queuedDocId']) as String? ??
+            '')
+        .toLowerCase();
+    if (queueDocId.contains('imap')) return true;
+
+    return false;
+  }
+
+  bool _isHearingRecordUpdateMessage(RemoteMessage message) {
+    final title = message.notification?.title ?? '';
+    final type = (message.data['type'] as String? ?? '').toLowerCase();
+    return isHearingRecordUpdateNotification({
+      'title': title,
+      'type': type,
+    });
   }
 }

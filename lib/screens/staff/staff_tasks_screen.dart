@@ -1,10 +1,14 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../services/task_service.dart';
+import '../../services/staff_service.dart';
 import '../../models/task_model.dart';
 import '../../models/case_model.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/open_work_tasks.dart';
+import '../../utils/task_priority.dart';
 import 'task_detail_screen.dart';
 
 class StaffTasksScreen extends StatefulWidget {
@@ -16,8 +20,78 @@ class StaffTasksScreen extends StatefulWidget {
 
 class _StaffTasksScreenState extends State<StaffTasksScreen> {
   final TaskService _taskService = TaskService();
+  final StaffService _staffService = StaffService();
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-  String _selectedFilter = 'all';
+  String _selectedFilter = 'open';
+  Set<String> _closedCaseIds = {};
+  StreamSubscription<List<CaseModel>>? _assignedCasesSub;
+  StreamSubscription<List<CaseModel>>? _attorneyCasesSub;
+
+  @override
+  void initState() {
+    super.initState();
+    _listenClosedCases();
+  }
+
+  @override
+  void dispose() {
+    _assignedCasesSub?.cancel();
+    _attorneyCasesSub?.cancel();
+    super.dispose();
+  }
+
+  void _listenClosedCases() {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    _assignedCasesSub = _staffService.getAssignedCases(user.uid).listen((
+      cases,
+    ) {
+      if (!mounted) return;
+      _mergeClosedCases(cases);
+    });
+
+    _firestore.collection('users').doc(user.uid).get().then((doc) {
+      final attorneyId =
+          (doc.data()?['assignedAttorneyId'] as String?)?.trim() ?? '';
+      if (attorneyId.isEmpty || !mounted) return;
+      _attorneyCasesSub = _staffService.getAttorneyCases(attorneyId).listen((
+        cases,
+      ) {
+        if (!mounted) return;
+        _mergeClosedCases(cases);
+      });
+    });
+  }
+
+  void _mergeClosedCases(List<CaseModel> cases) {
+    setState(() {
+      _closedCaseIds = {
+        ..._closedCaseIds,
+        ...OpenWorkTasks.closedCaseIds(cases),
+      };
+    });
+  }
+
+  List<TaskModel> _applyFilter(List<TaskModel> tasks) {
+    switch (_selectedFilter) {
+      case 'open':
+        return OpenWorkTasks.live(tasks, _closedCaseIds);
+      case 'closed':
+        return tasks.where((t) {
+          if (OpenWorkTasks.isCancelled(t.status)) return true;
+          final id = t.caseId?.trim() ?? '';
+          return id.isNotEmpty && _closedCaseIds.contains(id);
+        }).toList();
+      case 'pending':
+      case 'in_progress':
+        return OpenWorkTasks.live(tasks, _closedCaseIds)
+            .where((t) => t.status.toLowerCase().trim() == _selectedFilter)
+            .toList();
+      default:
+        return tasks;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -49,24 +123,32 @@ class _StaffTasksScreenState extends State<StaffTasksScreen> {
               setState(() => _selectedFilter = value);
             },
             itemBuilder: (context) => [
-              const PopupMenuItem(value: 'all', child: Text('All Tasks')),
+              const PopupMenuItem(value: 'open', child: Text('Open work')),
               const PopupMenuItem(value: 'pending', child: Text('Pending')),
               const PopupMenuItem(
                 value: 'in_progress',
                 child: Text('In Progress'),
               ),
               const PopupMenuItem(value: 'completed', child: Text('Completed')),
+              const PopupMenuItem(
+                value: 'closed',
+                child: Text('Closed cases'),
+              ),
+              const PopupMenuItem(value: 'all', child: Text('All Tasks')),
             ],
           ),
         ],
       ),
       body: StreamBuilder<List<TaskModel>>(
-        stream: _selectedFilter == 'all'
-            ? _taskService.getStaffTasks(user.uid)
-            : _taskService.getStaffTasksByStatus(user.uid, _selectedFilter),
+        stream: (_selectedFilter == 'pending' ||
+                _selectedFilter == 'in_progress' ||
+                _selectedFilter == 'completed')
+            ? _taskService.getStaffTasksByStatus(user.uid, _selectedFilter)
+            : _taskService.getStaffTasks(user.uid),
         builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
+          if (snapshot.connectionState == ConnectionState.waiting &&
+              !snapshot.hasData) {
+            return const SizedBox.shrink();
           }
 
           if (snapshot.hasError) {
@@ -82,7 +164,7 @@ class _StaffTasksScreenState extends State<StaffTasksScreen> {
             );
           }
 
-          final tasks = snapshot.data ?? [];
+          final tasks = _applyFilter(snapshot.data ?? []);
 
           if (tasks.isEmpty) {
             return Center(
@@ -92,7 +174,7 @@ class _StaffTasksScreenState extends State<StaffTasksScreen> {
                   Icon(Icons.task_outlined, size: 64, color: Colors.grey),
                   const SizedBox(height: 16),
                   Text(
-                    'No tasks assigned yet',
+                    _emptyFilterMessage(),
                     style: TextStyle(fontSize: 18, color: Colors.grey),
                   ),
                 ],
@@ -259,33 +341,24 @@ class _StaffTasksScreenState extends State<StaffTasksScreen> {
     );
   }
 
-  String _getPriorityLabel(int? priority) {
-    switch (priority) {
-      case 1:
-        return 'Urgent';
-      case 2:
-        return 'High';
-      case 3:
-        return 'Normal';
-      case 4:
-        return 'Low';
-      default:
-        return 'Normal';
-    }
-  }
+  String _getPriorityLabel(int? priority) => TaskPriority.label(priority);
 
-  Color _getPriorityColor(int? priority) {
-    switch (priority) {
-      case 1:
-        return Colors.orange; // Professional warning color for urgent
-      case 2:
-        return Colors.orange;
-      case 3:
-        return AppTheme.royalBlue;
-      case 4:
-        return Colors.green;
+  Color _getPriorityColor(int? priority) => TaskPriority.color(priority);
+
+  String _emptyFilterMessage() {
+    switch (_selectedFilter) {
+      case 'open':
+        return 'No open tasks';
+      case 'closed':
+        return 'No closed-case tasks';
+      case 'pending':
+        return 'No pending tasks';
+      case 'in_progress':
+        return 'No in-progress tasks';
+      case 'completed':
+        return 'No completed tasks';
       default:
-        return Colors.grey;
+        return 'No tasks assigned yet';
     }
   }
 
@@ -297,6 +370,9 @@ class _StaffTasksScreenState extends State<StaffTasksScreen> {
         return 'In Progress';
       case 'completed':
         return 'Completed';
+      case 'cancelled':
+      case 'canceled':
+        return 'Cancelled';
       case 'overdue':
         return 'Overdue';
       default:
@@ -312,6 +388,9 @@ class _StaffTasksScreenState extends State<StaffTasksScreen> {
         return Colors.blue;
       case 'completed':
         return Colors.green;
+      case 'cancelled':
+      case 'canceled':
+        return Colors.grey;
       case 'overdue':
         return Colors.red;
       default:

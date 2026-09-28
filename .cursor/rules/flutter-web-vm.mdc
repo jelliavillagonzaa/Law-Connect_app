@@ -1,0 +1,33 @@
+---
+description: Keep the Flutter web debug VM alive — never use web hot reload
+alwaysApply: true
+---
+
+# Flutter web debug VM
+
+These are **not app bugs**. They mean the Chrome debug session is dead:
+
+- `getVM: (-32000) Service connection disposed`
+- `writeFrom failed / pipe is being closed`
+- `TypeError: Cannot read properties of undefined (reading 'Symbol($signatureRtl)')`
+- `Null is not a subtype of type bool` after a widget field change on web
+
+They happen when web hot reload (`r`) is on, expression eval is on, a widget class shape changed, or the Chrome tab was closed.
+
+A **red Chrome compile error** such as `No named parameter with the name 'silent'` is a real Dart web compile failure. `dart:html` `Notification()` only accepts `dir`, `body`, `lang`, `tag`, `icon`. Do not pass JS options (`silent`, `badge`, `vibrate`, `requireInteraction`, `renotify`). Keep web Notification creation in `_createBrowserNotification` in `lib/services/web_notification_web.dart`.
+
+## Never
+
+- Do not run bare `flutter run` (it enables web hot reload by default)
+- Do not tell the user to press **r**
+- Do not start `flutter run` from a background agent shell
+- Do not close the Chrome tab Flutter opened
+- Do not mash **R** while a restart is already running
+- Do not reuse a session that already printed `The Dart compiler exited unexpectedly`
+
+## Always
+
+- Chrome: `.\scripts\run_chrome.cmd` (or `flutter` / `flutterrun` in a **new** Cursor terminal — `flutterrun` is a no-space alias)
+- Required flags: `--no-web-experimental-hot-reload --no-web-enable-expression-evaluation --no-web-resources-cdn`
+- After Dart edits: press **R** once
+- If the compiler already exited or the screen is red: **q**, close leftover Chrome tabs, **new terminal**, `.\scripts\run_chrome.cmd`

@@ -3,6 +3,7 @@ import 'dart:async' show unawaited;
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import '../app/app_startup_state.dart';
 import '../models/user_model.dart';
 import 'user_setup_service.dart';
 import 'email_otp_service.dart';
@@ -11,10 +12,12 @@ import 'admin_service.dart';
 import 'sms_service.dart';
 import 'staff_application_service.dart';
 import 'firestore_mirror_helper.dart';
+import 'calendar_session_cleanup.dart';
+import 'system_settings_service.dart';
 
 class AuthService {
-  final FirebaseAuth _auth = FirebaseAuth.instance;
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  FirebaseAuth get _auth => FirebaseAuth.instance;
+  FirebaseFirestore get _firestore => FirebaseFirestore.instance;
 
   /// Limits rapid Firebase verification emails (multiple [AuthService] instances share this).
   static DateTime? _lastFirebaseVerificationEmailSentAt;
@@ -573,21 +576,24 @@ class AuthService {
       );
 
       if (channel == 'email') {
-        final sent = await EmailOtpService().sendOtp(
+        final sent = await EmailOtpService().sendOtpDetailed(
           email: docEmail,
           otp: otp,
           name: recipientName,
           fcmToken: fcmToken,
         );
-        if (!sent) {
+        if (!sent.emailSent) {
           return {
             'success': false,
-            'message': 'Failed to send verification code to your email.',
+            'message':
+                sent.error ??
+                'Failed to send the verification code to Gmail. Check inbox and spam, then tap Resend.',
           };
         }
         return {
           'success': true,
-          'message': 'Verification code sent to your email.',
+          'message':
+              'Verification code sent to $docEmail. Check Inbox and Spam.',
           'channel': 'email',
           'destination': docEmail,
           'otp': otp,
@@ -1196,6 +1202,12 @@ class AuthService {
     required String password,
   }) async {
     try {
+      await AppStartupState.whenFirebaseReady;
+      final attemptBlock =
+          await SystemSettingsService.instance.loginAttemptBlock(email);
+      if (attemptBlock != null) {
+        return {'success': false, 'message': attemptBlock};
+      }
       final userCredential = await _auth.signInWithEmailAndPassword(
         email: email,
         password: password,
@@ -1343,6 +1355,11 @@ class AuthService {
                   'client', // Admin/staff/attorney don't need verification
               'createdAt': FieldValue.serverTimestamp(),
             };
+            // The single attorney signs in directly. Mark the account active
+            // so Case Oversight can assign cases without a signup approval.
+            if (defaultRole == 'attorney') {
+              loginUserData['isActive'] = true;
+            }
             await _retryFirestoreOperation(
               () async {
                 final result = await FirestoreMirror.doc(
@@ -1497,10 +1514,12 @@ class AuthService {
         };
       }
       var userDataMap = Map<String, dynamic>.from(userData);
-      final staffSync = await syncStaffRoleFromStaffApplication(
+      final staffSyncFuture = syncStaffRoleFromStaffApplication(
         uid: user.uid,
         email: email,
       );
+      final maintenanceFuture = _checkMaintenanceMode();
+      final staffSync = await staffSyncFuture;
       if (staffSync != null) {
         userDataMap.addAll(staffSync);
       }
@@ -1514,10 +1533,12 @@ class AuthService {
         finalIsVerified = true;
       }
 
-      await repairPortalRoleIfNeeded(
-        uid: user.uid,
-        email: emailLower,
-        firestoreRole: role,
+      unawaited(
+        repairPortalRoleIfNeeded(
+          uid: user.uid,
+          email: emailLower,
+          firestoreRole: role,
+        ),
       );
 
       // Defer email-verification sync so login navigation is not blocked on mobile.
@@ -1535,7 +1556,7 @@ class AuthService {
       // IMPORTANT: Always allow admins to login, even during maintenance
       // This ensures admins can always access the system to disable maintenance mode
       try {
-        final isMaintenanceMode = await _checkMaintenanceMode();
+        final isMaintenanceMode = await maintenanceFuture;
         if (isMaintenanceMode) {
           // Check if user is admin - allow admins to always login
           final isAdmin = finalRole.toLowerCase() == 'admin';
@@ -1588,12 +1609,16 @@ class AuthService {
       // Block client login if not verified
       // Admin, Attorney, and Staff don't need verification (they are created by admin)
       // Only require verification for client role
-      final rolesThatDontNeedVerification = ['admin', 'attorney', 'staff'];
+      final security = await SystemSettingsService.instance.load();
+      final rolesThatDontNeedVerification = security.enableTwoFactor
+          ? ['admin']
+          : ['admin', 'attorney', 'staff'];
       final needsVerification = !rolesThatDontNeedVerification.contains(
         finalRole.toLowerCase(),
       );
 
       if (needsVerification && !finalIsVerified) {
+        unawaited(SystemSettingsService.instance.clearFailedLogins(email));
         // Keep the session: OTP / verification screens need currentUser.
         // Login UI treats success + needsVerification → verification flow (not a red error).
         final pendingUserData = Map<String, dynamic>.from(userDataMap);
@@ -1610,6 +1635,7 @@ class AuthService {
       }
 
       // Non-blocking: FCM + audit log must not delay navigation (prevents ANR/crash).
+      unawaited(SystemSettingsService.instance.clearFailedLogins(email));
       unawaited(_postLoginSideEffects(user.uid, role));
 
       // Update userData with final role and isVerified for consistency
@@ -1623,6 +1649,12 @@ class AuthService {
         'role': finalRole,
       };
     } on FirebaseAuthException catch (e) {
+      if (e.code == 'wrong-password' ||
+          e.code == 'invalid-credential' ||
+          e.code == 'user-not-found' ||
+          e.code == 'invalid-email') {
+        await SystemSettingsService.instance.recordFailedLogin(email);
+      }
       String message = 'Login failed';
       switch (e.code) {
         case 'user-not-found':
@@ -2027,6 +2059,7 @@ class AuthService {
 
   // Logout
   Future<void> logout() async {
+    CalendarSessionCleanup.onLogout();
     await _auth.signOut();
   }
 
@@ -2101,23 +2134,25 @@ class AuthService {
         if (!result.isSuccess) throw Exception(result.failureMessage);
       }
 
-      final success = await emailOtpService.sendOtp(
+      final sent = await emailOtpService.sendOtpDetailed(
         email: docEmail,
         otp: otp,
         name: name,
       );
 
-      if (success) {
+      if (sent.emailSent) {
         return {
           'success': true,
           'message':
-              'Verification code sent to your email. Please check your inbox.',
+              'Verification code sent to $docEmail. Check Inbox and Spam.',
           'otp': otp,
         };
       } else {
         return {
           'success': false,
-          'message': 'Failed to send verification code. Please try again.',
+          'message':
+              sent.error ??
+              'Failed to send the verification code to Gmail. Try again.',
         };
       }
     } catch (e) {

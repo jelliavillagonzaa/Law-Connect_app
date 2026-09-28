@@ -779,8 +779,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
             Expanded(
               child: ElevatedButton.icon(
                 onPressed: () {
-                  // Step 1 of appointment flow: select attorney
-                  Get.to(() => const AttorneySelectionScreen());
+                  openRequestAppointmentFlow();
                 },
                 style: ElevatedButton.styleFrom(
                   backgroundColor: primaryColor,

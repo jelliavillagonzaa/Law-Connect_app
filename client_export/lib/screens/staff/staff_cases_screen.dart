@@ -10,6 +10,8 @@ import '../../services/storage_service.dart';
 import '../../models/case_model.dart';
 import '../../models/user_model.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/case_status_filter.dart';
+import '../../widgets/case/case_status_filter_button.dart';
 
 class StaffCasesScreen extends StatefulWidget {
   const StaffCasesScreen({super.key});
@@ -67,20 +69,12 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
                   ? 'Show Only Assigned Cases'
                   : 'Show All Attorney Cases',
             ),
-          PopupMenuButton<String>(
+          CaseStatusFilterButton(
+            selected: _selectedFilter,
+            iconColor: AppTheme.cleanWhite,
             onSelected: (value) {
               setState(() => _selectedFilter = value);
             },
-            itemBuilder: (context) => [
-              const PopupMenuItem(value: 'all', child: Text('All Cases')),
-              const PopupMenuItem(value: 'active', child: Text('Active')),
-              const PopupMenuItem(value: 'pending', child: Text('Pending')),
-              const PopupMenuItem(value: 'completed', child: Text('Completed')),
-            ],
-            child: Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Icon(Icons.filter_list, color: AppTheme.cleanWhite),
-            ),
           ),
         ],
       ),
@@ -110,9 +104,13 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
           }
 
           final allCases = snapshot.data ?? [];
-          final filteredCases = _filterCases(allCases, _selectedFilter);
+          final filteredCases =
+              CaseStatusFilter.apply(allCases, _selectedFilter);
 
           if (filteredCases.isEmpty) {
+            final empty = _selectedFilter == CaseStatusFilter.all
+                ? 'No cases assigned yet'
+                : 'No ${CaseStatusFilter.label(_selectedFilter).toLowerCase()} cases';
             return Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -120,7 +118,7 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
                   Icon(Icons.folder_open, size: 64, color: Colors.grey),
                   const SizedBox(height: 16),
                   Text(
-                    'No cases assigned yet',
+                    empty,
                     style: TextStyle(
                       fontSize: 18,
                       color: Colors.grey,
@@ -164,7 +162,7 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        'Status: ${caseModel.status.toUpperCase()}',
+                        'Status: ${CaseStatusFilter.statusLabel(caseModel.status)}',
                         style: TextStyle(
                           fontSize: 12,
                           color: _getStatusColor(caseModel.status),
@@ -192,21 +190,6 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
         },
       ),
     );
-  }
-
-  List<CaseModel> _filterCases(List<CaseModel> cases, String filter) {
-    switch (filter) {
-      case 'active':
-        return cases
-            .where((c) => c.status == 'in_progress' || c.status == 'accepted')
-            .toList();
-      case 'pending':
-        return cases.where((c) => c.status == 'pending').toList();
-      case 'completed':
-        return cases.where((c) => c.status == 'completed').toList();
-      default:
-        return cases;
-    }
   }
 
   Color _getStatusColor(String status) {

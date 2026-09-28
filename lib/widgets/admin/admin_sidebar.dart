@@ -1,12 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../models/user_model.dart';
-import '../../theme/app_theme.dart';
-import '../common/safe_network_avatar.dart';
-
-const Color kAdminAccentColor = AppTheme.royalBlue;
-const Color kAdminAccentColorDark = AppTheme.deepNavy;
+import 'admin_ui_theme.dart';
+import 'profile_card.dart';
+import 'sidebar_item.dart';
+import '../common/brand_logo.dart';
 
 class AdminSidebar extends StatefulWidget {
   final String activeItem;
@@ -26,18 +27,27 @@ class AdminSidebar extends StatefulWidget {
 
 class _AdminSidebarState extends State<AdminSidebar> {
   UserModel? _currentUser;
-  bool _isLoading = true;
+  StreamSubscription<User?>? _authSub;
+
   @override
   void initState() {
     super.initState();
     _loadUserData();
+    _authSub = FirebaseAuth.instance.authStateChanges().listen((_) {
+      _loadUserData();
+    });
+  }
+
+  @override
+  void dispose() {
+    _authSub?.cancel();
+    super.dispose();
   }
 
   Future<void> _loadUserData() async {
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) {
-        setState(() => _isLoading = false);
         return;
       }
 
@@ -48,16 +58,37 @@ class _AdminSidebarState extends State<AdminSidebar> {
       if (userDoc.exists && mounted) {
         setState(() {
           _currentUser = UserModel.fromFirestore(userDoc.data()!, user.uid);
-          _isLoading = false;
         });
-      } else {
-        setState(() => _isLoading = false);
       }
-    } catch (e) {
-      if (mounted) {
-        setState(() => _isLoading = false);
-      }
-    }
+    } catch (_) {}
+  }
+
+  Widget _logoutButton() {
+    return SizedBox(
+      width: double.infinity,
+      child: TextButton.icon(
+        onPressed: widget.onLogout,
+        style: TextButton.styleFrom(
+          backgroundColor: const Color(0xFF16325C),
+          foregroundColor: Colors.white,
+          padding: const EdgeInsets.symmetric(vertical: 7),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(8),
+            side: BorderSide(color: Colors.white.withValues(alpha: 0.10)),
+          ),
+        ),
+        icon: const Icon(Icons.logout_rounded, size: 14, color: Colors.white),
+        label: const Text(
+          'Logout',
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+            color: Colors.white,
+            letterSpacing: 0.2,
+          ),
+        ),
+      ),
+    );
   }
 
   final List<Map<String, dynamic>> _menuItems = [
@@ -84,240 +115,128 @@ class _AdminSidebarState extends State<AdminSidebar> {
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 280,
-      decoration: BoxDecoration(
-        color: Colors.white,
+      width: AdminUi.sidebarWidth,
+      decoration: const BoxDecoration(
+        gradient: AdminUi.navyGradient,
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.08),
-            blurRadius: 15,
-            offset: const Offset(2, 0),
+            color: Color(0x40122A54),
+            blurRadius: 28,
+            offset: Offset(8, 0),
           ),
         ],
       ),
-      child: Column(
+      child: SafeArea(
+        child: Column(
         children: [
-          // Logo/Header Section
-          Container(
-            padding: const EdgeInsets.all(24),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
             child: Row(
               children: [
-                Container(
-                  width: 48,
-                  height: 48,
-                  decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                      colors: [kAdminAccentColor, kAdminAccentColorDark],
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                    ),
-                    borderRadius: BorderRadius.circular(12),
-                    boxShadow: [
-                      BoxShadow(
-                        color: kAdminAccentColor.withOpacity(0.3),
-                        blurRadius: 8,
-                        offset: const Offset(0, 2),
+                const BrandLogo(size: 32),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Law Connect',
+                        style: TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w800,
+                          color: Colors.white,
+                          letterSpacing: 0.1,
+                          height: 1.15,
+                        ),
+                      ),
+                      SizedBox(height: 1),
+                      Text(
+                        'Admin Console',
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w500,
+                          color: Color(0xB3FFFFFF),
+                        ),
                       ),
                     ],
-                  ),
-                  child: const Icon(Icons.gavel, color: Colors.white, size: 24),
-                ),
-                const SizedBox(width: 12),
-                Text(
-                  'Law Connect',
-                  style: TextStyle(
-                    fontSize: 22,
-                    fontWeight: FontWeight.bold,
-                    color: const Color(0xFF1C1C1C),
-                    letterSpacing: 0.5,
                   ),
                 ),
               ],
             ),
           ),
-          const Divider(height: 1),
-
-          // Menu Items
-          Expanded(
-            child: ListView.builder(
-              padding: const EdgeInsets.symmetric(vertical: 8),
-              itemCount: _menuItems.length,
-              itemBuilder: (context, index) {
-                final item = _menuItems[index];
-                final isActive = widget.activeItem == item['key'];
-
-                return Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 4,
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            child: Container(height: 1, color: Colors.white.withValues(alpha: 0.08)),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(8, 10, 8, 6),
+            child: Column(
+              children: [
+                for (final item in _menuItems)
+                  SidebarItem(
+                    title: item['title'] as String,
+                    icon: item['icon'] as IconData,
+                    isActive: widget.activeItem == item['key'],
+                    onTap: () => widget.onItemSelected(item['key'] as String),
                   ),
-                  child: _MenuItem(
-                    title: item['title'],
-                    icon: item['icon'],
-                    isActive: isActive,
-                    onTap: () => widget.onItemSelected(item['key']),
+              ],
+            ),
+          ),
+          Expanded(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                return SingleChildScrollView(
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(10, 6, 10, 10),
+                      child: Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (_currentUser != null)
+                            ProfileCard(
+                              user: _currentUser!,
+                              onLogout: widget.onLogout,
+                            )
+                          else
+                            _logoutButton(),
+                          const SizedBox(height: 8),
+                          const Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                Icons.balance,
+                                size: 12,
+                                color: Color(0xB3FFFFFF),
+                              ),
+                              SizedBox(width: 6),
+                              Flexible(
+                                child: Text(
+                                  '"Justice Within Reach"',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w500,
+                                    fontStyle: FontStyle.italic,
+                                    color: Color(0xB3FFFFFF),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    ),
                   ),
                 );
               },
             ),
           ),
-
-          const Divider(height: 1),
-
-          // User Profile Section
-          Container(
-            padding: const EdgeInsets.all(16),
-            child: _isLoading
-                ? const Center(child: CircularProgressIndicator())
-                : _currentUser == null
-                ? const SizedBox.shrink()
-                : _UserProfileSection(
-                    user: _currentUser!,
-                    onLogout: widget.onLogout,
-                  ),
-          ),
         ],
-      ),
-    );
-  }
-}
-
-class _MenuItem extends StatelessWidget {
-  final String title;
-  final IconData icon;
-  final bool isActive;
-  final VoidCallback onTap;
-
-  const _MenuItem({
-    required this.title,
-    required this.icon,
-    required this.isActive,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(12),
-        hoverColor: AppTheme.royalBlue.withOpacity(0.05),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-          decoration: BoxDecoration(
-            color: isActive
-                ? kAdminAccentColor.withOpacity(0.12)
-                : Colors.transparent,
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Row(
-            children: [
-              Icon(
-                icon,
-                size: 22,
-                color: isActive ? kAdminAccentColor : const Color(0xFF6D6D6D),
-              ),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Text(
-                  title,
-                  style: TextStyle(
-                    fontSize: 15,
-                    fontWeight: isActive ? FontWeight.w600 : FontWeight.w500,
-                    color: isActive
-                        ? kAdminAccentColor
-                        : const Color(0xFF1C1C1C),
-                    letterSpacing: 0.2,
-                  ),
-                ),
-              ),
-            ],
-          ),
         ),
       ),
-    );
-  }
-}
-
-class _UserProfileSection extends StatelessWidget {
-  final UserModel user;
-  final VoidCallback onLogout;
-
-  const _UserProfileSection({required this.user, required this.onLogout});
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        Row(
-          children: [
-            SafeNetworkAvatar(
-              photoUrl: user.photoUrl,
-              radius: 28,
-              fallbackLetter: user.name.isNotEmpty ? user.name[0] : 'A',
-              backgroundColor: kAdminAccentColor.withOpacity(0.12),
-              foregroundColor: kAdminAccentColor,
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    user.name,
-                    style: TextStyle(
-                      fontSize: 15,
-                      fontWeight: FontWeight.w600,
-                      color: const Color(0xFF1C1C1C),
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    user.email,
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: const Color(0xFF6D6D6D),
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-        Material(
-          color: Colors.transparent,
-          child: InkWell(
-            onTap: onLogout,
-            borderRadius: BorderRadius.circular(12),
-            hoverColor: AppTheme.royalBlue.withOpacity(0.1),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              decoration: BoxDecoration(
-                color: AppTheme.royalBlue.withOpacity(0.1),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: AppTheme.royalBlue, width: 1),
-              ),
-              child: Center(
-                child: Text(
-                  'Logout',
-                  style: TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w600,
-                    color: AppTheme.royalBlue,
-                    letterSpacing: 0.3,
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-      ],
     );
   }
 }

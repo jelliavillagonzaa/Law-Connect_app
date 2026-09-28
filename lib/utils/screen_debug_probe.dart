@@ -7,8 +7,8 @@ import 'package:flutter/scheduler.dart';
 
 /// Debug-only instrumentation for screen freeze / crash diagnosis.
 ///
-/// Logs to the console (`flutter run`) and shows a small on-screen panel in
-/// debug builds. Wrap a screen with [wrap] and use [track] around async work.
+/// Logs to the console (`flutter run`) in debug builds. Wrap a screen with
+/// [wrap] and use [track] around async work.
 class ScreenDebugProbe {
   ScreenDebugProbe(this.screenName);
 
@@ -135,23 +135,8 @@ class ScreenDebugProbe {
   }
 
   Widget wrap(Widget child) {
-    if (!isEnabled) return child;
-    return Stack(
-      children: [
-        child,
-        Positioned(
-          left: 8,
-          right: 8,
-          bottom: 72,
-          child: IgnorePointer(
-            child: ValueListenableBuilder<int>(
-              valueListenable: _tick,
-              builder: (context, _, __) => _DebugProbePanel(probe: this),
-            ),
-          ),
-        ),
-      ],
-    );
+    // Console-only in debug; never cover the UI with the probe panel.
+    return child;
   }
 
   List<ProbeEvent> get recentEvents {
@@ -229,84 +214,4 @@ class ProbeEvent {
   final String? detail;
   final Duration? duration;
   final ProbeLevel level;
-}
-
-class _DebugProbePanel extends StatelessWidget {
-  const _DebugProbePanel({required this.probe});
-
-  final ScreenDebugProbe probe;
-
-  @override
-  Widget build(BuildContext context) {
-    final events = probe.recentEvents.reversed.take(5).toList();
-    return Material(
-      color: Colors.transparent,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.78),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(
-            color: probe._severeFrameCount > 0
-                ? Colors.redAccent
-                : Colors.blueAccent.withValues(alpha: 0.6),
-          ),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              'DEBUG ${probe.screenName}',
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 11,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              probe.summary,
-              style: TextStyle(
-                color: probe._lastError != null
-                    ? Colors.redAccent
-                    : Colors.white70,
-                fontSize: 10,
-                height: 1.25,
-              ),
-            ),
-            if (events.isNotEmpty) ...[
-              const SizedBox(height: 6),
-              for (final e in events)
-                Text(
-                  _formatEvent(e),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: e.level == ProbeLevel.critical
-                        ? Colors.redAccent
-                        : e.level == ProbeLevel.warn
-                            ? Colors.orangeAccent
-                            : Colors.white60,
-                    fontSize: 9.5,
-                    height: 1.2,
-                    fontFamily: 'monospace',
-                  ),
-                ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  String _formatEvent(ProbeEvent e) {
-    final t =
-        '${e.at.hour.toString().padLeft(2, '0')}:'
-        '${e.at.minute.toString().padLeft(2, '0')}:'
-        '${e.at.second.toString().padLeft(2, '0')}';
-    final dur = e.duration == null ? '' : ' (${e.duration!.inMilliseconds}ms)';
-    final detail = e.detail == null || e.detail!.isEmpty ? '' : ' ${e.detail}';
-    return '$t ${e.phase}$dur$detail';
-  }
 }

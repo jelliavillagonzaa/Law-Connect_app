@@ -200,7 +200,7 @@ class _ProfileCardState extends State<ProfileCard> {
       final downloadUrl = await profileService
           .uploadProfilePicture(imageFile)
           .timeout(
-            const Duration(seconds: 30),
+            const Duration(seconds: 60),
             onTimeout: () {
               throw Exception(
                 'Upload timeout. Please check your internet connection and try again.',
@@ -256,62 +256,16 @@ class _ProfileCardState extends State<ProfileCard> {
         }
       }
     } catch (e) {
-      // Show error message with better error handling
       if (mounted) {
-        String errorMessage = 'Failed to update profile picture';
-        final errorString = e.toString().toLowerCase();
-
-        // Check for specific error types (in order of specificity)
-        if (errorString.contains('bucket') ||
-            errorString.contains('not found') ||
-            errorString.contains('does not exist')) {
-          errorMessage =
-              'Supabase Storage bucket not found. Please create the "files" bucket. See SUPABASE_DASHBOARD_SETUP.md';
-        } else if (errorString.contains('permission') ||
-            errorString.contains('unauthorized') ||
-            errorString.contains('403') ||
-            errorString.contains('policy')) {
-          errorMessage =
-              'Permission denied. Please configure Supabase Storage policies. See SUPABASE_DASHBOARD_SETUP.md';
-        } else if (errorString.contains('storage') ||
-            errorString.contains('supabase')) {
-          errorMessage =
-              'Supabase Storage error. Please check SUPABASE_DASHBOARD_SETUP.md for setup instructions.';
-        } else if (errorString.contains('timeout') ||
-            errorString.contains('Timeout')) {
-          errorMessage =
-              'Upload timeout. Please check your internet connection and try again.';
-        } else if (errorString.contains('network') ||
-            errorString.contains('connection')) {
-          errorMessage =
-              'Network error. Please check your internet connection and try again.';
-        } else if (errorString.contains('readasbytessync') ||
-            errorString.contains('nosuchmethod')) {
-          errorMessage =
-              'File format error. Please try selecting the image again.';
-        } else if (errorString.contains('failed to upload')) {
-          // Extract the actual error from the exception message
-          final fullError = e.toString();
-          // Try to get the actual error message after "Failed to upload profile photo: "
-          if (fullError.contains('Failed to upload profile photo: ')) {
-            final actualError = fullError
-                .split('Failed to upload profile photo: ')
-                .last;
-            errorMessage = actualError.length > 100
-                ? 'Upload failed: ${actualError.substring(0, 100)}...'
-                : 'Upload failed: $actualError';
-          } else {
-            errorMessage = fullError.length > 100
-                ? 'Upload failed: ${fullError.substring(0, 100)}...'
-                : 'Upload failed: $fullError';
-          }
-        } else {
-          // Show the actual error for debugging
-          final fullError = e.toString();
-          errorMessage = fullError.length > 150
-              ? 'Error: ${fullError.substring(0, 150)}...'
-              : 'Error: $fullError';
+        var raw = e.toString();
+        if (raw.startsWith('Exception: ')) {
+          raw = raw.substring('Exception: '.length);
         }
+        raw = raw.replaceAll('Failed to save profile picture: ', '');
+        raw = raw.replaceAll('Exception: ', '');
+        final errorMessage = raw.length > 180
+            ? '${raw.substring(0, 180)}...'
+            : raw;
 
         // Log the full error for debugging
         print('❌ Profile picture upload error: $e');

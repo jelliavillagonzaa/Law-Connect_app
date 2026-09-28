@@ -25,6 +25,10 @@ class SupabaseRowMappers {
       'progress': model.progress ?? <String, dynamic>{},
       if (model.staffId != null) 'staff_id': model.staffId,
       'staff_assigned': model.staffAssigned ?? <String>[],
+      if (model.opposingParty != null && model.opposingParty!.trim().isNotEmpty)
+        'opposing_party': model.opposingParty!.trim(),
+      if (model.caseResult != null && model.caseResult!.trim().isNotEmpty)
+        'case_result': model.caseResult!.trim().toLowerCase(),
       if (model.hearingDate != null)
         'hearing_date': model.hearingDate!.toUtc().toIso8601String(),
       'is_archived': model.isArchived,
@@ -51,6 +55,10 @@ class SupabaseRowMappers {
       'progress': data['progress'] ?? <String, dynamic>{},
       if (data['staffId'] != null) 'staff_id': data['staffId'],
       'staff_assigned': data['staffAssigned'] ?? <dynamic>[],
+      if ((data['opposingParty'] as String?)?.trim().isNotEmpty == true)
+        'opposing_party': (data['opposingParty'] as String).trim(),
+      if ((data['caseResult'] as String?)?.trim().isNotEmpty == true)
+        'case_result': (data['caseResult'] as String).trim().toLowerCase(),
       if (data['hearingDate'] != null)
         'hearing_date': _isoFromFirestore(data['hearingDate']),
       'is_archived': data['isArchived'] == true,

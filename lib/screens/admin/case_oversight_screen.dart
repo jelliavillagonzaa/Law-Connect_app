@@ -6,6 +6,8 @@ import '../../services/admin_service.dart';
 import '../../services/case_service.dart';
 import '../../pages/case/case_detail_page.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/admin/admin_page_header.dart';
+import '../../widgets/admin/admin_ui_theme.dart';
 
 class CaseOversightScreen extends StatefulWidget {
   final bool inline;
@@ -30,7 +32,7 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
   final CaseService _caseService = CaseService();
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   late String _selectedStatus;
-  String _selectedFilter = 'all'; // all, assigned, unassigned, locked
+  String _selectedFilter = 'all'; // all, assigned, unassigned
 
   static const _statuses = {
     'all',
@@ -69,8 +71,9 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
       return StreamBuilder<List<CaseModel>>(
         stream: _caseService.getCasesForUser('', 'admin'),
         builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
+          if (snapshot.connectionState == ConnectionState.waiting &&
+              !snapshot.hasData) {
+            return const SizedBox.shrink();
           }
           if (snapshot.hasError) {
             return Center(child: Text('Error: ${snapshot.error}'));
@@ -84,8 +87,9 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
       return StreamBuilder<List<CaseModel>>(
         stream: _caseService.getCasesForUser('', 'admin'),
         builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
+          if (snapshot.connectionState == ConnectionState.waiting &&
+              !snapshot.hasData) {
+            return const SizedBox.shrink();
           }
           if (snapshot.hasError) {
             return Center(child: Text('Error: ${snapshot.error}'));
@@ -103,8 +107,9 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
     return StreamBuilder<List<CaseModel>>(
       stream: _caseService.getCasesByStatus(_selectedStatus),
       builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Center(child: CircularProgressIndicator());
+        if (snapshot.connectionState == ConnectionState.waiting &&
+            !snapshot.hasData) {
+          return const SizedBox.shrink();
         }
         if (snapshot.hasError) {
           return Center(child: Text('Error: ${snapshot.error}'));
@@ -163,9 +168,9 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
                                 const EdgeInsets.symmetric(horizontal: 12),
                             decoration: BoxDecoration(
                               color: Colors.white,
-                              borderRadius: BorderRadius.circular(12),
+                              borderRadius: BorderRadius.circular(AdminUi.radius),
                               border: Border.all(
-                                color: AppTheme.borderGray,
+                                color: AdminUi.line,
                                 width: 1,
                               ),
                             ),
@@ -230,9 +235,9 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
                                 const EdgeInsets.symmetric(horizontal: 12),
                             decoration: BoxDecoration(
                               color: Colors.white,
-                              borderRadius: BorderRadius.circular(12),
+                              borderRadius: BorderRadius.circular(AdminUi.radius),
                               border: Border.all(
-                                color: AppTheme.borderGray,
+                                color: AdminUi.line,
                                 width: 1,
                               ),
                             ),
@@ -252,10 +257,6 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
                                   DropdownMenuItem(
                                     value: 'unassigned',
                                     child: Text('Unassigned Cases'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'locked',
-                                    child: Text('Locked (Read‑only)'),
                                   ),
                                 ],
                                 onChanged: (value) {
@@ -284,32 +285,14 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
     final body = _buildBody();
 
     if (widget.inline) {
-      return Column(
-        children: [
-          // Custom header bar for inline mode
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.05),
-                  blurRadius: 5,
-                  offset: const Offset(0, 2),
-                ),
-              ],
-            ),
-            child: const Row(
-              children: [
-                Text(
-                  'Case Oversight',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                ),
-              ],
-            ),
-          ),
-          Expanded(child: body),
-        ],
+      return ColoredBox(
+        color: AdminUi.background,
+        child: Column(
+          children: [
+            const AdminPageHeader(title: 'Case Oversight'),
+            Expanded(child: body),
+          ],
+        ),
       );
     }
 
@@ -328,9 +311,6 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
         return caseModel.attorneyId != null && caseModel.attorneyId!.isNotEmpty;
       } else if (_selectedFilter == 'unassigned') {
         return caseModel.attorneyId == null || caseModel.attorneyId!.isEmpty;
-      } else if (_selectedFilter == 'locked') {
-        // TODO: Check if case is locked (need to add isLocked field to CaseModel)
-        return false;
       }
       return true;
     }).toList();
@@ -349,9 +329,10 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
           color: Colors.white,
           margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: BorderRadius.circular(AdminUi.radius),
+            side: const BorderSide(color: AdminUi.line),
           ),
-          elevation: 1,
+          elevation: 0,
           child: ListTile(
             leading: Container(
               padding: const EdgeInsets.all(10),
@@ -438,16 +419,6 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
                     ),
                   ),
                 const PopupMenuItem(
-                  value: 'lock',
-                  child: Row(
-                    children: [
-                      Icon(Icons.lock, size: 20),
-                      SizedBox(width: 8),
-                      Text('Lock Case'),
-                    ],
-                  ),
-                ),
-                const PopupMenuItem(
                   value: 'archive',
                   child: Row(
                     children: [
@@ -475,9 +446,6 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
         break;
       case 'reassign':
         _showReassignDialog(caseModel);
-        break;
-      case 'lock':
-        _showLockCaseDialog(caseModel);
         break;
       case 'archive':
         _showArchiveCaseDialog(caseModel);
@@ -674,65 +642,6 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
               }
             },
             child: const Text('Archive'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showLockCaseDialog(CaseModel caseModel) {
-    final reasonController = TextEditingController();
-
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Lock Case'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('Enter reason for locking this case:'),
-            const SizedBox(height: 16),
-            TextField(
-              controller: reasonController,
-              decoration: const InputDecoration(
-                labelText: 'Reason',
-                border: OutlineInputBorder(),
-              ),
-              maxLines: 3,
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              if (reasonController.text.trim().isNotEmpty) {
-                try {
-                  await _adminService.lockCase(
-                    caseModel.id,
-                    reasonController.text.trim(),
-                  );
-                  Get.snackbar(
-                    'Success',
-                    'Case locked successfully',
-                    backgroundColor: Colors.green,
-                    colorText: Colors.white,
-                  );
-                  Navigator.pop(context);
-                } catch (e) {
-                  Get.snackbar(
-                    'Error',
-                    'Failed to lock case: $e',
-                    backgroundColor: Colors.red,
-                    colorText: Colors.white,
-                  );
-                }
-              }
-            },
-            child: const Text('Lock'),
           ),
         ],
       ),

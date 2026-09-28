@@ -10,9 +10,16 @@ import '../../services/storage_service.dart';
 import '../../models/case_model.dart';
 import '../../models/user_model.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/case/case_details_download_button.dart';
+import '../../utils/case_details_export.dart';
+import '../../utils/case_result.dart';
+import '../../utils/case_status_filter.dart';
+import '../../widgets/case/case_status_filter_button.dart';
 
 class StaffCasesScreen extends StatefulWidget {
-  const StaffCasesScreen({super.key});
+  const StaffCasesScreen({super.key, this.closedFolder = false});
+
+  final bool closedFolder;
 
   @override
   State<StaffCasesScreen> createState() => _StaffCasesScreenState();
@@ -21,14 +28,24 @@ class StaffCasesScreen extends StatefulWidget {
 class _StaffCasesScreenState extends State<StaffCasesScreen> {
   final StaffService _staffService = StaffService();
   final StaffAuthService _staffAuthService = StaffAuthService();
-  String _selectedFilter = 'all';
+  String _selectedFilter = CaseStatusFilter.active;
   String? _assignedAttorneyId;
-  bool _showAllCases = false; // Toggle between assigned and all attorney cases
+  bool _showAllCases = false;
+  late bool _viewClosed;
 
   @override
   void initState() {
     super.initState();
+    _viewClosed = widget.closedFolder;
     _loadAttorneyId();
+  }
+
+  @override
+  void didUpdateWidget(StaffCasesScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.closedFolder != widget.closedFolder) {
+      _viewClosed = widget.closedFolder;
+    }
   }
 
   Future<void> _loadAttorneyId() async {
@@ -50,10 +67,27 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          _showAllCases ? 'All Attorney Cases' : 'Assigned Cases',
+          _viewClosed
+              ? 'Closed Cases'
+              : (_showAllCases ? 'All Attorney Cases' : 'Assigned Cases'),
           style: TextStyle(),
         ),
         actions: [
+          if (MediaQuery.of(context).size.width < 800)
+            TextButton(
+              onPressed: () {
+                setState(() {
+                  _viewClosed = !_viewClosed;
+                  _selectedFilter = _viewClosed
+                      ? CaseStatusFilter.completed
+                      : CaseStatusFilter.active;
+                });
+              },
+              child: Text(
+                _viewClosed ? 'Assigned' : 'Closed',
+                style: const TextStyle(color: AppTheme.cleanWhite),
+              ),
+            ),
           if (_assignedAttorneyId != null)
             IconButton(
               icon: Icon(
@@ -67,21 +101,17 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
                   ? 'Show Only Assigned Cases'
                   : 'Show All Attorney Cases',
             ),
-          PopupMenuButton<String>(
-            onSelected: (value) {
-              setState(() => _selectedFilter = value);
-            },
-            itemBuilder: (context) => [
-              const PopupMenuItem(value: 'all', child: Text('All Cases')),
-              const PopupMenuItem(value: 'active', child: Text('Active')),
-              const PopupMenuItem(value: 'pending', child: Text('Pending')),
-              const PopupMenuItem(value: 'completed', child: Text('Completed')),
-            ],
-            child: Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Icon(Icons.filter_list, color: AppTheme.cleanWhite),
+          if (!_viewClosed)
+            CaseStatusFilterButton(
+              selected: _selectedFilter == CaseStatusFilter.all
+                  ? CaseStatusFilter.active
+                  : _selectedFilter,
+              iconColor: AppTheme.cleanWhite,
+              values: CaseStatusFilter.attorneyMyCaseValues,
+              onSelected: (value) {
+                setState(() => _selectedFilter = value);
+              },
             ),
-          ),
         ],
       ),
       body: StreamBuilder<List<CaseModel>>(
@@ -89,8 +119,9 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
             ? _staffService.getAttorneyCases(_assignedAttorneyId!)
             : _staffService.getAssignedCases(user.uid),
         builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
+          if (snapshot.connectionState == ConnectionState.waiting &&
+              !snapshot.hasData) {
+            return const SizedBox.shrink();
           }
 
           if (snapshot.hasError) {
@@ -110,9 +141,20 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
           }
 
           final allCases = snapshot.data ?? [];
-          final filteredCases = _filterCases(allCases, _selectedFilter);
+          final filter = _viewClosed
+              ? CaseStatusFilter.completed
+              : (_selectedFilter == CaseStatusFilter.all
+                  ? CaseStatusFilter.active
+                  : _selectedFilter);
+          final filteredCases = CaseStatusFilter.apply(allCases, filter);
 
           if (filteredCases.isEmpty) {
+            final empty = _viewClosed
+                ? 'No closed cases'
+                : (_selectedFilter == CaseStatusFilter.active ||
+                        _selectedFilter == CaseStatusFilter.all
+                    ? 'No cases assigned yet'
+                    : 'No ${CaseStatusFilter.label(_selectedFilter).toLowerCase()} cases');
             return Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -120,7 +162,7 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
                   Icon(Icons.folder_open, size: 64, color: Colors.grey),
                   const SizedBox(height: 16),
                   Text(
-                    'No cases assigned yet',
+                    empty,
                     style: TextStyle(
                       fontSize: 18,
                       color: Colors.grey,
@@ -132,7 +174,7 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
           }
 
           return ListView.builder(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
             itemCount: filteredCases.length,
             itemBuilder: (context, index) {
               final caseModel = filteredCases[index];
@@ -164,13 +206,21 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        'Status: ${caseModel.status.toUpperCase()}',
+                        'Status: ${CaseStatusFilter.statusLabel(caseModel.status)}',
                         style: TextStyle(
                           fontSize: 12,
                           color: _getStatusColor(caseModel.status),
                           fontWeight: FontWeight.w600,
                         ),
                       ),
+                      if (CaseStatusFilter.isCompleted(caseModel.status) &&
+                          CaseResult.label(caseModel.caseResult).isNotEmpty) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          'Result: ${CaseResult.label(caseModel.caseResult)}',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                      ],
                       const SizedBox(height: 4),
                       Text(
                         'Updated: ${DateFormat('MMM dd, yyyy').format(caseModel.updatedAt)}',
@@ -194,40 +244,22 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
     );
   }
 
-  List<CaseModel> _filterCases(List<CaseModel> cases, String filter) {
-    switch (filter) {
-      case 'active':
-        return cases
-            .where((c) => c.status == 'in_progress' || c.status == 'accepted')
-            .toList();
-      case 'pending':
-        return cases.where((c) => c.status == 'pending').toList();
-      case 'completed':
-        return cases.where((c) => c.status == 'completed').toList();
-      default:
-        return cases;
-    }
-  }
-
   Color _getStatusColor(String status) {
-    switch (status.toLowerCase()) {
-      case 'pending':
-        return Colors.orange;
-      case 'accepted':
-      case 'in_progress':
-        return Colors.blue;
-      case 'completed':
-        return Colors.green;
-      default:
-        return Colors.grey;
-    }
+    if (CaseStatusFilter.isDraft(status)) return const Color(0xFFC9A227);
+    if (CaseStatusFilter.isOpen(status)) return Colors.orange;
+    if (CaseStatusFilter.isInProgress(status)) return Colors.blue;
+    if (CaseStatusFilter.isCompleted(status)) return Colors.green;
+    return Colors.grey;
   }
 
   IconData _getStatusIcon(String status) {
     switch (status.toLowerCase()) {
       case 'pending':
         return Icons.pending;
+      case 'under_review':
+        return Icons.drafts_outlined;
       case 'accepted':
+        return Icons.how_to_reg;
       case 'in_progress':
         return Icons.work;
       case 'completed':
@@ -350,9 +382,20 @@ class _StaffCaseDetailPageState extends State<StaffCaseDetailPage> {
 
   @override
   Widget build(BuildContext context) {
+    final isClosed = CaseStatusFilter.isCompleted(widget.caseModel.status);
+    final resultLabel = CaseResult.label(widget.caseModel.caseResult);
     return Scaffold(
       appBar: AppBar(
         title: Text('Case Details', style: TextStyle()),
+        actions: [
+          CaseDetailsDownloadButton(
+            exportData: CaseDetailsExportData(
+              caseModel: widget.caseModel,
+              clientName: _client?.name,
+              clientEmail: _client?.email,
+            ),
+          ),
+        ],
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
@@ -380,7 +423,9 @@ class _StaffCaseDetailPageState extends State<StaffCaseDetailPage> {
                         ),
                         Chip(
                           label: Text(
-                            widget.caseModel.status.toUpperCase(),
+                            CaseStatusFilter.statusLabel(
+                              widget.caseModel.status,
+                            ).toUpperCase(),
                             style: TextStyle(
                               color: AppTheme.cleanWhite,
                               fontWeight: FontWeight.bold,
@@ -398,6 +443,13 @@ class _StaffCaseDetailPageState extends State<StaffCaseDetailPage> {
                       'Type: ${widget.caseModel.caseType}',
                       style: TextStyle(fontSize: 16),
                     ),
+                    if (isClosed && resultLabel.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        'Result: $resultLabel',
+                        style: TextStyle(fontSize: 16),
+                      ),
+                    ],
                     // Client Information
                     _buildClientInfo(),
                     const SizedBox(height: 16),
@@ -418,7 +470,9 @@ class _StaffCaseDetailPageState extends State<StaffCaseDetailPage> {
                           const SizedBox(width: 8),
                           Expanded(
                             child: Text(
-                              'Staff Access: You can view, add notes, and upload documents. You cannot delete or close cases.',
+                              isClosed
+                                  ? 'This case is closed. You can view details only.'
+                                  : 'Staff Access: You can view, add notes, and upload documents. You cannot delete or close cases.',
                               style: TextStyle(
                                 fontSize: 12,
                                 color: Colors.blue.shade700,
@@ -446,6 +500,7 @@ class _StaffCaseDetailPageState extends State<StaffCaseDetailPage> {
               ),
             ),
 
+            if (!isClosed) ...[
             const SizedBox(height: 16),
 
             // Add Note Section
@@ -536,6 +591,7 @@ class _StaffCaseDetailPageState extends State<StaffCaseDetailPage> {
                 ),
               ),
             ),
+            ],
           ],
         ),
       ),
@@ -710,16 +766,10 @@ class _StaffCaseDetailPageState extends State<StaffCaseDetailPage> {
   }
 
   Color _getStatusColor(String status) {
-    switch (status.toLowerCase()) {
-      case 'pending':
-        return Colors.orange;
-      case 'accepted':
-      case 'in_progress':
-        return Colors.blue;
-      case 'completed':
-        return Colors.green;
-      default:
-        return Colors.grey;
-    }
+    if (CaseStatusFilter.isDraft(status)) return const Color(0xFFC9A227);
+    if (CaseStatusFilter.isOpen(status)) return Colors.orange;
+    if (CaseStatusFilter.isInProgress(status)) return Colors.blue;
+    if (CaseStatusFilter.isCompleted(status)) return Colors.green;
+    return Colors.grey;
   }
 }

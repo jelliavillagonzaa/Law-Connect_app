@@ -56,6 +56,13 @@ class BillingManagementScreen extends StatelessWidget {
       appBar: AppBar(
         title: Text(title),
         backgroundColor: AppTheme.royalBlue,
+        actions: [
+          IconButton(
+            tooltip: 'Payment History',
+            icon: const Icon(Icons.history),
+            onPressed: () => _openPaymentHistory(context, billing),
+          ),
+        ],
       ),
       floatingActionButton: canManage
           ? FloatingActionButton.extended(
@@ -107,47 +114,28 @@ class BillingManagementScreen extends StatelessWidget {
               const SizedBox(height: 24),
               Text('Case History', style: AppTheme.heading4),
               const SizedBox(height: 12),
-              if (invoices.isEmpty)
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: AppTheme.cardDecoration,
-                  child: Text(
-                    'No invoices issued yet.',
-                    style: AppTheme.bodyMedium
-                        .copyWith(color: AppTheme.mutedText),
-                  ),
-                )
-              else
-                ...invoices.map(
-                  (inv) => _FirmInvoiceCard(
-                    invoice: inv,
-                    billing: billing,
-                    canManage: canManage,
-                    onRecordPayment: () =>
-                        _openRecordPayment(context, billing, inv),
-                  ),
-                ),
-              const SizedBox(height: 24),
-              SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  onPressed: () => Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) => _PaymentHistoryScreen(
-                        attorneyId: attorneyId,
-                        billing: billing,
-                        canManage: canManage,
-                        invoices: invoices,
-                      ),
-                    ),
-                  ),
-                  icon: const Icon(Icons.history),
-                  label: const Text('Open Payment History'),
-                ),
+              _CaseHistorySection(
+                invoices: invoices,
+                billing: billing,
+                canManage: canManage,
+                onRecordPayment: (inv) =>
+                    _openRecordPayment(context, billing, inv),
               ),
             ],
           );
         },
+      ),
+    );
+  }
+
+  void _openPaymentHistory(BuildContext context, BillingService billing) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => _PaymentHistoryScreen(
+          attorneyId: attorneyId,
+          billing: billing,
+          canManage: canManage,
+        ),
       ),
     );
   }
@@ -188,6 +176,125 @@ class BillingManagementScreen extends StatelessWidget {
         recorderRole: recorderRole,
         recorderName: recorderName,
       ),
+    );
+  }
+}
+
+bool _invoiceMatchesCaseSearch(InvoiceModel invoice, String rawQuery) {
+  final query = rawQuery.trim().toLowerCase();
+  if (query.isEmpty) return true;
+
+  String normalize(String s) => s
+      .toLowerCase()
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .replaceAll(' vs. ', ' vs ')
+      .replaceAll(' v. ', ' vs ')
+      .trim();
+
+  final haystack = normalize([
+    invoice.caseTitle ?? '',
+    invoice.caseNumber ?? '',
+    invoice.displayCaseNumber,
+    invoice.clientName ?? '',
+    invoice.description ?? '',
+  ].join(' '));
+  final normalizedQuery = normalize(query);
+  if (haystack.contains(normalizedQuery)) return true;
+
+  final words = normalizedQuery.split(' ').where((w) => w.length >= 2);
+  if (words.isEmpty) return haystack.contains(normalizedQuery);
+  return words.every(haystack.contains);
+}
+
+class _CaseHistorySection extends StatefulWidget {
+  const _CaseHistorySection({
+    required this.invoices,
+    required this.billing,
+    required this.canManage,
+    required this.onRecordPayment,
+  });
+
+  final List<InvoiceModel> invoices;
+  final BillingService billing;
+  final bool canManage;
+  final void Function(InvoiceModel invoice) onRecordPayment;
+
+  @override
+  State<_CaseHistorySection> createState() => _CaseHistorySectionState();
+}
+
+class _CaseHistorySectionState extends State<_CaseHistorySection> {
+  final TextEditingController _searchController = TextEditingController();
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final query = _searchController.text;
+    final filtered = widget.invoices
+        .where((inv) => _invoiceMatchesCaseSearch(inv, query))
+        .toList();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        TextField(
+          controller: _searchController,
+          onChanged: (_) => setState(() {}),
+          textInputAction: TextInputAction.search,
+          decoration: InputDecoration(
+            hintText: 'Search case name, case no, or client...',
+            prefixIcon: const Icon(Icons.search),
+            suffixIcon: query.trim().isNotEmpty
+                ? IconButton(
+                    tooltip: 'Clear search',
+                    icon: const Icon(Icons.clear),
+                    onPressed: () {
+                      _searchController.clear();
+                      setState(() {});
+                    },
+                  )
+                : null,
+            filled: true,
+            fillColor: Colors.white,
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        if (widget.invoices.isEmpty)
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: AppTheme.cardDecoration,
+            child: Text(
+              'No invoices issued yet.',
+              style: AppTheme.bodyMedium.copyWith(color: AppTheme.mutedText),
+            ),
+          )
+        else if (filtered.isEmpty)
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: AppTheme.cardDecoration,
+            child: Text(
+              'No cases match your search.',
+              style: AppTheme.bodyMedium.copyWith(color: AppTheme.mutedText),
+            ),
+          )
+        else
+          ...filtered.map(
+            (inv) => _FirmInvoiceCard(
+              invoice: inv,
+              billing: widget.billing,
+              canManage: widget.canManage,
+              onRecordPayment: () => widget.onRecordPayment(inv),
+            ),
+          ),
+      ],
     );
   }
 }
@@ -369,28 +476,30 @@ class _PaymentHistoryScreenState extends State<_PaymentHistoryScreen> {
                     summary: buildPaymentReportSummary(filteredRows),
                   );
 
+                  final isMobile = MediaQuery.sizeOf(context).width < 720;
+
                   return ListView(
-                    padding: const EdgeInsets.all(16),
+                    padding: EdgeInsets.all(isMobile ? 12 : 16),
                     children: [
-                      Row(
-                        children: [
-                          Expanded(
-                            child: TextField(
-                              controller: _searchController,
-                              onChanged: (_) => setState(() {}),
-                              decoration: const InputDecoration(
-                                hintText:
-                                    'Search client, case no, payment status...',
-                                prefixIcon: Icon(Icons.search),
-                                filled: true,
-                                fillColor: Colors.white,
-                              ),
-                            ),
+                      if (isMobile) ...[
+                        TextField(
+                          controller: _searchController,
+                          onChanged: (_) => setState(() {}),
+                          decoration: const InputDecoration(
+                            hintText:
+                                'Search client, case no, payment status...',
+                            prefixIcon: Icon(Icons.search),
+                            filled: true,
+                            fillColor: Colors.white,
                           ),
-                          const SizedBox(width: 10),
-                          PopupMenuButton<String>(
+                        ),
+                        const SizedBox(height: 8),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: PopupMenuButton<String>(
                             icon: const Icon(Icons.download_outlined,
                                 color: AppTheme.royalBlue),
+                            tooltip: 'Download report',
                             onSelected: (value) {
                               if (value == 'pdf') {
                                 _downloadReportPdf(report);
@@ -409,8 +518,47 @@ class _PaymentHistoryScreenState extends State<_PaymentHistoryScreen> {
                               ),
                             ],
                           ),
-                        ],
-                      ),
+                        ),
+                      ] else
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: _searchController,
+                                onChanged: (_) => setState(() {}),
+                                decoration: const InputDecoration(
+                                  hintText:
+                                      'Search client, case no, payment status...',
+                                  prefixIcon: Icon(Icons.search),
+                                  filled: true,
+                                  fillColor: Colors.white,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            PopupMenuButton<String>(
+                              icon: const Icon(Icons.download_outlined,
+                                  color: AppTheme.royalBlue),
+                              onSelected: (value) {
+                                if (value == 'pdf') {
+                                  _downloadReportPdf(report);
+                                } else {
+                                  _downloadReportCsv(report);
+                                }
+                              },
+                              itemBuilder: (_) => const [
+                                PopupMenuItem(
+                                  value: 'pdf',
+                                  child: Text('Download PDF Report'),
+                                ),
+                                PopupMenuItem(
+                                  value: 'csv',
+                                  child: Text('Download CSV'),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
                       const SizedBox(height: 16),
                       if (baseReport.rows.isEmpty)
                         Text(
@@ -569,8 +717,8 @@ class _SummaryGrid extends StatelessWidget {
               Text('Total Remaining Balance',
                   style: AppTheme.bodyMedium.copyWith(color: Colors.white70)),
               const SizedBox(height: 6),
-              Text(
-                Currency.peso(remaining),
+              CurrencyText(
+                amount: remaining,
                 style: const TextStyle(
                   color: Colors.white,
                   fontSize: 32,
@@ -591,7 +739,7 @@ class _SummaryGrid extends StatelessWidget {
             Expanded(
               child: _statCard(
                 'Total Legal Fees',
-                Currency.peso(totalFees),
+                totalFees,
                 Icons.receipt_long_outlined,
                 AppTheme.royalBlue,
               ),
@@ -600,7 +748,7 @@ class _SummaryGrid extends StatelessWidget {
             Expanded(
               child: _statCard(
                 'Total Paid',
-                Currency.peso(totalPaid),
+                totalPaid,
                 Icons.check_circle_outline,
                 AppTheme.success,
               ),
@@ -658,7 +806,7 @@ class _SummaryGrid extends StatelessWidget {
     );
   }
 
-  Widget _statCard(String label, String value, IconData icon, Color color) {
+  Widget _statCard(String label, num amount, IconData icon, Color color) {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: AppTheme.cardDecoration,
@@ -667,8 +815,8 @@ class _SummaryGrid extends StatelessWidget {
         children: [
           Icon(icon, color: color, size: 24),
           const SizedBox(height: 10),
-          Text(
-            value,
+          CurrencyText(
+            amount: amount,
             style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
           ),
           const SizedBox(height: 2),
@@ -749,13 +897,13 @@ class _FirmInvoiceCard extends StatelessWidget {
             Text(invoice.description!, style: AppTheme.bodySmall),
           ],
           const SizedBox(height: 12),
-          _row('Total Fee', Currency.peso(invoice.totalLegalFee)),
+          _row('Total Fee', invoice.totalLegalFee),
           const SizedBox(height: 6),
-          _row('Total Paid', Currency.peso(invoice.amountPaid)),
+          _row('Total Paid', invoice.amountPaid),
           const SizedBox(height: 6),
           _row(
             'Remaining Balance',
-            Currency.peso(invoice.remainingBalance),
+            invoice.remainingBalance,
             emphasize: true,
           ),
           _PerCasePaymentHistory(
@@ -784,7 +932,7 @@ class _FirmInvoiceCard extends StatelessWidget {
     );
   }
 
-  Widget _row(String label, String value, {bool emphasize = false}) {
+  Widget _row(String label, num value, {bool emphasize = false}) {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
@@ -795,8 +943,8 @@ class _FirmInvoiceCard extends StatelessWidget {
             fontWeight: emphasize ? FontWeight.w600 : FontWeight.normal,
           ),
         ),
-        Text(
-          value,
+        CurrencyText(
+          amount: value,
           style: TextStyle(
             fontWeight: FontWeight.w700,
             color: emphasize ? AppTheme.royalBlue : AppTheme.darkText,
@@ -1006,8 +1154,8 @@ class _RecordPaymentSheetState extends State<_RecordPaymentSheet> {
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   Text('Remaining Balance', style: AppTheme.bodyMedium),
-                  Text(
-                    Currency.peso(invoice.remainingBalance),
+                  CurrencyText(
+                    amount: invoice.remainingBalance,
                     style: const TextStyle(
                       fontWeight: FontWeight.bold,
                       color: AppTheme.royalBlue,
@@ -1017,7 +1165,7 @@ class _RecordPaymentSheetState extends State<_RecordPaymentSheet> {
               ),
             ),
             const SizedBox(height: 16),
-            Text('Amount Received (₱)', style: AppTheme.bodyMedium),
+            Text(Currency.label('Amount Received'), style: AppTheme.bodyMedium),
             const SizedBox(height: 6),
             TextField(
               controller: _amountController,
@@ -1253,58 +1401,86 @@ class _CreateInvoiceSheetState extends State<_CreateInvoiceSheet> {
             const SizedBox(height: 16),
             Text('Case', style: AppTheme.bodyMedium),
             const SizedBox(height: 6),
-            StreamBuilder<List<CaseModel>>(
-              stream: _caseService.getCasesForUser(
-                widget.attorneyId,
-                'attorney',
-              ),
-              builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 12),
-                    child: LinearProgressIndicator(),
-                  );
-                }
-                // De-duplicate by id so the dropdown never has two items with
-                // the same value (Flutter asserts on that).
-                final byId = <String, CaseModel>{};
-                for (final c in (snapshot.data ?? const <CaseModel>[])) {
-                  byId[c.id] = c;
-                }
-                _cases = byId.values.toList();
-                if (_cases.isEmpty) {
-                  return Text(
-                    'No cases available to bill.',
-                    style:
-                        AppTheme.bodySmall.copyWith(color: AppTheme.mutedText),
-                  );
-                }
-                final valueId = byId.containsKey(_selectedCaseId)
-                    ? _selectedCaseId
-                    : null;
-                return DropdownButtonFormField<String>(
-                  initialValue: valueId,
-                  isExpanded: true,
-                  decoration: const InputDecoration(
-                    hintText: 'Select a case',
+            StreamBuilder<List<InvoiceModel>>(
+              stream: widget.billing.streamInvoicesForAttorney(widget.attorneyId),
+              builder: (context, invoiceSnapshot) {
+                return StreamBuilder<List<CaseModel>>(
+                  stream: _caseService.getCasesForUser(
+                    widget.attorneyId,
+                    'attorney',
                   ),
-                  items: _cases
-                      .map(
-                        (c) => DropdownMenuItem<String>(
-                          value: c.id,
-                          child: Text(
-                            c.caseTitle,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                      )
-                      .toList(),
-                  onChanged: (id) => setState(() => _selectedCaseId = id),
+                  builder: (context, caseSnapshot) {
+                    if (caseSnapshot.connectionState ==
+                            ConnectionState.waiting ||
+                        invoiceSnapshot.connectionState ==
+                            ConnectionState.waiting) {
+                      return const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 12),
+                        child: LinearProgressIndicator(),
+                      );
+                    }
+
+                    final paidCaseIds = <String>{};
+                    for (final invoice in invoiceSnapshot.data ??
+                        const <InvoiceModel>[]) {
+                      final caseId = invoice.caseId;
+                      if (caseId != null &&
+                          caseId.isNotEmpty &&
+                          !invoice.isCancelled &&
+                          invoice.isPaid) {
+                        paidCaseIds.add(caseId);
+                      }
+                    }
+
+                    // De-duplicate by id so the dropdown never has two items with
+                    // the same value (Flutter asserts on that).
+                    final byId = <String, CaseModel>{};
+                    for (final c in caseSnapshot.data ?? const <CaseModel>[]) {
+                      if (!paidCaseIds.contains(c.id)) {
+                        byId[c.id] = c;
+                      }
+                    }
+                    _cases = byId.values.toList();
+
+                    if (_cases.isEmpty) {
+                      return Text(
+                        paidCaseIds.isEmpty
+                            ? 'No cases available to bill.'
+                            : 'All cases are fully paid. No new invoice needed.',
+                        style: AppTheme.bodySmall
+                            .copyWith(color: AppTheme.mutedText),
+                      );
+                    }
+
+                    final valueId = byId.containsKey(_selectedCaseId)
+                        ? _selectedCaseId
+                        : null;
+
+                    return DropdownButtonFormField<String>(
+                      initialValue: valueId,
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                        hintText: 'Select a case',
+                      ),
+                      items: _cases
+                          .map(
+                            (c) => DropdownMenuItem<String>(
+                              value: c.id,
+                              child: Text(
+                                c.caseTitle,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          )
+                          .toList(),
+                      onChanged: (id) => setState(() => _selectedCaseId = id),
+                    );
+                  },
                 );
               },
             ),
             const SizedBox(height: 16),
-            Text('Total Legal Fee (₱)', style: AppTheme.bodyMedium),
+            Text(Currency.label('Total Legal Fee'), style: AppTheme.bodyMedium),
             const SizedBox(height: 6),
             TextField(
               controller: _feeController,

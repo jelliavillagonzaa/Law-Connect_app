@@ -15,7 +15,9 @@ bool isValidNetworkImageUrl(String? url) {
 
   if (lower.contains('firebasestorage.googleapis.com') ||
       lower.contains('googleusercontent.com') ||
-      lower.contains('storage.googleapis.com')) {
+      lower.contains('storage.googleapis.com') ||
+      (lower.contains('supabase.co') &&
+          lower.contains('/storage/v1/object/'))) {
     return true;
   }
 

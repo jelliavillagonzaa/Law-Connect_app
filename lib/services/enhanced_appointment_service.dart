@@ -2,11 +2,21 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
 import '../models/appointment_model.dart';
+import 'attorney_request_notify.dart';
+import 'system_settings_service.dart';
 import 'firestore_mirror_helper.dart';
 
 class EnhancedAppointmentService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirebaseAuth _auth = FirebaseAuth.instance;
+
+  /// Returned when the requested date/time is already booked.
+  static const String scheduleFullCode = 'schedule_full';
+
+  static final Set<String> _syncedSlotAttorneyIds = <String>{};
+
+  static bool isScheduleFull(Map<String, dynamic> result) =>
+      result['code'] == scheduleFullCode;
 
   /// Create a new appointment
   ///
@@ -46,8 +56,40 @@ class EnhancedAppointmentService {
           : (attorneyId ??
                 currentUser.uid); // Attorney-scheduled: default to current user
 
+      if (await isTimeSlotTaken(
+        attorneyId: finalAttorneyId,
+        dateTime: appointmentDateTime,
+      )) {
+        return _scheduleFullResult();
+      }
+
+      final appointmentId = _firestore.collection('appointments').doc().id;
+
+      try {
+        await _claimTimeSlot(
+          attorneyId: finalAttorneyId,
+          dateTime: appointmentDateTime,
+          appointmentId: appointmentId,
+        );
+      } catch (_) {}
+
+      try {
+        final slotSnap = await _slotRef(
+          finalAttorneyId,
+          appointmentDateTime,
+        ).get();
+        if (slotSnap.exists) {
+          final ownerId = slotSnap.data()?['appointmentId'] as String?;
+          if (ownerId != null &&
+              ownerId.isNotEmpty &&
+              ownerId != appointmentId) {
+            return _scheduleFullResult();
+          }
+        }
+      } catch (_) {}
+
       final appointment = AppointmentModel(
-        id: '', // Will be set by Firestore
+        id: appointmentId,
         clientId: clientId,
         clientName: clientName,
         attorneyId: finalAttorneyId,
@@ -62,15 +104,21 @@ class EnhancedAppointmentService {
         updatedAt: DateTime.now(),
       );
 
-      final addResult = await HybridDatastore.add(
+      final addResult = await HybridDatastore.set(
         collection: 'appointments',
+        id: appointmentId,
         data: appointment.toFirestore(),
       );
       if (!addResult.isSuccess) {
+        try {
+          await _releaseTimeSlot(
+            attorneyId: finalAttorneyId,
+            dateTime: appointmentDateTime,
+            appointmentId: appointmentId,
+          );
+        } catch (_) {}
         return {'success': false, 'message': addResult.failureMessage};
       }
-
-      final appointmentId = addResult.id!;
 
       // Get creator name (who scheduled the appointment)
       final creatorDoc = await _firestore
@@ -83,58 +131,69 @@ class EnhancedAppointmentService {
           'Someone';
 
       // Send immediate notifications based on preferences
-      await _sendImmediateAppointmentNotifications(
-        appointmentId: appointmentId,
-        clientId: clientId,
-        clientName: clientName,
-        attorneyId: finalAttorneyId,
-        appointmentDateTime: appointmentDateTime,
-        appointmentType: appointmentType,
-        creatorName: creatorName,
-        notifyClient: notifyClient,
-        notifyStaff: notifyStaff,
-      );
-
-      // Schedule 3-day advance notification
-      await _scheduleThreeDayAdvanceNotification(
-        appointmentId: appointmentId,
-        clientId: clientId,
-        attorneyId: finalAttorneyId,
-        appointmentDateTime: appointmentDateTime,
-        appointmentType: appointmentType,
-        clientName: clientName,
-        creatorName: creatorName,
-        notifyClient: notifyClient,
-        notifyStaff: notifyStaff,
-      );
-
-      // Schedule same-day morning reminder
-      await _scheduleSameDayReminder(
-        appointmentId: appointmentId,
-        clientId: clientId,
-        attorneyId: finalAttorneyId,
-        appointmentDateTime: appointmentDateTime,
-        appointmentType: appointmentType,
-        clientName: clientName,
-        creatorName: creatorName,
-        notifyClient: notifyClient,
-        notifyStaff: notifyStaff,
-      );
-
-      try {
-        await _mirrorAppointmentToCalendarEvent(
+      if (status == 'pending') {
+        await _notifyAttorneyOfClientAppointmentRequest(
           appointmentId: appointmentId,
           attorneyId: finalAttorneyId,
           clientId: clientId,
           clientName: clientName,
-          caseId: caseId,
-          caseTitle: caseTitle,
           appointmentDateTime: appointmentDateTime,
           appointmentType: appointmentType,
-          notes: notes,
         );
-      } catch (_) {
-        // `appointments` is source of truth; calendar mirror is best-effort.
+      } else {
+        await _sendImmediateAppointmentNotifications(
+          appointmentId: appointmentId,
+          clientId: clientId,
+          clientName: clientName,
+          attorneyId: finalAttorneyId,
+          appointmentDateTime: appointmentDateTime,
+          appointmentType: appointmentType,
+          creatorName: creatorName,
+          notifyClient: notifyClient,
+          notifyStaff: notifyStaff,
+        );
+
+        await _scheduleThreeDayAdvanceNotification(
+          appointmentId: appointmentId,
+          clientId: clientId,
+          attorneyId: finalAttorneyId,
+          appointmentDateTime: appointmentDateTime,
+          appointmentType: appointmentType,
+          clientName: clientName,
+          creatorName: creatorName,
+          notifyClient: notifyClient,
+          notifyStaff: notifyStaff,
+        );
+
+        await _scheduleSameDayReminder(
+          appointmentId: appointmentId,
+          clientId: clientId,
+          attorneyId: finalAttorneyId,
+          appointmentDateTime: appointmentDateTime,
+          appointmentType: appointmentType,
+          clientName: clientName,
+          creatorName: creatorName,
+          notifyClient: notifyClient,
+          notifyStaff: notifyStaff,
+        );
+      }
+
+      if (status.toLowerCase() != 'pending') {
+        try {
+          await _mirrorAppointmentToCalendarEvent(
+            appointmentId: appointmentId,
+            attorneyId: finalAttorneyId,
+            clientId: clientId,
+            clientName: clientName,
+            caseId: caseId,
+            caseTitle: caseTitle,
+            appointmentDateTime: appointmentDateTime,
+            appointmentType: appointmentType,
+            notes: notes,
+          );
+        } catch (_) {
+          // `appointments` is source of truth; calendar mirror is best-effort.
+        }
       }
 
       return {
@@ -188,6 +247,45 @@ class EnhancedAppointmentService {
       }).toList();
     } catch (e) {
       return [];
+    }
+  }
+
+  /// Client submitted a pending appointment request — notify the attorney now.
+  Future<void> _notifyAttorneyOfClientAppointmentRequest({
+    required String appointmentId,
+    required String attorneyId,
+    required String clientId,
+    required String clientName,
+    required DateTime appointmentDateTime,
+    required String appointmentType,
+  }) async {
+    try {
+      final dateStr = DateFormat('MMM d, yyyy').format(appointmentDateTime);
+      final timeStr = DateFormat('hh:mm a').format(appointmentDateTime);
+      final typeLabel = appointmentType
+          .replaceAll('_', ' ')
+          .split(' ')
+          .map((word) => word.isEmpty
+              ? word
+              : word[0].toUpperCase() + word.substring(1))
+          .join(' ');
+      final message =
+          '$clientName requested a $typeLabel on $dateStr at $timeStr.';
+      await AttorneyRequestNotify.notifyAttorneys(
+        attorneyIds: [attorneyId],
+        title: 'New Appointment Request',
+        message: message,
+        smsBody:
+            'Law Connect: New appointment request from $clientName on $dateStr at $timeStr.',
+        type: 'appointment_request',
+        data: {
+          'appointmentId': appointmentId,
+          'clientId': clientId,
+          'clientName': clientName,
+        },
+      );
+    } catch (e) {
+      print('Error notifying attorney of appointment request: $e');
     }
   }
 
@@ -309,20 +407,20 @@ class EnhancedAppointmentService {
       // Also create a Cloud Function trigger document for 3-day reminder
       // This will be processed by a Cloud Function scheduled task
       final reminderData = <String, dynamic>{
-            'appointmentId': appointmentId,
-            'clientId': clientId,
-            'attorneyId': attorneyId,
-            'clientName': clientName,
-            'appointmentDateTime': Timestamp.fromDate(appointmentDateTime),
-            'appointmentType': appointmentType,
-            'threeDayReminderDate': Timestamp.fromDate(threeDaysBefore),
-            'creatorName': creatorName,
-            'notifyClient': notifyClient,
-            'notifyStaff': notifyStaff,
-            'status': 'pending',
-            'notificationsSent': false,
-            'createdAt': FieldValue.serverTimestamp(),
-          };
+        'appointmentId': appointmentId,
+        'clientId': clientId,
+        'attorneyId': attorneyId,
+        'clientName': clientName,
+        'appointmentDateTime': Timestamp.fromDate(appointmentDateTime),
+        'appointmentType': appointmentType,
+        'threeDayReminderDate': Timestamp.fromDate(threeDaysBefore),
+        'creatorName': creatorName,
+        'notifyClient': notifyClient,
+        'notifyStaff': notifyStaff,
+        'status': 'pending',
+        'notificationsSent': false,
+        'createdAt': FieldValue.serverTimestamp(),
+      };
       await HybridDatastore.set(
         collection: 'appointment_reminders',
         id: appointmentId,
@@ -363,21 +461,21 @@ class EnhancedAppointmentService {
       // Create reminder document for same-day reminder
       final sameDayId = '${appointmentId}_sameday';
       final sameDayData = <String, dynamic>{
-            'appointmentId': appointmentId,
-            'clientId': clientId,
-            'attorneyId': attorneyId,
-            'clientName': clientName,
-            'creatorName': creatorName,
-            'notifyClient': notifyClient,
-            'notifyStaff': notifyStaff,
-            'appointmentDateTime': Timestamp.fromDate(appointmentDateTime),
-            'appointmentType': appointmentType,
-            'sameDayReminderDate': Timestamp.fromDate(sameDayMorning),
-            'reminderType': 'sameday',
-            'status': 'pending',
-            'notificationsSent': false,
-            'createdAt': FieldValue.serverTimestamp(),
-          };
+        'appointmentId': appointmentId,
+        'clientId': clientId,
+        'attorneyId': attorneyId,
+        'clientName': clientName,
+        'creatorName': creatorName,
+        'notifyClient': notifyClient,
+        'notifyStaff': notifyStaff,
+        'appointmentDateTime': Timestamp.fromDate(appointmentDateTime),
+        'appointmentType': appointmentType,
+        'sameDayReminderDate': Timestamp.fromDate(sameDayMorning),
+        'reminderType': 'sameday',
+        'status': 'pending',
+        'notificationsSent': false,
+        'createdAt': FieldValue.serverTimestamp(),
+      };
       await HybridDatastore.set(
         collection: 'appointment_reminders',
         id: sameDayId,
@@ -418,6 +516,9 @@ class EnhancedAppointmentService {
   /// This should be called by a Cloud Function scheduled task daily
   Future<void> processThreeDayReminders() async {
     try {
+      final settings = await SystemSettingsService.instance.load();
+      if (!settings.appointmentReminders) return;
+
       final now = DateTime.now();
       final todayStart = DateTime(now.year, now.month, now.day);
       final todayEnd = todayStart.add(const Duration(days: 1));
@@ -559,8 +660,16 @@ class EnhancedAppointmentService {
           .map((word) => word[0].toUpperCase() + word.substring(1))
           .join(' ');
 
-      final message =
+      final detail =
           'Reminder: Appointment with $clientName (scheduled by $creatorName) on $dateStr at $timeStr ($appointmentTypeStr)';
+      final settings = await SystemSettingsService.instance.load();
+      final message = settings.emailNotifications
+          ? settings.applyTemplate(settings.appointmentEmail, detail, {
+              'name': clientName,
+              'date': dateStr,
+              'time': timeStr,
+            })
+          : detail;
 
       // 1. Notify ATTORNEY (always notified)
       await _createNotification(
@@ -691,6 +800,14 @@ class EnhancedAppointmentService {
         return {'success': false, 'message': 'User not authenticated'};
       }
 
+      if (await isTimeSlotTaken(
+        attorneyId: currentUser.uid,
+        dateTime: finalDateTime,
+        excludeAppointmentId: request.id,
+      )) {
+        return _scheduleFullResult();
+      }
+
       final batch = _firestore.batch();
       final appointmentsRef = _firestore.collection('appointments');
       final newAppointmentRef = appointmentsRef.doc();
@@ -728,6 +845,39 @@ class EnhancedAppointmentService {
 
       // Commit appointment + request updates in one atomic batch
       await batch.commit();
+
+      try {
+        final requestedSlot = _minuteTruncated(request.appointmentDateTime);
+        final finalSlot = _minuteTruncated(finalDateTime);
+        if (requestedSlot != finalSlot) {
+          await _releaseTimeSlot(
+            attorneyId: currentUser.uid,
+            dateTime: request.appointmentDateTime,
+            appointmentId: request.id,
+          );
+        }
+        await _claimTimeSlot(
+          attorneyId: currentUser.uid,
+          dateTime: finalDateTime,
+          appointmentId: newAppointmentRef.id,
+          overwrite: true,
+        );
+      } catch (_) {}
+
+      try {
+        await _removeMirroredAppointmentCalendarEvent(request.id);
+        await _mirrorAppointmentToCalendarEvent(
+          appointmentId: newAppointmentRef.id,
+          attorneyId: currentUser.uid,
+          clientId: request.clientId,
+          clientName: request.clientName,
+          caseId: request.caseId,
+          caseTitle: request.caseTitle,
+          appointmentDateTime: finalDateTime,
+          appointmentType: appointmentType,
+          notes: notes,
+        );
+      } catch (_) {}
 
       // Get attorney name for notifications
       final attorneyDoc = await _firestore
@@ -805,6 +955,7 @@ class EnhancedAppointmentService {
     return _firestore
         .collection('appointments')
         .where('attorneyId', isEqualTo: attorneyId)
+        .limit(80)
         .snapshots()
         .map((snapshot) {
           final list = snapshot.docs
@@ -844,6 +995,27 @@ class EnhancedAppointmentService {
     String? status,
   }) async {
     try {
+      final currentSnap = await _firestore
+          .collection('appointments')
+          .doc(appointmentId)
+          .get();
+      final currentData = currentSnap.data();
+      final oldDateTime = currentData == null
+          ? null
+          : AppointmentModel.fromFirestore(currentSnap).appointmentDateTime;
+      final oldStatus = (currentData?['status'] as String?) ?? '';
+      final attorneyId = (currentData?['attorneyId'] as String?) ?? '';
+
+      if (appointmentDateTime != null && attorneyId.isNotEmpty) {
+        if (await isTimeSlotTaken(
+          attorneyId: attorneyId,
+          dateTime: appointmentDateTime,
+          excludeAppointmentId: appointmentId,
+        )) {
+          return _scheduleFullResult();
+        }
+      }
+
       final updateData = <String, dynamic>{
         'updatedAt': FieldValue.serverTimestamp(),
       };
@@ -863,10 +1035,33 @@ class EnhancedAppointmentService {
           .doc(appointmentId)
           .update(updateData);
 
+      final nextStatus = (status ?? oldStatus).toLowerCase();
+      final nextDateTime = appointmentDateTime ?? oldDateTime;
+      if (attorneyId.isNotEmpty) {
+        try {
+          if (oldDateTime != null) {
+            await _releaseTimeSlot(
+              attorneyId: attorneyId,
+              dateTime: oldDateTime,
+              appointmentId: appointmentId,
+            );
+          }
+          if (nextDateTime != null && _statusOccupiesSlot(nextStatus)) {
+            await _claimTimeSlot(
+              attorneyId: attorneyId,
+              dateTime: nextDateTime,
+              appointmentId: appointmentId,
+            );
+          }
+        } catch (_) {}
+      }
+
       if (appointmentDateTime != null) {
         try {
-          final snap =
-              await _firestore.collection('appointments').doc(appointmentId).get();
+          final snap = await _firestore
+              .collection('appointments')
+              .doc(appointmentId)
+              .get();
           final d = snap.data();
           if (d != null) {
             await _mirrorAppointmentToCalendarEvent(
@@ -923,6 +1118,23 @@ class EnhancedAppointmentService {
 
       await requestDoc.reference.update(updateData);
 
+      final lowered = status.toLowerCase();
+      if (lowered == 'declined' || lowered == 'cancelled') {
+        try {
+          final apt = AppointmentModel.fromFirestore(requestDoc);
+          final attorneyIdForSlot =
+              existingAttorneyId ?? currentAttorneyId ?? '';
+          if (attorneyIdForSlot.isNotEmpty) {
+            await _releaseTimeSlot(
+              attorneyId: attorneyIdForSlot,
+              dateTime: apt.appointmentDateTime,
+              appointmentId: requestId,
+            );
+          }
+          await _removeMirroredAppointmentCalendarEvent(requestId);
+        } catch (_) {}
+      }
+
       // Best-effort client notification (outside main try/catch below)
       try {
         if (clientId != null && clientId.isNotEmpty) {
@@ -957,7 +1169,10 @@ class EnhancedAppointmentService {
             'isRead': false,
             'createdAt': FieldValue.serverTimestamp(),
           };
-          await HybridDatastore.add(collection: 'notifications', data: notifData);
+          await HybridDatastore.add(
+            collection: 'notifications',
+            data: notifData,
+          );
         }
       } catch (_) {
         // Ignore notification failures
@@ -993,6 +1208,215 @@ class EnhancedAppointmentService {
 
   static String calendarEventDocIdForAppointment(String appointmentId) =>
       'appt_$appointmentId';
+
+  Map<String, dynamic> _scheduleFullResult() => {
+        'success': false,
+        'code': scheduleFullCode,
+        'message':
+            'The schedule for this day is already full at the selected time.',
+      };
+
+  DateTime _minuteTruncated(DateTime dateTime) => DateTime(
+        dateTime.year,
+        dateTime.month,
+        dateTime.day,
+        dateTime.hour,
+        dateTime.minute,
+      );
+
+  bool _statusOccupiesSlot(String status) {
+    switch (status.toLowerCase().trim()) {
+      case 'upcoming':
+      case 'confirmed':
+      case 'scheduled':
+      case 'rescheduled':
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  bool _statusBlocksSlot(String status) {
+    switch (status.toLowerCase().trim()) {
+      case 'pending':
+      case 'upcoming':
+      case 'confirmed':
+      case 'scheduled':
+      case 'rescheduled':
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  String _slotDocId(String attorneyId, DateTime dateTime) {
+    final slot = _minuteTruncated(dateTime);
+    final y = slot.year.toString().padLeft(4, '0');
+    final m = slot.month.toString().padLeft(2, '0');
+    final d = slot.day.toString().padLeft(2, '0');
+    final h = slot.hour.toString().padLeft(2, '0');
+    final min = slot.minute.toString().padLeft(2, '0');
+    return '${attorneyId}_${y}${m}${d}_$h$min';
+  }
+
+  DocumentReference<Map<String, dynamic>> _slotRef(
+    String attorneyId,
+    DateTime dateTime,
+  ) {
+    return _firestore
+        .collection('appointment_slots')
+        .doc(_slotDocId(attorneyId, dateTime));
+  }
+
+  /// True when this attorney already has a confirmed booking (or hearing)
+  /// at the same date and time.
+  Future<bool> isTimeSlotTaken({
+    required String attorneyId,
+    required DateTime dateTime,
+    String? excludeAppointmentId,
+  }) async {
+    if (attorneyId.isEmpty) return false;
+    final target = _minuteTruncated(dateTime);
+
+    try {
+      final slotSnap = await _slotRef(attorneyId, target).get();
+      if (slotSnap.exists) {
+        final existingId = slotSnap.data()?['appointmentId'] as String?;
+        if (excludeAppointmentId == null ||
+            existingId == null ||
+            existingId != excludeAppointmentId) {
+          return true;
+        }
+      }
+    } catch (_) {}
+
+    try {
+      final snap = await _firestore
+          .collection('appointments')
+          .where('attorneyId', isEqualTo: attorneyId)
+          .get();
+      for (final doc in snap.docs) {
+        if (excludeAppointmentId != null && doc.id == excludeAppointmentId) {
+          continue;
+        }
+        final apt = AppointmentModel.fromFirestore(doc);
+        if (!_statusBlocksSlot(apt.status)) continue;
+        if (_minuteTruncated(apt.appointmentDateTime) == target) {
+          return true;
+        }
+      }
+    } on FirebaseException catch (e) {
+      if (e.code != 'permission-denied') {
+        // Ignore; slot doc is the client-safe source of truth.
+      }
+    } catch (_) {}
+
+    try {
+      final events = await _firestore
+          .collection('calendar_events')
+          .where('assignedTo', isEqualTo: attorneyId)
+          .get();
+      for (final doc in events.docs) {
+        final data = doc.data();
+        final type = (data['eventType'] as String?)?.toLowerCase() ?? '';
+        if (type != 'hearing' && type != 'deadline' && type != 'filing') {
+          continue;
+        }
+        final raw = data['eventDate'];
+        DateTime? eventDate;
+        if (raw is Timestamp) eventDate = raw.toDate();
+        if (raw is DateTime) eventDate = raw;
+        if (eventDate == null) continue;
+        if (_minuteTruncated(eventDate) == target) return true;
+      }
+    } catch (_) {}
+
+    return false;
+  }
+
+  Future<void> _claimTimeSlot({
+    required String attorneyId,
+    required DateTime dateTime,
+    required String appointmentId,
+    bool overwrite = false,
+  }) async {
+    if (attorneyId.isEmpty || appointmentId.isEmpty) return;
+    final slot = _minuteTruncated(dateTime);
+    final ref = _slotRef(attorneyId, slot);
+    final existing = await ref.get();
+    if (existing.exists && !overwrite) {
+      final existingId = existing.data()?['appointmentId'] as String?;
+      if (existingId != null &&
+          existingId.isNotEmpty &&
+          existingId != appointmentId) {
+        return;
+      }
+    }
+    await ref.set({
+      'attorneyId': attorneyId,
+      'appointmentId': appointmentId,
+      'startAt': Timestamp.fromDate(slot),
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  Future<void> _releaseTimeSlot({
+    required String attorneyId,
+    required DateTime dateTime,
+    required String appointmentId,
+  }) async {
+    if (attorneyId.isEmpty) return;
+    final ref = _slotRef(attorneyId, dateTime);
+    try {
+      final snap = await ref.get();
+      if (!snap.exists) return;
+      final existingId = snap.data()?['appointmentId'] as String?;
+      if (existingId != null &&
+          existingId.isNotEmpty &&
+          existingId != appointmentId) {
+        return;
+      }
+      await ref.delete();
+    } catch (_) {}
+  }
+
+  /// Writes missing occupancy docs for already-confirmed appointments so
+  /// later client requests can detect a full slot.
+  Future<void> syncOccupiedTimeSlotsIfNeeded(
+    String attorneyId,
+    List<AppointmentModel> appointments,
+  ) async {
+    final aid = attorneyId.trim();
+    if (aid.isEmpty || _syncedSlotAttorneyIds.contains(aid)) return;
+    _syncedSlotAttorneyIds.add(aid);
+
+    for (final apt in appointments) {
+      if (!_statusBlocksSlot(apt.status) || apt.id.isEmpty) continue;
+      try {
+        final ref = _slotRef(aid, apt.appointmentDateTime);
+        final snap = await ref.get();
+        if (!snap.exists) {
+          await _claimTimeSlot(
+            attorneyId: aid,
+            dateTime: apt.appointmentDateTime,
+            appointmentId: apt.id,
+          );
+        }
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _removeMirroredAppointmentCalendarEvent(
+    String appointmentId,
+  ) async {
+    if (appointmentId.isEmpty) return;
+    try {
+      await _firestore
+          .collection('calendar_events')
+          .doc(calendarEventDocIdForAppointment(appointmentId))
+          .delete();
+    } catch (_) {}
+  }
 
   /// Manual client appointments (not AI hearings) — shown on attorney day dialog.
   Future<void> _mirrorAppointmentToCalendarEvent({

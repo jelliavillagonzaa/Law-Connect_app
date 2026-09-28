@@ -9,6 +9,7 @@ import '../../widgets/common/profile_picture_widget.dart';
 import '../../widgets/maps/oroquieta_map_picker.dart';
 import '../../widgets/maps/oroquieta_map_viewer.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/currency.dart';
 import '../auth/login_page.dart';
 
 class AttorneyProfilePage extends StatefulWidget {
@@ -85,23 +86,32 @@ class _AttorneyProfilePageState extends State<AttorneyProfilePage> {
               maxWidth: isDesktop ? 800 : double.infinity,
             ),
             child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
-                  // Profile Picture
-                  ProfilePictureWidget(
-                    photoUrl: _userProfile?['photoUrl'],
-                    userName: _isLoading
-                        ? 'Attorney'
-                        : (_userProfile?['name'] ??
-                              user?.email?.split('@')[0] ??
-                              'Attorney'),
-                    size: isDesktop ? 150 : 120,
-                    isEditable: true,
-                    onUpdated: _loadProfile,
+                  // Profile Picture with online status dot beside camera
+                  Center(
+                    child: ProfilePictureWidget(
+                      photoUrl: _userProfile?['photoUrl'],
+                      userName: _isLoading
+                          ? 'Attorney'
+                          : (_userProfile?['name'] ??
+                                user?.email?.split('@')[0] ??
+                                'Attorney'),
+                      size: isDesktop ? 150 : 120,
+                      isEditable: true,
+                      isOnline: _userProfile != null
+                          ? _userProfile!['isAvailable'] == true
+                          : null,
+                      onUpdated: _loadProfile,
+                    ),
                   ),
                   SizedBox(height: isDesktop ? 32 : 24),
                   // User Info
                   Text(
                     _userProfile?['name'] ?? 'Attorney',
+                    textAlign: TextAlign.center,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       fontSize: isDesktop ? 28 : 24,
                       fontWeight: FontWeight.bold,
@@ -110,6 +120,9 @@ class _AttorneyProfilePageState extends State<AttorneyProfilePage> {
                   const SizedBox(height: 8),
                   Text(
                     user?.email ?? '',
+                    textAlign: TextAlign.center,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       fontSize: isDesktop ? 16 : 14,
                       color: Colors.grey[600],
@@ -142,10 +155,6 @@ class _AttorneyProfilePageState extends State<AttorneyProfilePage> {
                         ),
                       ],
                     ),
-                  const SizedBox(height: 8),
-                  // Online / Offline toggle (settings)
-                  if (_userProfile != null)
-                    _buildAvailabilityHeaderToggle(isDesktop: isDesktop),
                   SizedBox(height: isDesktop ? 40 : 32),
                   // Profile Details – all info in a single container
                   Card(
@@ -200,328 +209,178 @@ class _AttorneyProfilePageState extends State<AttorneyProfilePage> {
                               ),
                             ),
                           ),
-                          _buildCompactInfoRow(
-                            icon: Icons.person,
+                          _buildAdditionalDetailTile(
+                            icon: Icons.person_outline,
                             label: 'Name',
-                            value: _userProfile?['name'] ?? 'Not set',
+                            value: _userProfile?['name']?.toString().trim().isNotEmpty ==
+                                    true
+                                ? _userProfile!['name'].toString().trim()
+                                : 'Not set',
                             isDesktop: isDesktop,
                           ),
-                          SizedBox(height: isDesktop ? 12 : 10),
-                          _buildCompactInfoRow(
-                            icon: Icons.email,
+                          SizedBox(height: isDesktop ? 10 : 8),
+                          _buildAdditionalDetailTile(
+                            icon: Icons.email_outlined,
                             label: 'Email',
-                            value: _userProfile?['email'] ?? 'Not set',
+                            value: _userProfile?['email']?.toString().trim().isNotEmpty ==
+                                    true
+                                ? _userProfile!['email'].toString().trim()
+                                : 'Not set',
                             isDesktop: isDesktop,
+                            maxLines: 2,
                           ),
-                          SizedBox(height: isDesktop ? 12 : 10),
-                          _buildCompactInfoRow(
-                            icon: Icons.phone,
+                          SizedBox(height: isDesktop ? 10 : 8),
+                          _buildAdditionalDetailTile(
+                            icon: Icons.phone_outlined,
                             label: 'Phone',
-                            value: _userProfile?['phone'] ?? 'Not set',
+                            value: _userProfile?['phone']?.toString().trim().isNotEmpty ==
+                                    true
+                                ? _userProfile!['phone'].toString().trim()
+                                : 'Not set',
                             isDesktop: isDesktop,
                           ),
-                          SizedBox(height: isDesktop ? 12 : 10),
-                          _buildCompactInfoRow(
-                            icon: Icons.work,
+                          SizedBox(height: isDesktop ? 10 : 8),
+                          _buildAdditionalDetailTile(
+                            icon: Icons.work_outline,
                             label: 'Specializations',
-                            value: _userProfile?['specialization'] != null
+                            value: _userProfile?['specialization'] != null &&
+                                    (_userProfile!['specialization'] as List)
+                                        .isNotEmpty
                                 ? (_userProfile!['specialization'] as List)
                                       .join(', ')
                                 : 'Not set',
                             isDesktop: isDesktop,
+                            maxLines: 3,
                           ),
-                          SizedBox(height: isDesktop ? 12 : 10),
-                          _buildCompactInfoRow(
-                            icon: Icons.check_circle,
+                          SizedBox(height: isDesktop ? 10 : 8),
+                          _buildAdditionalDetailTile(
+                            icon: Icons.circle_outlined,
                             label: 'Availability',
                             value: _userProfile?['isAvailable'] == true
                                 ? 'Available'
                                 : 'Unavailable',
                             isDesktop: isDesktop,
+                            valueColor: _userProfile?['isAvailable'] == true
+                                ? const Color(0xFF2E7D32)
+                                : AppTheme.mutedText,
                           ),
                         ],
                       ),
                     ),
                   ),
                   SizedBox(height: isDesktop ? 32 : 24),
-                  // Additional Details - Professional Container
-                  Container(
-                    decoration: BoxDecoration(
-                      color: AppTheme.cleanWhite,
-                      borderRadius: BorderRadius.circular(20),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withOpacity(0.08),
-                          blurRadius: 20,
-                          offset: const Offset(0, 4),
-                          spreadRadius: 0,
-                        ),
-                        BoxShadow(
-                          color: Colors.black.withOpacity(0.04),
-                          blurRadius: 10,
-                          offset: const Offset(0, 2),
-                        ),
-                      ],
+                  // Additional Details
+                  Card(
+                    elevation: 2,
+                    margin: EdgeInsets.only(bottom: isDesktop ? 16 : 12),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
                     ),
                     child: Padding(
-                      padding: EdgeInsets.all(isDesktop ? 24 : 20),
+                      padding: EdgeInsets.all(isDesktop ? 20 : 16),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
-                        children: <Widget>[
-                          // Header with Edit button
+                        children: [
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
                               Text(
                                 'Additional Details',
                                 style: TextStyle(
-                                  fontSize: isDesktop ? 22 : 20,
+                                  fontSize: isDesktop ? 20 : 18,
                                   fontWeight: FontWeight.bold,
-                                  color: AppTheme.darkText,
                                 ),
                               ),
                               TextButton.icon(
                                 onPressed: _handleEditProfile,
                                 icon: Icon(
-                                  Icons.edit,
+                                  Icons.edit_outlined,
                                   size: isDesktop ? 18 : 16,
-                                  color: AppTheme.royalBlue,
                                 ),
                                 label: Text(
                                   'Edit',
                                   style: TextStyle(
                                     fontSize: isDesktop ? 14 : 12,
                                     fontWeight: FontWeight.w600,
-                                    color: AppTheme.royalBlue,
-                                  ),
-                                ),
-                                style: TextButton.styleFrom(
-                                  padding: EdgeInsets.symmetric(
-                                    horizontal: isDesktop ? 12 : 8,
-                                    vertical: isDesktop ? 8 : 6,
-                                  ),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(8),
                                   ),
                                 ),
                               ),
                             ],
                           ),
-                          const SizedBox(height: 20),
-                          // Location card
-                          if ((_userProfile?['officeAddress'] != null &&
-                                  _userProfile!['officeAddress']
-                                      .toString()
-                                      .isNotEmpty) ||
-                              (_userProfile?['city'] != null &&
-                                  _userProfile!['city']
-                                      .toString()
-                                      .isNotEmpty) ||
-                              (_userProfile?['province'] != null &&
-                                  _userProfile!['province']
-                                      .toString()
-                                      .isNotEmpty))
-                            Container(
-                              margin: EdgeInsets.only(
-                                bottom: isDesktop ? 16 : 12,
-                              ),
-                              padding: EdgeInsets.all(isDesktop ? 18 : 16),
-                              decoration: BoxDecoration(
-                                color: AppTheme.lightGray.withOpacity(0.5),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                  color: AppTheme.borderGray.withOpacity(0.5),
-                                  width: 1,
-                                ),
-                              ),
-                              child: _buildLocationRow(isDesktop: isDesktop),
+                          Container(
+                            height: 1,
+                            margin: EdgeInsets.symmetric(
+                              vertical: isDesktop ? 12 : 10,
                             ),
-                          // Bio card
-                          if (_userProfile?['bio'] != null &&
-                              _userProfile!['bio'].toString().isNotEmpty)
-                            Container(
-                              margin: EdgeInsets.only(
-                                bottom: isDesktop ? 16 : 12,
-                              ),
-                              padding: EdgeInsets.all(isDesktop ? 18 : 16),
-                              decoration: BoxDecoration(
-                                color: AppTheme.lightGray.withOpacity(0.5),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                  color: AppTheme.borderGray.withOpacity(0.5),
-                                  width: 1,
-                                ),
-                              ),
-                              child: _buildInfoRow(
-                                Icons.description,
-                                'Bio / Introduction',
-                                _userProfile!['bio'],
-                                isDesktop: isDesktop,
-                              ),
-                            ),
-                          // Languages card
-                          if (_userProfile?['languages'] != null)
-                            Container(
-                              margin: EdgeInsets.only(
-                                bottom: isDesktop ? 16 : 12,
-                              ),
-                              padding: EdgeInsets.all(isDesktop ? 18 : 16),
-                              decoration: BoxDecoration(
-                                color: AppTheme.lightGray.withOpacity(0.5),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                  color: AppTheme.borderGray.withOpacity(0.5),
-                                  width: 1,
-                                ),
-                              ),
-                              child: _buildInfoRow(
-                                Icons.language,
-                                'Languages Spoken',
-                                _userProfile!['languages'] is List
-                                    ? (_userProfile!['languages'] as List).join(
-                                        ', ',
-                                      )
-                                    : _userProfile!['languages'].toString(),
-                                isDesktop: isDesktop,
-                              ),
-                            ),
-                          // Rate information card
-                          if (_userProfile?['rateType'] != null ||
-                              _userProfile?['consultationFee'] != null)
-                            Container(
-                              margin: EdgeInsets.only(
-                                bottom: isDesktop ? 16 : 12,
-                              ),
-                              padding: EdgeInsets.all(isDesktop ? 18 : 16),
-                              decoration: BoxDecoration(
-                                color: AppTheme.lightGray.withOpacity(0.5),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                  color: AppTheme.borderGray.withOpacity(0.5),
-                                  width: 1,
-                                ),
-                              ),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Container(
-                                    padding: const EdgeInsets.all(8),
-                                    decoration: BoxDecoration(
-                                      color: AppTheme.royalBlue.withOpacity(
-                                        0.1,
-                                      ),
-                                      borderRadius: BorderRadius.circular(8),
-                                    ),
-                                    child: Icon(
-                                      Icons.attach_money,
-                                      color: AppTheme.royalBlue,
-                                      size: isDesktop ? 24 : 20,
-                                    ),
-                                  ),
-                                  SizedBox(width: isDesktop ? 16 : 12),
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Text(
-                                          'Rate Information',
-                                          style: TextStyle(
-                                            fontSize: isDesktop ? 13 : 11,
-                                            color: AppTheme.mutedText,
-                                            fontWeight: FontWeight.w500,
-                                          ),
-                                        ),
-                                        const SizedBox(height: 6),
-                                        if (_userProfile?['rateType'] != null)
-                                          Padding(
-                                            padding: const EdgeInsets.only(
-                                              bottom: 4,
-                                            ),
-                                            child: Text(
-                                              'Rate Type: ${_userProfile!['rateType']}',
-                                              style: TextStyle(
-                                                fontSize: isDesktop ? 16 : 14,
-                                                fontWeight: FontWeight.w600,
-                                                color: AppTheme.darkText,
-                                              ),
-                                            ),
-                                          ),
-                                        if (_userProfile?['consultationFee'] !=
-                                            null)
-                                          Text(
-                                            'Consultation Fee: ₱${_userProfile!['consultationFee']}',
-                                            style: TextStyle(
-                                              fontSize: isDesktop ? 16 : 14,
-                                              fontWeight: FontWeight.w600,
-                                              color: AppTheme.darkText,
-                                            ),
-                                          ),
-                                      ],
-                                    ),
-                                  ),
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(
+                                colors: [
+                                  Colors.transparent,
+                                  Colors.grey[300]!,
+                                  Colors.transparent,
                                 ],
                               ),
                             ),
-                          // Empty-state if no additional details
-                          if ((_userProfile?['officeAddress'] == null ||
-                                  _userProfile!['officeAddress']
-                                      .toString()
-                                      .isEmpty) &&
-                              (_userProfile?['city'] == null ||
-                                  _userProfile!['city'].toString().isEmpty) &&
-                              (_userProfile?['province'] == null ||
-                                  _userProfile!['province']
-                                      .toString()
-                                      .isEmpty) &&
-                              (_userProfile?['mapsPin'] == null ||
-                                  _userProfile!['mapsPin']
-                                      .toString()
-                                      .isEmpty) &&
-                              (_userProfile?['bio'] == null ||
-                                  _userProfile!['bio'].toString().isEmpty) &&
-                              _userProfile?['languages'] == null &&
-                              _userProfile?['rateType'] == null &&
-                              _userProfile?['consultationFee'] == null)
-                            Container(
-                              padding: EdgeInsets.all(isDesktop ? 32 : 24),
-                              decoration: BoxDecoration(
-                                color: AppTheme.lightGray.withOpacity(0.3),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                  color: AppTheme.borderGray.withOpacity(0.3),
-                                  width: 1,
-                                ),
-                              ),
-                              child: Column(
-                                children: [
-                                  Icon(
-                                    Icons.info_outline,
-                                    color: AppTheme.mutedText,
-                                    size: 48,
-                                  ),
-                                  const SizedBox(height: 12),
-                                  Text(
-                                    'No additional details added yet',
-                                    style: TextStyle(
-                                      fontSize: isDesktop ? 15 : 13,
-                                      color: AppTheme.mutedText,
-                                      fontWeight: FontWeight.w500,
+                          ),
+                          _buildAdditionalDetailTile(
+                            icon: Icons.location_on_outlined,
+                            label: 'Location',
+                            value: _formatLocationDisplay(),
+                            isDesktop: isDesktop,
+                            maxLines: 4,
+                            trailing: _canShowLocationMap()
+                                ? TextButton.icon(
+                                    onPressed: _openLocationMap,
+                                    icon: Icon(
+                                      Icons.map_outlined,
+                                      size: isDesktop ? 18 : 16,
                                     ),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    'Click Edit to add more information',
-                                    style: TextStyle(
-                                      fontSize: isDesktop ? 13 : 11,
-                                      color: AppTheme.mutedText.withOpacity(
-                                        0.7,
+                                    label: Text(
+                                      'View on map',
+                                      style: TextStyle(
+                                        fontSize: isDesktop ? 13 : 12,
                                       ),
                                     ),
-                                  ),
-                                ],
-                              ),
-                            ),
+                                    style: TextButton.styleFrom(
+                                      padding: EdgeInsets.zero,
+                                      minimumSize: Size.zero,
+                                      tapTargetSize:
+                                          MaterialTapTargetSize.shrinkWrap,
+                                      foregroundColor: AppTheme.royalBlue,
+                                    ),
+                                  )
+                                : null,
+                          ),
+                          SizedBox(height: isDesktop ? 10 : 8),
+                          _buildAdditionalDetailTile(
+                            icon: Icons.description_outlined,
+                            label: 'Bio / Introduction',
+                            value:
+                                (_userProfile?['bio'] != null &&
+                                    _userProfile!['bio']
+                                        .toString()
+                                        .trim()
+                                        .isNotEmpty)
+                                ? _userProfile!['bio'].toString().trim()
+                                : 'Not set',
+                            isDesktop: isDesktop,
+                            maxLines: 6,
+                          ),
+                          SizedBox(height: isDesktop ? 10 : 8),
+                          _buildAdditionalDetailTile(
+                            icon: Icons.language_outlined,
+                            label: 'Languages Spoken',
+                            value: _userProfile?['languages'] != null
+                                ? (_userProfile!['languages'] is List
+                                      ? (_userProfile!['languages'] as List)
+                                            .join(', ')
+                                      : _userProfile!['languages'].toString())
+                                : 'Not set',
+                            isDesktop: isDesktop,
+                            maxLines: 3,
+                          ),
+                          SizedBox(height: isDesktop ? 10 : 8),
+                          _buildRateDetailTile(isDesktop: isDesktop),
                         ],
                       ),
                     ),
@@ -561,7 +420,10 @@ class _AttorneyProfilePageState extends State<AttorneyProfilePage> {
       );
 
     if (widget.embedded) {
-      return scrollContent;
+      return ColoredBox(
+        color: const Color.fromARGB(255, 158, 182, 215),
+        child: scrollContent,
+      );
     }
 
     return Scaffold(
@@ -620,272 +482,235 @@ class _AttorneyProfilePageState extends State<AttorneyProfilePage> {
     }
   }
 
-  Widget _buildLocationRow({bool isDesktop = false}) {
-    final addressParts = <String>[];
-    if (_userProfile?['officeAddress'] != null &&
-        _userProfile!['officeAddress'].toString().isNotEmpty) {
-      addressParts.add(_userProfile!['officeAddress'].toString());
-    }
-    if (_userProfile?['city'] != null &&
-        _userProfile!['city'].toString().isNotEmpty) {
-      addressParts.add(_userProfile!['city'].toString());
-    }
-    if (_userProfile?['province'] != null &&
-        _userProfile!['province'].toString().isNotEmpty) {
-      addressParts.add(_userProfile!['province'].toString());
+  String _formatLocationDisplay() {
+    final office = _userProfile?['officeAddress']?.toString().trim() ?? '';
+    final city = _userProfile?['city']?.toString().trim() ?? '';
+    final province = _userProfile?['province']?.toString().trim() ?? '';
+
+    if (office.isNotEmpty) {
+      final segments = office
+          .split(',')
+          .map((part) => part.trim())
+          .where((part) => part.isNotEmpty)
+          .toList();
+      if (segments.length >= 3) {
+        return office;
+      }
+
+      var result = office;
+      for (final part in [city, province]) {
+        if (part.isEmpty) continue;
+        if (!result.toLowerCase().contains(part.toLowerCase())) {
+          result = '$result, $part';
+        }
+      }
+      return result;
     }
 
-    final fullAddress = addressParts.join(', ');
-    final mapsPin = _userProfile?['mapsPin']?.toString() ?? '';
-
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Icon(
-          Icons.location_on,
-          color: AppTheme.royalBlue,
-          size: isDesktop ? 28 : 24,
-        ),
-        SizedBox(width: isDesktop ? 20 : 16),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Location',
-                style: TextStyle(
-                  fontSize: isDesktop ? 14 : 12,
-                  color: Colors.grey[600],
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                fullAddress.isNotEmpty ? fullAddress : 'Not set',
-                style: TextStyle(
-                  fontSize: isDesktop ? 18 : 16,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-              // Show "View Maps" button if coordinates or address is available
-              if ((_userProfile?['latitude'] != null &&
-                      _userProfile?['longitude'] != null) ||
-                  fullAddress.isNotEmpty ||
-                  mapsPin.isNotEmpty) ...[
-                const SizedBox(height: 8),
-                InkWell(
-                  onTap: () {
-                    // Open Flutter map viewer with location
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => OroquietaMapViewer(
-                          latitude: _userProfile?['latitude'] as double?,
-                          longitude: _userProfile?['longitude'] as double?,
-                          locationName: fullAddress.isNotEmpty
-                              ? fullAddress
-                              : 'Oroquieta City, Philippines',
-                          address: fullAddress.isNotEmpty
-                              ? fullAddress
-                              : 'Oroquieta City, Philippines',
-                        ),
-                      ),
-                    );
-                  },
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.map,
-                        size: isDesktop ? 18 : 16,
-                        color: AppTheme.royalBlue,
-                      ),
-                      const SizedBox(width: 4),
-                      Text(
-                        'View Maps',
-                        style: TextStyle(
-                          fontSize: isDesktop ? 14 : 12,
-                          color: AppTheme.royalBlue,
-                          decoration: TextDecoration.underline,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ],
-          ),
-        ),
-      ],
-    );
+    final fallback = [city, province].where((part) => part.isNotEmpty).join(', ');
+    return fallback.isEmpty ? 'Not set' : fallback;
   }
 
-  // Availability toggle shown under the avatar/name in settings
-  Widget _buildAvailabilityHeaderToggle({required bool isDesktop}) {
-    final isAvailable = _userProfile?['isAvailable'] == true;
+  bool _canShowLocationMap() {
+    final address = _formatLocationDisplay();
+    final mapsPin = _userProfile?['mapsPin']?.toString().trim() ?? '';
+    return (_userProfile?['latitude'] != null &&
+            _userProfile?['longitude'] != null) ||
+        (address.isNotEmpty && address != 'Not set') ||
+        mapsPin.isNotEmpty;
+  }
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.7),
-        borderRadius: BorderRadius.circular(24),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.08),
-            blurRadius: 10,
-            offset: const Offset(0, 3),
-          ),
-        ],
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 10,
-            height: 10,
-            decoration: BoxDecoration(
-              color: isAvailable
-                  ? const Color(0xFF4CAF50)
-                  : const Color(0xFFFF9800),
-              shape: BoxShape.circle,
-            ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            isAvailable ? 'Online' : 'Offline',
-            style: TextStyle(
-              fontSize: isDesktop ? 14 : 12,
-              fontWeight: FontWeight.w600,
-              color: isAvailable
-                  ? const Color(0xFF4CAF50)
-                  : const Color(0xFFFF9800),
-            ),
-          ),
-          const SizedBox(width: 8),
-          Transform.scale(
-            scale: 0.9,
-            child: Switch(
-              value: isAvailable,
-              onChanged: (value) => _updateAvailabilityFromSettings(value),
-              activeColor: const Color(0xFF4CAF50),
-              activeTrackColor: const Color(0xFF4CAF50).withOpacity(0.4),
-              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
-          ),
-        ],
+  void _openLocationMap() {
+    final fullAddress = _formatLocationDisplay();
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => OroquietaMapViewer(
+          latitude: _userProfile?['latitude'] as double?,
+          longitude: _userProfile?['longitude'] as double?,
+          locationName: fullAddress.isNotEmpty && fullAddress != 'Not set'
+              ? fullAddress
+              : 'Oroquieta City, Philippines',
+          address: fullAddress.isNotEmpty && fullAddress != 'Not set'
+              ? fullAddress
+              : 'Oroquieta City, Philippines',
+        ),
       ),
     );
   }
 
-  Future<void> _updateAvailabilityFromSettings(bool isAvailable) async {
-    try {
-      await _profileService.updateProfile({
-        'isAvailable': isAvailable,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
-
-      if (mounted) {
-        setState(() {
-          _userProfile = {...?_userProfile, 'isAvailable': isAvailable};
-        });
-
-        Get.snackbar(
-          'Status updated',
-          isAvailable ? 'You are now online.' : 'You are now offline.',
-          backgroundColor: isAvailable ? Colors.green : Colors.orange,
-          colorText: Colors.white,
-          duration: const Duration(seconds: 2),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        Get.snackbar(
-          'Error',
-          'Failed to update availability: $e',
-          backgroundColor: Colors.red,
-          colorText: Colors.white,
-        );
-      }
-    }
-  }
-
-  Widget _buildInfoRow(
-    IconData icon,
-    String label,
-    String value, {
-    bool isDesktop = false,
-    bool isMultiLine = false,
-  }) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Icon(icon, color: AppTheme.royalBlue, size: isDesktop ? 28 : 24),
-        SizedBox(width: isDesktop ? 20 : 16),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                label,
-                style: TextStyle(
-                  fontSize: isDesktop ? 14 : 12,
-                  color: Colors.grey[600],
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                value,
-                style: TextStyle(
-                  fontSize: isDesktop ? 18 : 16,
-                  fontWeight: FontWeight.w500,
-                ),
-                maxLines: isMultiLine ? null : 3,
-                overflow: isMultiLine
-                    ? TextOverflow.visible
-                    : TextOverflow.ellipsis,
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  // Compact info row for single container layout
-  Widget _buildCompactInfoRow({
+  Widget _buildAdditionalDetailTile({
     required IconData icon,
     required String label,
     required String value,
+    required bool isDesktop,
+    int maxLines = 2,
+    Color? valueColor,
+    Widget? trailing,
+  }) {
+    final isEmpty = value.trim().isEmpty || value.trim() == 'Not set';
+    final displayColor = valueColor ??
+        (isEmpty ? AppTheme.mutedText : AppTheme.darkText);
+
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.all(isDesktop ? 14 : 12),
+      decoration: BoxDecoration(
+        color: AppTheme.lightGray.withValues(alpha: 0.45),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppTheme.borderGray.withValues(alpha: 0.45)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: AppTheme.royalBlue.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(
+              icon,
+              color: AppTheme.royalBlue,
+              size: isDesktop ? 20 : 18,
+            ),
+          ),
+          SizedBox(width: isDesktop ? 14 : 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: isDesktop ? 12 : 11,
+                    color: AppTheme.mutedText,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.2,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  value,
+                  style: TextStyle(
+                    fontSize: isDesktop ? 15 : 14,
+                    fontWeight: FontWeight.w600,
+                    color: displayColor,
+                    height: 1.35,
+                  ),
+                  maxLines: maxLines,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                if (trailing != null) ...[
+                  const SizedBox(height: 8),
+                  trailing,
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRateDetailTile({required bool isDesktop}) {
+    final rateType = _userProfile?['rateType']?.toString().trim() ?? '';
+    final fee = _userProfile?['consultationFee'];
+
+    if (rateType.isEmpty && fee == null) {
+      return _buildAdditionalDetailTile(
+        icon: Icons.payments_outlined,
+        label: 'Rate Information',
+        value: 'Not set',
+        isDesktop: isDesktop,
+      );
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.all(isDesktop ? 14 : 12),
+      decoration: BoxDecoration(
+        color: AppTheme.lightGray.withValues(alpha: 0.45),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppTheme.borderGray.withValues(alpha: 0.45)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: AppTheme.royalBlue.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(
+              Icons.payments_outlined,
+              color: AppTheme.royalBlue,
+              size: isDesktop ? 20 : 18,
+            ),
+          ),
+          SizedBox(width: isDesktop ? 14 : 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Rate Information',
+                  style: TextStyle(
+                    fontSize: isDesktop ? 12 : 11,
+                    color: AppTheme.mutedText,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                if (rateType.isNotEmpty)
+                  _buildRateLine(
+                    'Rate Type',
+                    rateType,
+                    isDesktop: isDesktop,
+                  ),
+                if (fee != null) ...[
+                  if (rateType.isNotEmpty) const SizedBox(height: 6),
+                  _buildRateLine(
+                    'Consultation Fee',
+                    '${Currency.symbol}$fee',
+                    isDesktop: isDesktop,
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRateLine(
+    String label,
+    String value, {
     required bool isDesktop,
   }) {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Icon(icon, color: AppTheme.royalBlue, size: isDesktop ? 22 : 20),
-        SizedBox(width: isDesktop ? 16 : 12),
+        SizedBox(
+          width: isDesktop ? 118 : 108,
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: isDesktop ? 13 : 12,
+              color: AppTheme.mutedText,
+            ),
+          ),
+        ),
         Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                label,
-                style: TextStyle(
-                  fontSize: isDesktop ? 12 : 11,
-                  color: Colors.grey[600],
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-              const SizedBox(height: 2),
-              Text(
-                value,
-                style: TextStyle(
-                  fontSize: isDesktop ? 16 : 15,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.black87,
-                ),
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ],
+          child: Text(
+            value,
+            style: TextStyle(
+              fontSize: isDesktop ? 15 : 14,
+              fontWeight: FontWeight.w600,
+              color: AppTheme.darkText,
+            ),
           ),
         ),
       ],
@@ -921,18 +746,23 @@ class _AttorneyProfilePageState extends State<AttorneyProfilePage> {
             borderRadius: BorderRadius.circular(16),
           ),
           title: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                'Edit Profile Information',
-                style: TextStyle(
-                  fontSize: isDesktop ? 22 : 18,
-                  fontWeight: FontWeight.bold,
+              Expanded(
+                child: Text(
+                  'Edit Profile Information',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: isDesktop ? 22 : 18,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
               IconButton(
                 icon: const Icon(Icons.close),
                 onPressed: () => Navigator.pop(context),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
               ),
             ],
           ),
@@ -1150,18 +980,23 @@ class _AttorneyProfilePageState extends State<AttorneyProfilePage> {
             borderRadius: BorderRadius.circular(16),
           ),
           title: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                'Edit Additional Details',
-                style: TextStyle(
-                  fontSize: isDesktop ? 22 : 18,
-                  fontWeight: FontWeight.bold,
+              Expanded(
+                child: Text(
+                  'Edit Additional Details',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: isDesktop ? 22 : 18,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
               IconButton(
                 icon: const Icon(Icons.close),
                 onPressed: () => Navigator.pop(context),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
               ),
             ],
           ),
@@ -1316,8 +1151,8 @@ class _AttorneyProfilePageState extends State<AttorneyProfilePage> {
                   // Consultation Fee
                   TextField(
                     controller: consultationFeeController,
-                    decoration: const InputDecoration(
-                      labelText: 'Consultation Fee (₱)',
+                    decoration: InputDecoration(
+                      labelText: Currency.label('Consultation Fee'),
                       hintText: '0.00',
                       border: OutlineInputBorder(),
                       prefixIcon: Icon(Icons.payments),

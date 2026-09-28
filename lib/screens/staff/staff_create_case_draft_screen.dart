@@ -4,11 +4,15 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
 import 'package:flutter/foundation.dart' show debugPrint;
 import '../../services/case_service.dart';
+import '../../services/client_directory_service.dart';
 import '../../services/staff_auth_service.dart';
-import '../../services/fcm_service.dart';
+import '../../services/staff_service.dart';
+import '../../services/attorney_request_notify.dart';
+import '../../utils/case_sms_formatter.dart';
 import '../../models/case_model.dart';
 import '../../models/user_model.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/common/dropdown_helpers.dart';
 
 class StaffCreateCaseDraftScreen extends StatefulWidget {
   const StaffCreateCaseDraftScreen({super.key});
@@ -26,7 +30,7 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
   final _internalNotesController = TextEditingController();
   final CaseService _caseService = CaseService();
   final StaffAuthService _staffAuthService = StaffAuthService();
-  final FCMService _fcmService = FCMService();
+  final ClientDirectoryService _clientDirectory = ClientDirectoryService();
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
   String? _selectedClientId;
@@ -59,15 +63,11 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
   }
 
   Future<void> _initializeData() async {
-    // First load staff info to get assigned attorney ID
     await _loadStaffInfo();
-    // Then load clients and staff members (they depend on attorney ID)
-    if (_assignedAttorneyId != null) {
-      await Future.wait([
-        _loadClients(),
-        _loadStaffMembers(),
-      ]);
-    }
+    await Future.wait([
+      _loadClients(),
+      if (_assignedAttorneyId != null) _loadStaffMembers(),
+    ]);
   }
 
   Future<void> _loadStaffInfo() async {
@@ -97,7 +97,7 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
   Future<void> _loadClients() async {
     try {
       final user = FirebaseAuth.instance.currentUser;
-      if (user == null || _assignedAttorneyId == null) {
+      if (user == null) {
         if (mounted) {
           setState(() => _isLoadingClients = false);
         }
@@ -108,101 +108,14 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
         setState(() => _isLoadingClients = true);
       }
 
-      final clientIds = <String>{};
-      final clientsMap = <String, Map<String, dynamic>>{};
-
-      // Get clients from existing cases
-      try {
-        final casesSnapshot = await _firestore
-            .collection('cases')
-            .where('attorneyId', isEqualTo: _assignedAttorneyId)
-            .get();
-
-        for (var caseDoc in casesSnapshot.docs) {
-          final caseData = caseDoc.data();
-          final clientId = caseData['clientId'] as String?;
-          if (clientId != null &&
-              clientId.trim().isNotEmpty &&
-              !clientIds.contains(clientId)) {
-            clientIds.add(clientId);
-          }
-        }
-      } catch (e) {
-        debugPrint('Error loading clients from cases: $e');
-      }
-
-      // Get clients from appointments
-      try {
-        final appointmentsSnapshot = await _firestore
-            .collection('appointments')
-            .where('attorneyId', isEqualTo: _assignedAttorneyId)
-            .get();
-
-        for (var aptDoc in appointmentsSnapshot.docs) {
-          final aptData = aptDoc.data();
-          final clientId = aptData['clientId'] as String?;
-          if (clientId != null && !clientIds.contains(clientId)) {
-            clientIds.add(clientId);
-          }
-        }
-      } catch (e) {
-        debugPrint('Error loading clients from appointments: $e');
-      }
-
-      // Note: Staff members don't have permission to read case_requests collection
-      // Clients are loaded from existing cases and appointments only
-
-      // Get client details
-      for (var clientId in clientIds) {
-        if (clientId.trim().isEmpty) continue;
-        try {
-          final clientDoc = await _firestore.collection('users').doc(clientId).get();
-          if (clientDoc.exists) {
-            final clientData = clientDoc.data()!;
-            final name = clientData['name'] as String? ?? '';
-            final fullName = clientData['fullName'] as String? ?? '';
-            final email = clientData['email'] as String? ?? '';
-
-            String displayName;
-            if (fullName.isNotEmpty && fullName.trim().isNotEmpty) {
-              displayName = fullName.trim();
-            } else if (name.isNotEmpty && name.trim().isNotEmpty) {
-              displayName = name.trim();
-            } else if (email.isNotEmpty) {
-              displayName = email;
-            } else {
-              displayName = 'Client';
-            }
-
-            clientsMap[clientId] = {
-              'id': clientId,
-              'name': name,
-              'fullName': fullName,
-              'displayName': displayName,
-              'email': email,
-            };
-          }
-        } catch (e) {
-          debugPrint('Error loading client $clientId: $e');
-        }
-      }
-
-      final clientsList = clientsMap.values.toList();
-      clientsList.sort((a, b) {
-        final nameA = (a['displayName'] as String? ?? '').toLowerCase();
-        final nameB = (b['displayName'] as String? ?? '').toLowerCase();
-        return nameA.compareTo(nameB);
-      });
+      final clientsList = await _clientDirectory.loadSignedUpClients();
 
       if (mounted) {
         setState(() {
           _clients = clientsList;
           _isLoadingClients = false;
         });
-        debugPrint('✅ Loaded ${clientsList.length} clients for attorney $_assignedAttorneyId');
-        if (clientsList.isEmpty) {
-          debugPrint('⚠️ No clients found. Checked cases and appointments for attorney $_assignedAttorneyId');
-        }
+        debugPrint('✅ Loaded ${clientsList.length} signed-up clients');
       }
     } catch (e) {
       if (mounted) {
@@ -317,7 +230,7 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
         'timeline': [
           {
             'date': DateTime.now().toIso8601String(),
-            'action': 'Draft case created by staff',
+            'action': 'Draft created',
             'actor': user.uid,
           }
         ],
@@ -382,6 +295,14 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
 
       if (caseId != null) {
         debugPrint('✅ Draft case created successfully: $caseId');
+        try {
+          await StaffService().logActivity(
+            action: 'Draft case created',
+            details: 'Created draft "${_titleController.text.trim()}"',
+            resourceType: 'case',
+            resourceId: caseId,
+          );
+        } catch (_) {}
         
         // Notify attorney that draft is ready for review
         try {
@@ -468,32 +389,20 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
 
       final title = 'Draft Case Ready for Review';
       final body = '$staffName has created a draft case: "$caseTitle"';
+      final short = CaseSmsFormatter.shortTitle(caseTitle);
 
-      // Send FCM notification
-      await _fcmService.sendNotificationToUser(
+      await AttorneyRequestNotify.notifyParty(
         userId: _assignedAttorneyId!,
         title: title,
-        body: body,
+        message: body,
+        type: 'draft_case_ready',
+        smsBody:
+            'Law Connect: New draft case "$short" is ready for your review.',
         data: {
-          'type': 'draft_case_ready',
           'caseId': caseId,
           'staffId': user?.uid,
         },
       );
-
-      // Save in-app notification to Firestore
-      await _firestore.collection('notifications').add({
-        'userId': _assignedAttorneyId!,
-        'title': title,
-        'message': body,
-        'type': 'draft_case_ready',
-        'data': {
-          'caseId': caseId,
-          'staffId': user?.uid,
-        },
-        'isRead': false,
-        'createdAt': FieldValue.serverTimestamp(),
-      });
 
       debugPrint('✅ Attorney notified about draft case $caseId');
     } catch (e) {
@@ -566,6 +475,7 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
               ),
               const SizedBox(height: 8),
               DropdownButtonFormField<String>(
+                isExpanded: true,
                 value: _isLoadingClients || _clients.isEmpty
                     ? null
                     : (_selectedClientId != null &&
@@ -576,6 +486,25 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
                   border: OutlineInputBorder(),
                   hintText: 'Select a client',
                 ),
+                selectedItemBuilder: (context) {
+                  if (_isLoadingClients) {
+                    return [dropdownSelectedLabel('Loading clients...')];
+                  }
+                  if (_clients.isEmpty) {
+                    return [dropdownSelectedLabel('No clients found')];
+                  }
+                  return _clients.map((client) {
+                    final displayName = client['displayName'] as String? ??
+                        client['fullName'] as String? ??
+                        client['name'] as String? ??
+                        'Client';
+                    final email = client['email'] as String? ?? '';
+                    final label = email.isNotEmpty
+                        ? '$displayName ($email)'
+                        : displayName;
+                    return dropdownSelectedLabel(label);
+                  }).toList();
+                },
                 items: _isLoadingClients
                     ? [
                         const DropdownMenuItem<String>(
@@ -600,11 +529,10 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
                             final email = client['email'] as String? ?? '';
                             return DropdownMenuItem<String>(
                               value: client['id'] as String,
-                              child: Text(
+                              child: dropdownEllipsisText(
                                 email.isNotEmpty
                                     ? '$displayName ($email)'
                                     : displayName,
-                                overflow: TextOverflow.ellipsis,
                               ),
                             );
                           }).toList(),
@@ -658,6 +586,7 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
               ),
               const SizedBox(height: 8),
               DropdownButtonFormField<String>(
+                isExpanded: true,
                 value: _selectedCategory,
                 decoration: const InputDecoration(
                   border: OutlineInputBorder(),
@@ -666,9 +595,11 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
                 items: _categories.map((category) {
                   return DropdownMenuItem<String>(
                     value: category,
-                    child: Text(category),
+                    child: dropdownEllipsisText(category),
                   );
                 }).toList(),
+                selectedItemBuilder: (context) =>
+                    dropdownSelectedLabels(_categories),
                 onChanged: (value) {
                   setState(() {
                     _selectedCategory = value;
@@ -715,7 +646,7 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
 
               // Client Background (Optional)
               const Text(
-                'Client Background (Optional)',
+                'Client Background',
                 style: TextStyle(
                   fontSize: 16,
                   fontWeight: FontWeight.w600,
@@ -735,7 +666,7 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
 
               // Assign Other Staff (Optional)
               const Text(
-                'Assign Other Staff (Optional)',
+                'Assign Other Staff',
                 style: TextStyle(
                   fontSize: 16,
                   fontWeight: FontWeight.w600,
@@ -743,6 +674,7 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
               ),
               const SizedBox(height: 8),
               DropdownButtonFormField<String>(
+                isExpanded: true,
                 value: _selectedStaffId,
                 decoration: const InputDecoration(
                   border: OutlineInputBorder(),
@@ -756,9 +688,15 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
                   ..._staffMembers.map((staff) {
                     return DropdownMenuItem<String>(
                       value: staff.id,
-                      child: Text(staff.name),
+                      child: dropdownEllipsisText(staff.name),
                     );
                   }).toList(),
+                ],
+                selectedItemBuilder: (context) => [
+                  dropdownSelectedLabel('No Additional Staff'),
+                  ...dropdownSelectedLabels(
+                    _staffMembers.map((staff) => staff.name).toList(),
+                  ),
                 ],
                 onChanged: (value) {
                   setState(() {
@@ -771,7 +709,7 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
 
               // First Hearing Date (Optional)
               const Text(
-                'First Hearing Date (Optional)',
+                'First Hearing Date',
                 style: TextStyle(
                   fontSize: 16,
                   fontWeight: FontWeight.w600,
@@ -800,7 +738,7 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
 
               // Remarks for Attorney (Optional)
               const Text(
-                'Remarks for Attorney Review (Optional)',
+                'Remarks for Attorney Review',
                 style: TextStyle(
                   fontSize: 16,
                   fontWeight: FontWeight.w600,
@@ -820,7 +758,7 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
 
               // Internal Notes (Optional)
               const Text(
-                'Internal Notes (Optional)',
+                'Internal Notes',
                 style: TextStyle(
                   fontSize: 16,
                   fontWeight: FontWeight.w600,

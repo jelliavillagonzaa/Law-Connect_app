@@ -3,7 +3,35 @@
         "{**/.c4z/.extsrcs/*.PROTSYM.cbl,**/.c4z/.extsrcs/*.PROTSYM.listing}": true
     },
     "dart.flutterRunAdditionalArgs": [
-        "--no-web-resources-cdn"
+        "--no-web-resources-cdn",
+        "--no-web-experimental-hot-reload",
+        "--no-web-enable-expression-evaluation"
     ],
-    "dart.openDevTools": "never"
+    "dart.openDevTools": "never",
+    "dart.flutterHotReloadOnSave": "never",
+    "dart.hotReloadOnSave": "never",
+    "dart.evaluateGettersInDebugViews": false,
+    "dart.evaluateToStringInDebugViews": false,
+    "debug.javascript.autoAttach": "disabled",
+    "terminal.integrated.profiles.windows": {
+        "PowerShell": {
+            "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "icon": "terminal-powershell",
+            "args": [
+                "-NoExit",
+                "-NoProfile",
+                "-Command",
+                "Set-Location 'C:\\law_connect4new'; $env:Path = 'C:\\law_connect4new\\scripts;' + $env:Path; if (Test-Path Function:\\flutter) { Remove-Item Function:\\flutter }; function global:flutter { & 'C:\\law_connect4new\\scripts\\flutter_safe.cmd' @args }; function global:flutterrun { & 'C:\\law_connect4new\\scripts\\run_chrome.cmd' @args }; Set-Alias -Name flutter-run -Value flutterrun -Scope Global -Force; Write-Host 'Law Connect: Chrome hot reload is OFF. After edits press R once. Never press r. If the screen turns red, press q then run flutterrun or .\\scripts\\run_chrome.cmd'"
+            ]
+        },
+        "Command Prompt": {
+            "path": "cmd.exe",
+            "icon": "terminal-cmd",
+            "args": [
+                "/k",
+                "cd /d C:\\law_connect4new && set PATH=C:\\law_connect4new\\scripts;%PATH% && doskey flutter=C:\\law_connect4new\\scripts\\flutter_safe.cmd $* && doskey flutterrun=C:\\law_connect4new\\scripts\\run_chrome.cmd $* && doskey flutter-run=C:\\law_connect4new\\scripts\\run_chrome.cmd $* && echo Law Connect: Chrome hot reload is OFF. After edits press R once. Never press r. If the screen turns red, press q then run flutterrun or .\\scripts\\run_chrome.cmd"
+            ]
+        }
+    },
+    "terminal.integrated.defaultProfile.windows": "Command Prompt"
 }
