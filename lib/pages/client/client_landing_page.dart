@@ -2,7 +2,9 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:get/get.dart';
+import 'package:url_launcher/url_launcher.dart';
 
+import '../../config/email_branding.dart';
 import '../../routes/portal_navigation.dart';
 import '../../services/auth_service.dart';
 import '../../theme/app_theme.dart';
@@ -231,7 +233,25 @@ class _SiteNav extends StatelessWidget {
                 onAbout: onAbout,
                 onContact: onContact,
               ),
-              const SizedBox(width: 16),
+              const SizedBox(width: 14),
+              OutlinedButton.icon(
+                onPressed: () => launchUrl(
+                  Uri.parse(EmailBranding.downloadAppUrl),
+                  mode: LaunchMode.externalApplication,
+                ),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.white,
+                  side: BorderSide(color: Colors.white.withValues(alpha: 0.25)),
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+                ),
+                icon: const Icon(Icons.download_rounded, size: 16, color: _gold),
+                label: const Text(
+                  'Download App',
+                  style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w700),
+                ),
+              ),
+              const SizedBox(width: 10),
               _GoldPill(label: 'Login', onTap: onLogin),
             ] else
               PopupMenuButton<VoidCallback>(
@@ -244,6 +264,7 @@ class _SiteNav extends StatelessWidget {
                     ('Features', onFeatures),
                     ('About', onAbout),
                     ('Contact', onContact),
+                    ('Download App', () => launchUrl(Uri.parse(EmailBranding.downloadAppUrl), mode: LaunchMode.externalApplication)),
                     ('Login', onLogin),
                   ])
                     PopupMenuItem(
@@ -514,6 +535,25 @@ class _HeroSection extends StatelessWidget {
               ),
             ),
             _GoldPill(label: 'Learn More', onTap: onLearnMore),
+            OutlinedButton.icon(
+              onPressed: () => launchUrl(
+                Uri.parse(EmailBranding.downloadAppUrl),
+                mode: LaunchMode.externalApplication,
+              ),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.white,
+                side: BorderSide(color: Colors.white.withValues(alpha: 0.35)),
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(28),
+                ),
+              ),
+              icon: const Icon(Icons.download_rounded, size: 18, color: _gold),
+              label: const Text(
+                'Download App',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+              ),
+            ),
           ],
         ),
       ],

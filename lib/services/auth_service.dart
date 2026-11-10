@@ -1950,10 +1950,10 @@ class AuthService {
     required String userId,
     required String role,
   }) async {
-    final display = name.trim().isEmpty ? 'there' : name.trim();
-    final link = EmailBranding.websiteUrl;
+    final display = name.trim().isEmpty ? '' : ', ${name.trim()}';
+    final link = EmailBranding.downloadAppUrl;
     final body =
-        'Welcome To Law Connect $display. You can install the application now: $link';
+        'Welcome from Law Connect$display! You can download the app to explore: $link';
 
     if (phone.trim().isNotEmpty) {
       try {

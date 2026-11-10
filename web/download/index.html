@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="X-UA-Compatible" content="IE=Edge">
+  <meta name="description" content="Download Law Connect — Professional Legal Services on your mobile device">
+  <meta name="theme-color" content="#071526">
+  <link rel="icon" type="image/png" href="../logo.png">
+  <title>Download Law Connect App</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    body {
+      background-color: #071526;
+      color: #FFFFFF;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px 16px;
+    }
+    .container {
+      width: 100%;
+      max-width: 480px;
+      text-align: center;
+      margin: 0 auto;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 24px;
+      text-decoration: none;
+      color: #fff;
+    }
+    .brand img {
+      width: 52px;
+      height: 52px;
+      border-radius: 12px;
+      object-fit: contain;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+    }
+    .brand-text {
+      text-align: left;
+    }
+    .brand-title {
+      font-size: 20px;
+      font-weight: 800;
+      letter-spacing: -0.3px;
+    }
+    .brand-subtitle {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      color: #E4A11A;
+      text-transform: uppercase;
+    }
+    .card {
+      background: rgba(11, 34, 64, 0.75);
+      border: 1px solid rgba(228, 161, 26, 0.25);
+      border-radius: 20px;
+      padding: 32px 24px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+      backdrop-filter: blur(10px);
+    }
+    .badge {
+      display: inline-block;
+      padding: 6px 14px;
+      background: rgba(228, 161, 26, 0.15);
+      border: 1px solid rgba(228, 161, 26, 0.4);
+      border-radius: 20px;
+      color: #E4A11A;
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 16px;
+      letter-spacing: 0.5px;
+    }
+    h1 {
+      font-size: 24px;
+      font-weight: 800;
+      line-height: 1.25;
+      margin-bottom: 12px;
+      color: #FFFFFF;
+    }
+    h1 span {
+      color: #E4A11A;
+    }
+    p.desc {
+      font-size: 14.5px;
+      line-height: 1.5;
+      color: #B7C3D4;
+      margin-bottom: 28px;
+    }
+    .btn-download {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      width: 100%;
+      background: #E4A11A;
+      color: #1B1404;
+      font-size: 16px;
+      font-weight: 800;
+      text-decoration: none;
+      padding: 18px 24px;
+      border-radius: 14px;
+      border: none;
+      cursor: pointer;
+      box-shadow: 0 6px 20px rgba(228, 161, 26, 0.35);
+      transition: transform 0.15s ease, box-shadow 0.15s ease, background-color 0.15s;
+    }
+    .btn-download:hover, .btn-download:focus {
+      background: #f0ac22;
+      transform: translateY(-2px);
+      box-shadow: 0 8px 26px rgba(228, 161, 26, 0.5);
+    }
+    .btn-download:active {
+      transform: translateY(0);
+    }
+    .btn-download svg {
+      width: 24px;
+      height: 24px;
+      fill: currentColor;
+    }
+    .btn-sub {
+      font-size: 11.5px;
+      color: #8C99AB;
+      margin-top: 8px;
+    }
+    .divider {
+      height: 1px;
+      background: rgba(255, 255, 255, 0.08);
+      margin: 24px 0;
+    }
+    .steps {
+      text-align: left;
+      margin-bottom: 20px;
+    }
+    .steps-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: #E4A11A;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 12px;
+    }
+    .step-item {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 10px;
+      font-size: 13.5px;
+      color: #CCD6E2;
+      line-height: 1.4;
+    }
+    .step-num {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: rgba(228, 161, 26, 0.2);
+      color: #E4A11A;
+      font-weight: 800;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .btn-web {
+      display: inline-block;
+      width: 100%;
+      padding: 13px 20px;
+      background: transparent;
+      color: #E4A11A;
+      border: 1.5px solid rgba(228, 161, 26, 0.4);
+      border-radius: 12px;
+      font-size: 14px;
+      font-weight: 700;
+      text-decoration: none;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .btn-web:hover {
+      background: rgba(228, 161, 26, 0.1);
+      border-color: #E4A11A;
+    }
+    .footer {
+      margin-top: 24px;
+      font-size: 12px;
+      color: #6C7D93;
+    }
+    .download-status {
+      display: none;
+      margin-top: 14px;
+      padding: 10px;
+      border-radius: 8px;
+      background: rgba(46, 204, 113, 0.15);
+      border: 1px solid rgba(46, 204, 113, 0.4);
+      color: #2ECC71;
+      font-size: 13px;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <a href="../" class="brand">
+      <img src="../email-logo.png" alt="Law Connect Logo" onerror="this.src='../logo.png'">
+      <div class="brand-text">
+        <div class="brand-title">Law Connect</div>
+        <div class="brand-subtitle">Firm Portal</div>
+      </div>
+    </a>
+
+    <div class="card">
+      <div class="badge">✦ OFFICIAL MOBILE APP</div>
+      <h1>Welcome from<br><span>Law Connect</span></h1>
+      <p class="desc">
+        You can download the app to explore cases, appointments, legal services, and connect directly with attorneys.
+      </p>
+
+      <button id="downloadBtn" class="btn-download" onclick="startDownload()">
+        <svg viewBox="0 0 24 24">
+          <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/>
+        </svg>
+        <span>Download Law Connect App</span>
+      </button>
+      <div class="btn-sub">Android APK • Tap to download directly to your device</div>
+
+      <div id="downloadNotice" class="download-status">
+        ✓ Starting download... check your notification bar or downloads folder.
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="steps">
+        <div class="steps-title">Quick Installation Steps</div>
+        <div class="step-item">
+          <div class="step-num">1</div>
+          <div>Tap <b>Download Law Connect App</b> above.</div>
+        </div>
+        <div class="step-item">
+          <div class="step-num">2</div>
+          <div>When prompted, tap <b>Open</b> or <b>Install</b> (allow install from this browser if asked).</div>
+        </div>
+        <div class="step-item">
+          <div class="step-num">3</div>
+          <div>Open the app and log in with your phone or email to explore.</div>
+        </div>
+      </div>
+
+      <a href="../" class="btn-web">Continue to Web Portal (No Download Needed)</a>
+    </div>
+
+    <div class="footer">
+      © Law Connect. All rights reserved.
+    </div>
+  </div>
+
+  <script>
+    // Primary APK download URL: local web asset, or GitHub releases fallback
+    const LOCAL_APK = '/law-connect.apk';
+    const GITHUB_RELEASE_APK = 'https://github.com/jelliavillagonzaa/Law-Connect_app/releases/latest/download/app-release.apk';
+    const GITHUB_RELEASES_PAGE = 'https://github.com/jelliavillagonzaa/Law-Connect_app/releases';
+
+    function startDownload() {
+      const notice = document.getElementById('downloadNotice');
+      if (notice) notice.style.display = 'block';
+
+      // First check if local APK exists, otherwise use GitHub release
+      fetch(LOCAL_APK, { method: 'HEAD' })
+        .then(function(res) {
+          if (res.ok) {
+            triggerFileDownload(LOCAL_APK);
+          } else {
+            triggerFileDownload(GITHUB_RELEASE_APK);
+          }
+        })
+        .catch(function() {
+          triggerFileDownload(GITHUB_RELEASE_APK);
+        });
+    }
+
+    function triggerFileDownload(url) {
+      const a = document.createElement('a');
+      a.href = url;
+      a.setAttribute('download', 'LawConnect.apk');
+      a.target = '_blank';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function() {
+        document.body.removeChild(a);
+      }, 500);
+    }
+
+    // Auto-trigger if ?auto=1 in URL
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('auto') === '1' || params.get('auto') === 'true') {
+      setTimeout(startDownload, 600);
+    }
+  </script>
+</body>
+</html>

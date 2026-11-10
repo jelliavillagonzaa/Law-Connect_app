@@ -62,6 +62,24 @@
             { "key": "Cache-Control", "value": "public, max-age=604800" },
             { "key": "Access-Control-Allow-Origin", "value": "*" }
           ]
+        },
+        {
+          "source": "/download",
+          "headers": [
+            { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }
+          ]
+        },
+        {
+          "source": "/download/**",
+          "headers": [
+            { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }
+          ]
+        },
+        {
+          "source": "/download.html",
+          "headers": [
+            { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }
+          ]
         }
       ],
       "rewrites": [

@@ -68,21 +68,21 @@ class EmailOtpService {
     final recipient = email.trim();
     if (recipient.isEmpty || !recipient.contains('@')) return false;
 
-    final display = name.trim().isEmpty ? 'there' : name.trim();
-    final link = EmailBranding.websiteUrl;
+    final display = name.trim().isEmpty ? '' : ', ${name.trim()}';
+    final link = EmailBranding.downloadAppUrl;
     final templateParams = <String, dynamic>{
       'email': recipient,
       'to_email': recipient,
       'user_email': recipient,
-      'to_name': display,
-      'user_name': display,
-      'name': display,
-      'passcode': 'Welcome To Law Connect $display',
+      'to_name': display.isEmpty ? 'Friend' : name.trim(),
+      'user_name': display.isEmpty ? 'Friend' : name.trim(),
+      'name': display.isEmpty ? 'Friend' : name.trim(),
+      'passcode': 'Welcome from Law Connect$display',
       'message':
-          'Welcome To Law Connect $display. You can install the application now.',
+          'Welcome from Law Connect$display! You can download the app to explore.',
       'install_link': link,
-      'install_label': 'Install Law Connect',
-      'time': 'You can install the application now: $link',
+      'install_label': 'Download Law Connect App',
+      'time': 'You can download the app to explore: $link',
       'logo_url': EmailBranding.logoUrl,
       'logo': EmailBranding.logoUrl,
       'image_url': EmailBranding.logoUrl,

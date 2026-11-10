@@ -13,6 +13,13 @@ class EmailBranding {
 
   static const String websiteUrl = 'https://jurislink-app.web.app/';
 
+  /// Dedicated download page with instant 1-tap download button.
+  static const String downloadAppUrl = 'https://jurislink-app.web.app/download';
+
+  /// GitHub releases repository page.
+  static const String githubReleasesUrl =
+      'https://github.com/jelliavillagonzaa/Law-Connect_app/releases';
+
   /// EmailJS template must use: src="{{logo_url}}" (NOT cid:logo.png).
   static const String emailJsLogoHtml =
       '<a href="$websiteUrl">'
