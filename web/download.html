@@ -197,20 +197,21 @@
     .download-status {
       display: none;
       margin-top: 14px;
-      padding: 10px;
-      border-radius: 8px;
+      padding: 12px;
+      border-radius: 10px;
       background: rgba(46, 204, 113, 0.15);
       border: 1px solid rgba(46, 204, 113, 0.4);
       color: #2ECC71;
-      font-size: 13px;
+      font-size: 13.5px;
       font-weight: 600;
+      line-height: 1.4;
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <a href="../" class="brand">
-      <img src="../email-logo.png" alt="Law Connect Logo" onerror="this.src='../logo.png'">
+    <a href="/" class="brand">
+      <img src="/email-logo.png" alt="Law Connect Logo" onerror="this.src='/logo.png'">
       <div class="brand-text">
         <div class="brand-title">Law Connect</div>
         <div class="brand-subtitle">Firm Portal</div>
@@ -218,22 +219,23 @@
     </a>
 
     <div class="card">
-      <div class="badge">✦ OFFICIAL MOBILE APP</div>
+      <div class="badge">✦ OFFICIAL ANDROID APP</div>
       <h1>Welcome from<br><span>Law Connect</span></h1>
       <p class="desc">
         You can download the app to explore cases, appointments, legal services, and connect directly with attorneys.
       </p>
 
-      <button id="downloadBtn" class="btn-download" onclick="startDownload()">
+      <!-- Direct Native Download Link without target="_blank" -->
+      <a id="downloadBtn" href="/law-connect.apk" download="LawConnect.apk" class="btn-download" onclick="handleClick(event)">
         <svg viewBox="0 0 24 24">
           <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/>
         </svg>
         <span>Download Law Connect App</span>
-      </button>
-      <div class="btn-sub">Android APK • Tap to download directly to your device</div>
+      </a>
+      <div class="btn-sub">Android Application Package (APK) • Direct Download</div>
 
       <div id="downloadNotice" class="download-status">
-        ✓ Starting download... check your notification bar or downloads folder.
+        ✓ <b>Starting download!</b> Check your notification bar or downloads folder for <b>LawConnect.apk</b>.
       </div>
 
       <div class="divider"></div>
@@ -242,19 +244,19 @@
         <div class="steps-title">Quick Installation Steps</div>
         <div class="step-item">
           <div class="step-num">1</div>
-          <div>Tap <b>Download Law Connect App</b> above.</div>
+          <div>Tap <b>Download Law Connect App</b> above to start download.</div>
         </div>
         <div class="step-item">
           <div class="step-num">2</div>
-          <div>When prompted, tap <b>Open</b> or <b>Install</b> (allow install from this browser if asked).</div>
+          <div>When downloaded, tap <b>Open</b> or <b>Install</b> (if prompted, enable <i>Allow from this source</i>).</div>
         </div>
         <div class="step-item">
           <div class="step-num">3</div>
-          <div>Open the app and log in with your phone or email to explore.</div>
+          <div>Open Law Connect and sign in with your phone or email to start exploring.</div>
         </div>
       </div>
 
-      <a href="../" class="btn-web">Continue to Web Portal (No Download Needed)</a>
+      <a href="/" class="btn-web">Continue to Web Portal (No Download Needed)</a>
     </div>
 
     <div class="footer">
@@ -263,45 +265,20 @@
   </div>
 
   <script>
-    // Primary APK download URL: local web asset, or GitHub releases fallback
-    const LOCAL_APK = '/law-connect.apk';
-    const GITHUB_RELEASE_APK = 'https://github.com/jelliavillagonzaa/Law-Connect_app/releases/latest/download/app-release.apk';
-    const GITHUB_RELEASES_PAGE = 'https://github.com/jelliavillagonzaa/Law-Connect_app/releases';
-
-    function startDownload() {
-      const notice = document.getElementById('downloadNotice');
+    function handleClick(e) {
+      var notice = document.getElementById('downloadNotice');
       if (notice) notice.style.display = 'block';
-
-      // First check if local APK exists, otherwise use GitHub release
-      fetch(LOCAL_APK, { method: 'HEAD' })
-        .then(function(res) {
-          if (res.ok) {
-            triggerFileDownload(LOCAL_APK);
-          } else {
-            triggerFileDownload(GITHUB_RELEASE_APK);
-          }
-        })
-        .catch(function() {
-          triggerFileDownload(GITHUB_RELEASE_APK);
-        });
-    }
-
-    function triggerFileDownload(url) {
-      const a = document.createElement('a');
-      a.href = url;
-      a.setAttribute('download', 'LawConnect.apk');
-      a.target = '_blank';
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(function() {
-        document.body.removeChild(a);
-      }, 500);
+      // Native <a download> handles the download directly in the same tab without opening blank page.
     }
 
     // Auto-trigger if ?auto=1 in URL
-    const params = new URLSearchParams(window.location.search);
+    var params = new URLSearchParams(window.location.search);
     if (params.get('auto') === '1' || params.get('auto') === 'true') {
-      setTimeout(startDownload, 600);
+      setTimeout(function() {
+        var notice = document.getElementById('downloadNotice');
+        if (notice) notice.style.display = 'block';
+        window.location.href = '/law-connect.apk';
+      }, 500);
     }
   </script>
 </body>
