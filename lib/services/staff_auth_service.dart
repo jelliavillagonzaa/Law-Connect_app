@@ -272,8 +272,11 @@ class StaffAuthService {
       };
 
       if (name != null) updateData['name'] = name;
-      if (phone != null) updateData['phone'] = phone;
-      if (phoneNumber != null) updateData['phoneNumber'] = phoneNumber;
+      if (phone != null || phoneNumber != null) {
+        final resolved = (phoneNumber ?? phone)!.trim();
+        updateData['phone'] = resolved;
+        updateData['phoneNumber'] = resolved;
+      }
       if (address != null) updateData['address'] = address;
       if (photoUrl != null) updateData['photoUrl'] = photoUrl;
 

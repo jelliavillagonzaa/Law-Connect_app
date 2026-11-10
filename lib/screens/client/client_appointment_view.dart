@@ -39,26 +39,26 @@ class _ClientAppointmentViewState extends State<ClientAppointmentView>
     List<AppointmentModel> appointments,
     int tabIndex,
   ) {
-    final now = DateTime.now();
-    final today = DateTime(now.year, now.month, now.day);
 
     List<AppointmentModel> filtered;
 
+    final now = DateTime.now();
     switch (tabIndex) {
-      case 0: // Today: date == today AND status != "completed"
+      case 0: // Upcoming: non-completed, non-cancelled, AND future date/time
         filtered = appointments.where((apt) {
-          final aptDate = DateTime(
-            apt.appointmentDateTime.year,
-            apt.appointmentDateTime.month,
-            apt.appointmentDateTime.day,
-          );
-          return aptDate == today && apt.status != 'completed';
+          final s = apt.status.toLowerCase().trim();
+          if (s == 'completed' || s == 'cancelled' || s == 'declined') {
+            return false;
+          }
+          return !apt.appointmentDateTime.isBefore(now);
         }).toList();
         break;
-      case 1: // Completed: status == "completed"
-        filtered = appointments
-            .where((apt) => apt.status == 'completed')
-            .toList();
+      case 1: // Completed: status == "completed" OR past appointment date
+        filtered = appointments.where((apt) {
+          final s = apt.status.toLowerCase().trim();
+          if (s == 'cancelled' || s == 'declined') return false;
+          return s == 'completed' || apt.appointmentDateTime.isBefore(now);
+        }).toList();
         break;
       default:
         filtered = [];
@@ -135,7 +135,7 @@ class _ClientAppointmentViewState extends State<ClientAppointmentView>
           unselectedLabelColor: Colors.white70,
           indicatorColor: Colors.white,
           tabs: const [
-            Tab(text: 'Today'),
+            Tab(text: 'Upcoming'),
             Tab(text: 'Completed'),
           ],
         ),
@@ -192,7 +192,7 @@ class _ClientAppointmentViewState extends State<ClientAppointmentView>
   }
 
   Widget _buildEmptyState(int tabIndex) {
-    final tabNames = ['Today', 'Completed'];
+    final tabNames = ['Upcoming', 'Completed'];
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,

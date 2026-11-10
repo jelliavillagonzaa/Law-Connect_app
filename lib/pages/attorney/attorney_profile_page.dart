@@ -10,6 +10,7 @@ import '../../widgets/maps/oroquieta_map_picker.dart';
 import '../../widgets/maps/oroquieta_map_viewer.dart';
 import '../../theme/app_theme.dart';
 import '../../utils/currency.dart';
+import '../../widgets/common/change_password_dialog.dart';
 import '../auth/login_page.dart';
 
 class AttorneyProfilePage extends StatefulWidget {
@@ -83,7 +84,7 @@ class _AttorneyProfilePageState extends State<AttorneyProfilePage> {
           alignment: Alignment.topCenter,
           child: ConstrainedBox(
             constraints: BoxConstraints(
-              maxWidth: isDesktop ? 800 : double.infinity,
+              maxWidth: isDesktop ? 540 : double.infinity,
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -386,6 +387,35 @@ class _AttorneyProfilePageState extends State<AttorneyProfilePage> {
                     ),
                   ),
                   SizedBox(height: isDesktop ? 32 : 24),
+                  // Change Password Button
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: () => ChangePasswordDialog.show(context),
+                      icon: const Icon(Icons.lock_reset_rounded, size: 20),
+                      label: Text(
+                        'Change Password',
+                        style: TextStyle(
+                          fontSize: isDesktop ? 16 : 15,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: AppTheme.royalBlue,
+                        side: const BorderSide(
+                          color: AppTheme.royalBlue,
+                          width: 1.5,
+                        ),
+                        padding: EdgeInsets.symmetric(
+                          vertical: isDesktop ? 16 : 14,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                    ),
+                  ),
+                  SizedBox(height: isDesktop ? 12 : 10),
                   // Logout Button (text only, no arrow/icon)
                   SizedBox(
                     width: double.infinity,
@@ -767,7 +797,7 @@ class _AttorneyProfilePageState extends State<AttorneyProfilePage> {
             ],
           ),
           content: SizedBox(
-            width: isDesktop ? 600 : double.infinity,
+            width: isDesktop ? 500 : double.infinity,
             child: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -1001,7 +1031,7 @@ class _AttorneyProfilePageState extends State<AttorneyProfilePage> {
             ],
           ),
           content: SizedBox(
-            width: isDesktop ? 600 : double.infinity,
+            width: isDesktop ? 500 : double.infinity,
             child: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,

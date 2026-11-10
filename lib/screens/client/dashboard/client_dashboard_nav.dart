@@ -26,12 +26,14 @@ Future<void> openChat({
   required String conversationId,
   required String otherUserId,
   required String otherUserName,
+  String? otherUserRole,
 }) {
   return Get.to(
         () => ChatScreen(
           conversationId: conversationId,
           otherUserId: otherUserId,
           otherUserName: otherUserName,
+          otherUserRole: otherUserRole,
         ),
       ) ??
       Future.value();

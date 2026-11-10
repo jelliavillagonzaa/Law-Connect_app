@@ -9,7 +9,7 @@ class PaymentMethod {
   static const String other = 'other';
 
   /// Methods offered when recording a payment manually, in display order.
-  static const List<String> all = [cash, check, bankTransfer, gcash, other];
+  static const List<String> all = [cash, check, bankTransfer, gcash];
 
   static String label(String method) {
     switch (method) {

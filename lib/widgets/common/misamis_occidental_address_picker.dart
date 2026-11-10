@@ -3,32 +3,131 @@ import 'package:flutter/material.dart';
 import '../../data/misamis_occidental_address_data.dart';
 import '../../theme/app_theme.dart';
 
-/// Cascading address fields limited to Misamis Occidental, Philippines.
-class MisamisOccidentalAddressPicker extends StatefulWidget {
+/// Street line plus Misamis Occidental city and barangay.
+///
+/// [streetController], [city], and [barangay] are owned by the parent so the
+/// values survive when this step is hidden.
+class MisamisOccidentalAddressPicker extends StatelessWidget {
   const MisamisOccidentalAddressPicker({
     super.key,
-    required this.onChanged,
-    this.validator,
-    this.formFieldKey,
+    required this.streetController,
+    required this.city,
+    required this.barangay,
+    required this.onCityChanged,
+    required this.onBarangayChanged,
+    required this.onStreetChanged,
+    this.placeError,
   });
 
-  final ValueChanged<String> onChanged;
-  final String? Function(String?)? validator;
-  final GlobalKey<FormFieldState<String>>? formFieldKey;
+  final TextEditingController streetController;
+  final String? city;
+  final String? barangay;
+  final ValueChanged<String?> onCityChanged;
+  final ValueChanged<String?> onBarangayChanged;
+  final VoidCallback onStreetChanged;
+  final String? placeError;
 
   @override
-  State<MisamisOccidentalAddressPicker> createState() =>
-      _MisamisOccidentalAddressPickerState();
-}
+  Widget build(BuildContext context) {
+    final data = MisamisOccidentalAddressData.cached;
+    final barangays = data.barangaysFor(city);
 
-class _MisamisOccidentalAddressPickerState
-    extends State<MisamisOccidentalAddressPicker> {
-  late final MisamisOccidentalAddressData _data =
-      MisamisOccidentalAddressData.cached;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          'Address in Misamis Occidental',
+          style: TextStyle(
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+            color: Colors.grey[800],
+          ),
+        ),
+        const SizedBox(height: 8),
+        TextFormField(
+          controller: streetController,
+          textCapitalization: TextCapitalization.words,
+          textInputAction: TextInputAction.next,
+          decoration: _decoration(
+            'Street address *',
+            hint: 'House no., Street, Purok, or Sitio',
+          ),
+          validator: (value) {
+            final trimmed = value?.trim() ?? '';
+            if (trimmed.isEmpty) {
+              return 'Enter your street, purok, or sitio';
+            }
+            if (trimmed.length < 2) {
+              return 'Street address is too short';
+            }
+            return null;
+          },
+          onChanged: (_) => onStreetChanged(),
+        ),
+        const SizedBox(height: 12),
+        DropdownButtonFormField<String>(
+          initialValue: city != null && data.cityNames.contains(city)
+              ? city
+              : null,
+          decoration: _decoration(
+            'City / Municipality *',
+            hint: 'Select city or municipality',
+          ),
+          isExpanded: true,
+          items: data.cityNames
+              .map(
+                (item) => DropdownMenuItem<String>(
+                  value: item,
+                  child: Text(item, overflow: TextOverflow.ellipsis),
+                ),
+              )
+              .toList(),
+          onChanged: onCityChanged,
+        ),
+        const SizedBox(height: 12),
+        DropdownButtonFormField<String>(
+          key: ValueKey('barangay-$city'),
+          initialValue:
+              barangay != null && barangays.contains(barangay) ? barangay : null,
+          decoration: _decoration(
+            'Barangay *',
+            hint: city == null ? 'Select city first' : 'Select barangay',
+          ),
+          isExpanded: true,
+          items: barangays
+              .map(
+                (item) => DropdownMenuItem<String>(
+                  value: item,
+                  child: Text(item, overflow: TextOverflow.ellipsis),
+                ),
+              )
+              .toList(),
+          onChanged: city == null ? null : onBarangayChanged,
+        ),
+        if (placeError != null) ...[
+          const SizedBox(height: 8),
+          Text(
+            placeError!,
+            style: TextStyle(
+              color: Theme.of(context).colorScheme.error,
+              fontSize: 12,
+            ),
+          ),
+        ],
+        const SizedBox(height: 12),
+        _lockedLine('Province', MisamisOccidentalAddressData.provinceName),
+        const SizedBox(height: 12),
+        _lockedLine('Country', MisamisOccidentalAddressData.countryName),
+      ],
+    );
+  }
 
-  String? _purok;
-  String? _city;
-  String? _barangay;
+  Widget _lockedLine(String label, String value) {
+    return InputDecorator(
+      decoration: _decoration(label),
+      child: Text(value),
+    );
+  }
 
   InputDecoration _decoration(String label, {String? hint}) {
     return InputDecoration(
@@ -37,132 +136,6 @@ class _MisamisOccidentalAddressPickerState
       filled: true,
       fillColor: AppTheme.cleanWhite,
       border: const OutlineInputBorder(),
-    );
-  }
-
-  Widget _dropdown({
-    required String label,
-    required String? value,
-    required List<String> items,
-    required ValueChanged<String?>? onChanged,
-    String? hint,
-  }) {
-    return DropdownButtonFormField<String>(
-      value: value != null && items.contains(value) ? value : null,
-      decoration: _decoration(label, hint: hint),
-      isExpanded: true,
-      items: items
-          .map(
-            (item) => DropdownMenuItem<String>(
-              value: item,
-              child: Text(item, overflow: TextOverflow.ellipsis),
-            ),
-          )
-          .toList(),
-      onChanged: onChanged,
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final barangays = _data.barangaysFor(_city);
-
-    return FormField<String>(
-      key: widget.formFieldKey,
-      initialValue: '',
-      validator: widget.validator,
-      autovalidateMode: AutovalidateMode.onUserInteraction,
-      builder: (field) {
-        void updateField() {
-          final composed = _composedAddress();
-          field.didChange(composed);
-          widget.onChanged(composed);
-        }
-
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text(
-              'Address (Misamis Occidental only)',
-              style: TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.w600,
-                color: Colors.grey[800],
-              ),
-            ),
-            const SizedBox(height: 8),
-            _dropdown(
-              label: 'Purok *',
-              value: _purok,
-              items: MisamisOccidentalAddressData.purokOptions,
-              hint: 'Select purok',
-              onChanged: (value) {
-                setState(() => _purok = value);
-                updateField();
-              },
-            ),
-            const SizedBox(height: 12),
-            _dropdown(
-              label: 'City / Municipality *',
-              value: _city,
-              items: _data.cityNames,
-              hint: 'Select city or municipality',
-              onChanged: (value) {
-                setState(() {
-                  _city = value;
-                  _barangay = null;
-                });
-                updateField();
-              },
-            ),
-            const SizedBox(height: 12),
-            _dropdown(
-              label: 'Barangay *',
-              value: _barangay,
-              items: barangays,
-              hint: _city == null ? 'Select city first' : 'Select barangay',
-              onChanged: _city == null
-                  ? null
-                  : (value) {
-                      setState(() => _barangay = value);
-                      updateField();
-                    },
-            ),
-            const SizedBox(height: 12),
-            TextFormField(
-              readOnly: true,
-              initialValue: MisamisOccidentalAddressData.provinceName,
-              decoration: _decoration('Province'),
-            ),
-            const SizedBox(height: 12),
-            TextFormField(
-              readOnly: true,
-              initialValue: MisamisOccidentalAddressData.countryName,
-              decoration: _decoration('Country'),
-            ),
-            if (field.hasError)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Text(
-                  field.errorText!,
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.error,
-                    fontSize: 12,
-                  ),
-                ),
-              ),
-          ],
-        );
-      },
-    );
-  }
-
-  String _composedAddress() {
-    if (_purok == null || _barangay == null || _city == null) return '';
-    return MisamisOccidentalAddressData.compose(
-      purok: _purok!,
-      barangay: _barangay!,
-      city: _city!,
     );
   }
 }

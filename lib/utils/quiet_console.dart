@@ -124,7 +124,7 @@ void installQuietErrorHandlers() {
         color: Color(0xFFFFFFFF),
         child: Center(
           child: Text(
-            'Could not load this screen. Press R once to restart.',
+            'Could not load this screen. Close the app and open it again.',
             textAlign: TextAlign.center,
             textDirection: TextDirection.ltr,
             style: TextStyle(color: Color(0xFF1A3A6C), fontSize: 16),

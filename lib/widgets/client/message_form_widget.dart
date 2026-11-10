@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:get/get.dart';
 import '../../theme/app_theme.dart';
 import '../../services/chat_service.dart';
@@ -38,51 +37,26 @@ class _MessageFormWidgetState extends State<MessageFormWidget> {
     }
 
     try {
-      // Create or get chat with staff using email (no need to find staff first)
-      _chatId = await _chatService.getOrCreateChatByStaffEmail(
-        clientId: user.uid,
-        staffEmail: 'staff@gmail.com',
-      );
-
-      // Try to get staff info for display (optional)
-      try {
-        final staffQuery = await FirebaseFirestore.instance
-            .collection('users')
-            .where('email', isEqualTo: 'staff@gmail.com')
-            .limit(1)
-            .get();
-
-        if (staffQuery.docs.isNotEmpty) {
-          final staffDoc = staffQuery.docs.first;
-          final staffData = staffDoc.data();
-          if (staffData['role'] == 'staff') {
-            _staffId = staffDoc.id;
-            _staffName = staffData['fullName'] ?? 
-                        staffData['name'] ?? 
-                        'Staff Member';
-            _staffPhotoUrl = staffData['photoUrl'];
-          } else {
-            _staffId = 'staff_staff@gmail.com'; // Use email as identifier
-            _staffName = 'Staff Member';
-          }
-        } else {
-          _staffId = 'staff_staff@gmail.com'; // Use email as identifier
-          _staffName = 'Staff Member';
-        }
-      } catch (e) {
-        // If can't get staff info, use defaults
-        _staffId = 'staff_staff@gmail.com';
-        _staffName = 'Staff Member';
-      }
-
+      _chatId = await _chatService.getOrCreateClientOfficeChat(user.uid);
+      final counterpart = await _chatService.officeChatCounterpart(_chatId!);
+      _staffId = counterpart.id;
+      _staffName = counterpart.name;
       setState(() => _isLoading = false);
     } catch (e) {
-      setState(() => _isLoading = false);
+      if (mounted) {
+        setState(() => _isLoading = false);
+        Get.snackbar(
+          'Messages',
+          e.toString().replaceFirst('Exception: ', ''),
+          backgroundColor: Colors.red,
+          colorText: Colors.white,
+        );
+      }
     }
   }
 
   Future<void> _sendMessage() async {
-    if (_messageController.text.trim().isEmpty || _chatId == null) {
+    if (_messageController.text.trim().isEmpty) {
       return;
     }
 
@@ -92,10 +66,16 @@ class _MessageFormWidgetState extends State<MessageFormWidget> {
     setState(() => _isSending = true);
 
     try {
+      _chatId ??= await _chatService.getOrCreateClientOfficeChat(user.uid);
+      final counterpart = await _chatService.officeChatCounterpart(_chatId!);
+      _staffId = counterpart.id;
+      _staffName = counterpart.name;
+
       await _chatService.sendMessage(
         chatId: _chatId!,
         senderId: user.uid,
         text: _messageController.text.trim(),
+        senderRole: 'client',
       );
 
       _messageController.clear();
@@ -294,7 +274,9 @@ class _MessageFormWidgetState extends State<MessageFormWidget> {
                           Padding(
                             padding: const EdgeInsets.only(bottom: 4),
                             child: Text(
-                              message.senderRole == 'staff' ? 'Staff' : (_staffName ?? 'Staff'),
+                              message.labelForSender(
+                                fallback: _staffName ?? 'Law Connect',
+                              ),
                               style: TextStyle(
                                 fontSize: 12,
                                 fontWeight: FontWeight.bold,
@@ -465,45 +447,32 @@ class _MessageFormWidgetState extends State<MessageFormWidget> {
             decoration: const BoxDecoration(
               color: Color(0xFFF8FAFC),
             ),
-            child: _staffId == null || _chatId == null
+            child: _chatId == null
                 ? Center(
                     child: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        Container(
-                          width: 64,
-                          height: 64,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: Colors.grey[300],
-                            border: Border.all(
-                              color: Colors.grey[400]!,
-                              width: 2,
-                            ),
-                          ),
-                          child: Icon(
-                            Icons.info_outline,
-                            size: 32,
-                            color: Colors.grey[600],
-                          ),
+                        Icon(
+                          Icons.message_outlined,
+                          size: 64,
+                          color: Colors.grey[400],
                         ),
                         const SizedBox(height: 16),
                         Text(
-                          'No Staff Available',
+                          'No messages yet',
                           style: TextStyle(
                             fontSize: 18,
                             fontWeight: FontWeight.bold,
-                            color: Colors.grey[700],
+                            color: Colors.grey[600],
                           ),
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          'No staff member is currently assigned yet.',
+                          'Start a conversation with ${_staffName ?? 'the office'}',
                           style: TextStyle(
                             fontSize: 14,
-                            color: Colors.grey[600],
+                            color: Colors.grey[500],
                           ),
-                          textAlign: TextAlign.center,
                         ),
                       ],
                     ),
@@ -587,8 +556,7 @@ class _MessageFormWidgetState extends State<MessageFormWidget> {
                     ),
                     child: TextField(
                       controller: _messageController,
-                      enabled:
-                          _staffId != null && _chatId != null && !_isSending,
+                      enabled: !_isSending,
                       decoration: InputDecoration(
                         hintText: 'Type your message...',
                         hintStyle: TextStyle(color: Colors.grey[500]),
@@ -625,10 +593,7 @@ class _MessageFormWidgetState extends State<MessageFormWidget> {
                             ),
                           )
                         : Icon(Icons.send, color: Colors.grey[600], size: 20),
-                    onPressed:
-                        (_staffId != null && _chatId != null && !_isSending)
-                        ? _sendMessage
-                        : null,
+                    onPressed: !_isSending ? _sendMessage : null,
                   ),
                 ),
               ],

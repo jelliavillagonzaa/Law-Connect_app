@@ -54,6 +54,7 @@ class CaseService {
           caseTitle: caseModel.caseTitle,
           caseType: caseModel.caseType,
           caseDescription: caseModel.caseDescription,
+          caseDescriptionDelta: caseModel.caseDescriptionDelta,
           status: caseModel.status,
           createdAt: DateTime.now(),
           updatedAt: DateTime.now(),
@@ -66,6 +67,17 @@ class CaseService {
           hearingDate: caseModel.hearingDate,
           isArchived: caseModel.isArchived,
           archivedAt: caseModel.archivedAt,
+          clientName: caseModel.clientName,
+          clientEmail: caseModel.clientEmail,
+          clientPhone: caseModel.clientPhone,
+          clientAddress: caseModel.clientAddress,
+          court: caseModel.court,
+          courtBranch: caseModel.courtBranch,
+          courtRegion: caseModel.courtRegion,
+          courtEmail: caseModel.courtEmail,
+          courtContact: caseModel.courtContact,
+          caseNumber: caseModel.caseNumber,
+          natureOfAction: caseModel.natureOfAction,
         ),
       );
       if (!result.isSuccess) {
@@ -332,6 +344,7 @@ class CaseService {
     required String caseId,
     String? caseTitle,
     String? caseDescription,
+    String? caseDescriptionDelta,
     String? caseType,
   }) async {
     try {
@@ -349,6 +362,9 @@ class CaseService {
       }
       if (caseDescription != null && caseDescription.isNotEmpty) {
         updateData['caseDescription'] = caseDescription;
+      }
+      if (caseDescriptionDelta != null) {
+        updateData['caseDescriptionDelta'] = caseDescriptionDelta;
       }
       if (caseType != null && caseType.isNotEmpty) {
         updateData['caseType'] = caseType;

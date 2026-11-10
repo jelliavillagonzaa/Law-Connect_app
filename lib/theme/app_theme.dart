@@ -293,7 +293,8 @@ class AppTheme {
       chipTheme: ChipThemeData(
         backgroundColor: lightGray,
         selectedColor: sidebarActive,
-        labelStyle: TextStyle(
+        labelStyle: const TextStyle(
+          color: darkText,
           fontSize: 12,
           fontWeight: FontWeight.w500,
         ),

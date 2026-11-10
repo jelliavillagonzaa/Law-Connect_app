@@ -48,6 +48,20 @@ class BillingService {
         .map(_mapInvoices);
   }
 
+  Stream<List<InvoiceModel>> streamAllInvoices() {
+    return _firestore
+        .collection(_invoices)
+        .snapshots()
+        .map(_mapInvoices);
+  }
+
+  Stream<List<PaymentModel>> streamAllPayments() {
+    return _firestore
+        .collection(_payments)
+        .snapshots()
+        .map(_mapPayments);
+  }
+
   Stream<List<InvoiceModel>> streamInvoicesForCase(String caseId) {
     return _firestore
         .collection(_invoices)
@@ -355,7 +369,9 @@ class BillingService {
                 'updatedAt': FieldValue.serverTimestamp(),
               });
             })
-            .then((_) => firestoreOk = true)
+            .then((_) {
+              firestoreOk = true;
+            })
             .catchError((Object e) {
               firestoreError = e.toString();
             }),
@@ -472,7 +488,9 @@ class BillingService {
                 });
               }
             })
-            .then((_) => firestoreOk = true)
+            .then((_) {
+              firestoreOk = true;
+            })
             .catchError((Object e) {
               firestoreError = e.toString();
             }),
@@ -536,7 +554,9 @@ class BillingService {
       await Future.wait<void>([
         batch
             .commit()
-            .then((_) => firestoreOk = true)
+            .then((_) {
+              firestoreOk = true;
+            })
             .catchError((Object e) {
               firestoreError = e.toString();
             }),

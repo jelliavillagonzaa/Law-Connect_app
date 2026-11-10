@@ -4,6 +4,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 
+import 'attorney_availability_service.dart';
 import 'hearing_calendar_fields.dart';
 import 'hearing_notification_fanout_service.dart';
 import '../utils/calendar_live_hearing_map.dart';
@@ -38,6 +39,8 @@ class HearingCalendarSyncService {
   final Map<String, bool> _overlayScopedDebouncedReady = {};
   final Map<String, Timer> _globalHearingDefer = {};
   final Map<String, Future<void>> _bootstrapInFlight = {};
+  final Map<String, Future<List<Map<String, dynamic>>>> _automatedFetchInFlight =
+      {};
 
   static const int _overlayEmitDebounceMs = 560;
   static const int _overlayScopedDebounceMs = 1800;
@@ -80,6 +83,7 @@ class HearingCalendarSyncService {
   void _scheduleScopedSync(String attorneyId) {
     final aid = attorneyId.trim();
     if (aid.isEmpty || _syncWritesBlocked || !canWriteCalendarSync(aid)) return;
+    if (kIsWeb) return; // Web uses live hearings overlay; skip background write storm
     _scopedSyncDebounce[aid]?.cancel();
     _scopedSyncDebounce[aid] = Timer(
       const Duration(milliseconds: _scopedSyncDebounceMs),
@@ -91,9 +95,68 @@ class HearingCalendarSyncService {
   /// hearings overlay — running this on tab open remaps large docs and ANRs.
   void attachForAttorney(String attorneyId) {
     final aid = attorneyId.trim();
-    if (aid.isEmpty || _attachedAttorneys.contains(aid)) return;
-    _attachedAttorneys.add(aid);
-    _scheduleScopedSync(aid);
+    if (aid.isEmpty) return;
+    final firstAttach = !_attachedAttorneys.contains(aid);
+    if (firstAttach) {
+      _attachedAttorneys.add(aid);
+    }
+    // Warm overlay cache immediately so Calendar shows automated chips on open.
+    unawaited(
+      fetchAutomatedCalendarRows(aid).then((_) {
+        unawaited(fetchRowsFromHearingNotifications(aid));
+      }),
+    );
+    if (firstAttach) {
+      _scheduleScopedSync(aid);
+    }
+  }
+
+  /// Bumps when a hearing/order is seeded so open calendars paint + jump month.
+  final ValueNotifier<int> overlaySeedRevision = ValueNotifier(0);
+
+  /// Overlay keys touched by the latest [seedOverlayFromHearing] call.
+  final Set<String> lastSeededOverlayKeys = <String>{};
+
+  /// Seed attorney/staff calendar overlay as soon as a hearing/order is notified.
+  void seedOverlayFromHearing({
+    required String hearingDocId,
+    required Map<String, dynamic> hearingData,
+    Iterable<String> attorneyIds = const [],
+  }) {
+    final hid = hearingDocId.trim();
+    if (hid.isEmpty) return;
+    if (!isCalendarDisplayableHearingRow(hearingData)) return;
+
+    final targets = <String>{
+      firmOverlayId,
+      for (final id in attorneyIds)
+        if (id.trim().isNotEmpty) overlayKey(id.trim()),
+    };
+    final attorneyUid =
+        (hearingData['attorneyUid'] as String?)?.trim() ?? '';
+    if (attorneyUid.isNotEmpty) {
+      targets.add(overlayKey(attorneyUid));
+    }
+
+    var seeded = false;
+    lastSeededOverlayKeys
+      ..clear()
+      ..addAll(targets);
+    for (final aid in targets) {
+      final row = CalendarLiveHearingMap.fromHearingDoc(
+        hearingData,
+        hid,
+        aid,
+        fallbackToCreatedAt: true,
+      );
+      if (row == null) continue;
+      row['fromInbox'] = true;
+      rememberOverlayRows(aid, [row]);
+      seeded = true;
+    }
+    if (seeded) {
+      overlaySeedRevision.value = overlaySeedRevision.value + 1;
+    }
   }
 
   void detachForAttorney(String attorneyId) {
@@ -152,6 +215,7 @@ class HearingCalendarSyncService {
     }
     _globalHearingDefer.clear();
     _bootstrapInFlight.clear();
+    _automatedFetchInFlight.clear();
     _syncWritesBlocked = false;
   }
 
@@ -211,48 +275,50 @@ class HearingCalendarSyncService {
       );
     }
 
-    final caseNoVariants = <String>{};
-    for (final c in caseMaps) {
-      for (final field in [
-        'caseNumber',
-        'caseNo',
-        'docketNumber',
-        'criminalCaseNo',
-      ]) {
-        final v = (c[field] as String?)?.trim() ?? '';
-        if (v.isEmpty) continue;
-        caseNoVariants.addAll(
-          HearingNotificationFanoutService.caseNumberQueryVariants(v),
+    if (!kIsWeb) {
+      final caseNoVariants = <String>{};
+      for (final c in caseMaps) {
+        for (final field in [
+          'caseNumber',
+          'caseNo',
+          'docketNumber',
+          'criminalCaseNo',
+        ]) {
+          final v = (c[field] as String?)?.trim() ?? '';
+          if (v.isEmpty) continue;
+          caseNoVariants.addAll(
+            HearingNotificationFanoutService.caseNumberQueryVariants(v),
+          );
+        }
+      }
+      for (final caseNo in caseNoVariants.take(14)) {
+        queries.add(
+          runQuery(
+            _db
+                .collection('hearings')
+                .where('caseNo', isEqualTo: caseNo)
+                .limit(40),
+          ),
         );
       }
-    }
-    for (final caseNo in caseNoVariants.take(14)) {
-      queries.add(
-        runQuery(
-          _db
-              .collection('hearings')
-              .where('caseNo', isEqualTo: caseNo)
-              .limit(40),
-        ),
-      );
-    }
 
-    final clientNames = <String>{};
-    for (final c in caseMaps) {
-      for (final field in ['clientName', 'clientFullName', 'caseTitle']) {
-        final v = (c[field] as String?)?.trim() ?? '';
-        if (v.length >= 4) clientNames.add(v);
+      final clientNames = <String>{};
+      for (final c in caseMaps) {
+        for (final field in ['clientName', 'clientFullName', 'caseTitle']) {
+          final v = (c[field] as String?)?.trim() ?? '';
+          if (v.length >= 4) clientNames.add(v);
+        }
       }
-    }
-    for (final name in clientNames.take(4)) {
-      queries.add(
-        runQuery(
-          _db
-              .collection('hearings')
-              .where('clientName', isEqualTo: name)
-              .limit(40),
-        ),
-      );
+      for (final name in clientNames.take(4)) {
+        queries.add(
+          runQuery(
+            _db
+                .collection('hearings')
+                .where('clientName', isEqualTo: name)
+                .limit(40),
+          ),
+        );
+      }
     }
 
     queries.add(
@@ -302,37 +368,95 @@ class HearingCalendarSyncService {
 
   /// Automated calendar overlay: every non-spam `hearings` row with a date.
   /// n8n writes often omit `attorneyUid` / matching `cases` — still show them.
+  ///
+  /// [onRows] fires as soon as the newest hearings page is mapped, before the
+  /// wider pages finish, so an automated AI hearing can paint immediately.
   Future<List<Map<String, dynamic>>> fetchAutomatedCalendarRows(
-    String attorneyId,
-  ) async {
+    String attorneyId, {
+    void Function(List<Map<String, dynamic>> rows)? onRows,
+  }) {
     final aid = overlayKey(attorneyId);
+    final inFlight = _automatedFetchInFlight[aid];
+    if (inFlight != null) {
+      return inFlight.then((rows) {
+        if (rows.isNotEmpty) onRows?.call(rows);
+        return rows;
+      });
+    }
 
+    final fut = _fetchAutomatedCalendarRowsImpl(aid, onRows: onRows);
+    _automatedFetchInFlight[aid] = fut;
+    return fut.whenComplete(() => _automatedFetchInFlight.remove(aid));
+  }
+
+  Future<List<Map<String, dynamic>>> _fetchAutomatedCalendarRowsImpl(
+    String aid, {
+    void Function(List<Map<String, dynamic>> rows)? onRows,
+  }) async {
     final cached = _hearingNavRowCache[aid];
+    if (cached != null && cached.isNotEmpty) {
+      onRows?.call(List<Map<String, dynamic>>.from(cached));
+    }
 
     try {
       final byId = <String, QueryDocumentSnapshot<Map<String, dynamic>>>{};
 
-      Future<void> take(Query<Map<String, dynamic>> query) async {
+      Future<List<QueryDocumentSnapshot<Map<String, dynamic>>>> take(
+        Query<Map<String, dynamic>> query,
+      ) async {
         try {
           final snap = await FirestoreQueryGet.hearings(query);
-          for (final doc in snap.docs) {
-            byId[doc.id] = doc;
-          }
+          return snap.docs;
         } catch (e) {
           debugPrint('[HearingCalendar] overlay query failed: $e');
+          return const [];
         }
       }
 
-      // Newest + a wide unscoped page so October 28 (and other days) keep
-      // every court-order row, not only the last 40 uploads.
-      await take(
-        _db.collection('hearings').orderBy('createdAt', descending: true).limit(150),
+      void publish(Iterable<QueryDocumentSnapshot<Map<String, dynamic>>> docs) {
+        if (docs.isEmpty) return;
+        final mapped = CalendarLiveHearingMap.mapHearingDocs(docs, aid);
+        if (mapped.isEmpty) return;
+        mapped.sort((a, b) {
+          final ad = a['eventDate'];
+          final bd = b['eventDate'];
+          if (ad is DateTime && bd is DateTime) return ad.compareTo(bd);
+          return 0;
+        });
+        onRows?.call(mapped);
+      }
+
+      // Newest page first (the automated AI hearing), in parallel with the
+      // wider pages so October 28 and older court-order rows still load.
+      final newestFuture = take(
+        _db
+            .collection('hearings')
+            .orderBy('createdAt', descending: true)
+            .limit(150),
       );
-      await take(_db.collection('hearings').limit(200));
-      if (aid != firmOverlayId) {
-        await take(
-          _db.collection('hearings').where('attorneyUid', isEqualTo: aid).limit(300),
-        );
+      final wideFuture = take(_db.collection('hearings').limit(200));
+      final uidFuture = aid == firmOverlayId
+          ? Future<List<QueryDocumentSnapshot<Map<String, dynamic>>>>.value(
+              const [],
+            )
+          : take(
+              _db
+                  .collection('hearings')
+                  .where('attorneyUid', isEqualTo: aid)
+                  .limit(300),
+            );
+
+      final newest = await newestFuture;
+      for (final doc in newest) {
+        byId[doc.id] = doc;
+      }
+      publish(byId.values);
+
+      final rest = await Future.wait([wideFuture, uidFuture]);
+      for (final docs in rest) {
+        for (final doc in docs) {
+          byId[doc.id] = doc;
+        }
       }
 
       if (byId.isEmpty) {
@@ -373,27 +497,46 @@ class HearingCalendarSyncService {
     if (uid.isEmpty) return const [];
 
     try {
-      QuerySnapshot<Map<String, dynamic>> snap;
-      try {
-        snap = await _db
+      final snaps = await Future.wait([
+        _db
             .collection('notifications')
             .where('userId', isEqualTo: uid)
-            .limit(80)
-            .get();
-      } catch (e) {
-        debugPrint('[HearingCalendar] inbox query failed: $e');
-        return const [];
+            .limit(100)
+            .get()
+            .catchError((_) => _db.collection('notifications').limit(0).get()),
+        _db
+            .collection('notifications')
+            .where('attorneyId', isEqualTo: uid)
+            .limit(100)
+            .get()
+            .catchError((_) => _db.collection('notifications').limit(0).get()),
+        if (aid.isNotEmpty && aid != uid && aid != HearingCalendarSyncService.firmOverlayId)
+          _db
+              .collection('notifications')
+              .where('attorneyId', isEqualTo: aid)
+              .limit(100)
+              .get()
+              .catchError((_) => _db.collection('notifications').limit(0).get()),
+      ]);
+
+      final allDocs = <String, QueryDocumentSnapshot<Map<String, dynamic>>>{};
+      for (final s in snaps) {
+        for (final doc in s.docs) {
+          allDocs[doc.id] = doc;
+        }
       }
 
       final hearingIds = <String>{};
       final notifByHearing = <String, Map<String, dynamic>>{};
       final standalone = <Map<String, dynamic>>[];
 
-      for (final doc in snap.docs) {
+      for (final doc in allDocs.values) {
         final data = doc.data();
         final type = '${data['type'] ?? ''}'.toLowerCase();
         final hid = HearingCalendarFields.asDisplayString(data['hearingDocId']);
-        final isHearing = type.contains('hearing') || hid.isNotEmpty;
+        final hasCase = HearingCalendarFields.asDisplayString(data['caseNo']).isNotEmpty ||
+            HearingCalendarFields.asDisplayString(data['caseTitle']).isNotEmpty;
+        final isHearing = type.contains('hearing') || type.contains('court') || hid.isNotEmpty || hasCase;
         if (!isHearing) continue;
         if (hid.isNotEmpty) {
           hearingIds.add(hid);
@@ -414,39 +557,10 @@ class HearingCalendarSyncService {
       for (final hid in hearingIds) {
         try {
           final hSnap = await _db.collection('hearings').doc(hid).get();
-          final hd = hSnap.exists
-              ? Map<String, dynamic>.from(hSnap.data()!)
-              : <String, dynamic>{};
           final notif = notifByHearing[hid] ?? const <String, dynamic>{};
-          hd['summary'] = HearingCalendarFields.asDisplayString(hd['summary'])
-                  .isNotEmpty
-              ? hd['summary']
-              : notif['summary'] ?? notif['message'];
-          hd['message'] = HearingCalendarFields.asDisplayString(hd['message'])
-                  .isNotEmpty
-              ? hd['message']
-              : notif['message'] ?? notif['summary'];
-          if (HearingCalendarFields.hearingFieldAsString(hd, 'hearingDate')
-              .isEmpty) {
-            final fromNotif = HearingCalendarFields.hearingFieldAsString(
-              notif,
-              'hearingDate',
-            );
-            if (fromNotif.isNotEmpty) hd['hearingDate'] = fromNotif;
-          }
-          if (HearingCalendarFields.hearingFieldAsString(hd, 'hearingTime')
-              .isEmpty) {
-            final fromNotif = HearingCalendarFields.hearingFieldAsString(
-              notif,
-              'hearingTime',
-            );
-            if (fromNotif.isNotEmpty) hd['hearingTime'] = fromNotif;
-          }
-          for (final key in ['caseNo', 'caseTitle', 'clientName', 'courtBranch']) {
-            if (HearingCalendarFields.asDisplayString(hd[key]).isEmpty) {
-              final v = HearingCalendarFields.asDisplayString(notif[key]);
-              if (v.isNotEmpty) hd[key] = v;
-            }
+          final hd = Map<String, dynamic>.from(notif);
+          if (hSnap.exists && hSnap.data() != null) {
+            hd.addAll(hSnap.data()!);
           }
           final row = CalendarLiveHearingMap.fromHearingDoc(hd, hid, aid);
           if (row != null) {
@@ -1352,6 +1466,7 @@ class HearingCalendarSyncService {
   }) async {
     if (!canWriteCalendarSync(attorneyId)) return;
     if (HearingCalendarFields.isNonCourtHearingSpam(hd)) {
+      await _clearHearingSlot(hearingDocId, attorneyId);
       try {
         await _db
             .collection('calendar_events')
@@ -1371,6 +1486,11 @@ class HearingCalendarSyncService {
             (existing.data()?['eventDate'] as Timestamp?)
                 ?.millisecondsSinceEpoch;
         if (existingMs == when.millisecondsSinceEpoch) {
+          await _publishHearingSlot(
+            hearingDocId: hearingDocId,
+            attorneyId: attorneyId,
+            when: when,
+          );
           return;
         }
       }
@@ -1381,6 +1501,7 @@ class HearingCalendarSyncService {
         'description': fields.description,
         'activityType': fields.hearingPurpose,
       })) {
+        await _clearHearingSlot(hearingDocId, attorneyId);
         await ref.delete();
         return;
       }
@@ -1419,6 +1540,13 @@ class HearingCalendarSyncService {
       }
 
       await ref.set(payload, SetOptions(merge: true));
+      if (attorneyId.isNotEmpty && attorneyId != firmOverlayId) {
+        await AttorneyAvailabilityService().moveHolder(
+          attorneyId: attorneyId,
+          holderId: calendarDocId(hearingDocId),
+          when: eventWhen,
+        );
+      }
     } catch (e) {
       if (_isPermissionDenied(e)) {
         _syncWritesBlocked = true;
@@ -1426,6 +1554,27 @@ class HearingCalendarSyncService {
       }
       rethrow;
     }
+  }
+
+  Future<void> _publishHearingSlot({
+    required String hearingDocId,
+    required String attorneyId,
+    required DateTime when,
+  }) async {
+    if (attorneyId.isEmpty || attorneyId == firmOverlayId) return;
+    await AttorneyAvailabilityService().claimHolder(
+      attorneyId: attorneyId,
+      when: when,
+      holderId: calendarDocId(hearingDocId),
+    );
+  }
+
+  Future<void> _clearHearingSlot(String hearingDocId, String attorneyId) async {
+    if (attorneyId.isEmpty || attorneyId == firmOverlayId) return;
+    await AttorneyAvailabilityService().releaseHolder(
+      attorneyId: attorneyId,
+      holderId: calendarDocId(hearingDocId),
+    );
   }
 
   Future<Set<String>> _resolveAttorneyIds(Map<String, dynamic> hd) async {

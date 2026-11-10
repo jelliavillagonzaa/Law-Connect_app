@@ -4,6 +4,7 @@ import '../../widgets/profile_card.dart';
 import '../../widgets/card_row.dart';
 import '../../widgets/primary_button.dart';
 import '../../widgets/secondary_button.dart';
+import '../../widgets/common/change_password_dialog.dart';
 
 class AttorneyProfileScreen extends StatelessWidget {
   const AttorneyProfileScreen({super.key});
@@ -60,9 +61,7 @@ class AttorneyProfileScreen extends StatelessWidget {
                   SecondaryButton(
                     text: 'Change Password',
                     icon: Icons.lock_outline,
-                    onPressed: () {
-                      // TODO: Navigate to change password screen
-                    },
+                    onPressed: () => ChangePasswordDialog.show(context),
                   ),
                 ],
               ),

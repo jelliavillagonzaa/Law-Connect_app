@@ -1,10 +1,13 @@
+import 'dart:async' show unawaited;
+
 import 'package:flutter/material.dart';
 
 import '../../screens/attorney/attorney_reminders_screen.dart';
 import '../../services/hearing_notification_fanout_service.dart';
+import '../../services/attorney_inbox_read_store.dart';
 import 'attorney_ui_theme.dart';
 
-/// Attorney dashboard bell. Badge is unread `notifications` count only.
+/// Attorney dashboard bell. Synchronized with Reminders unread store and notifications.
 class RemindersBellButton extends StatefulWidget {
   const RemindersBellButton({
     super.key,
@@ -40,6 +43,8 @@ class _RemindersBellButtonState extends State<RemindersBellButton> {
     final fanout = HearingNotificationFanoutService.instance;
     fanout.attachAttorneyBellWatcher(userId);
     _unread = fanout.attorneyUnreadNotificationBellListenable(userId);
+    unawaited(AttorneyInboxReadStore.instance.ensureLoaded(userId));
+    unawaited(fanout.refreshAttorneyBellFromNotifications(userId));
   }
 
   Future<void> _openReminders() async {
@@ -52,7 +57,7 @@ class _RemindersBellButtonState extends State<RemindersBellButton> {
     HearingNotificationFanoutService.instance
         .attachAttorneyBellWatcher(widget.userId);
     await HearingNotificationFanoutService.instance
-        .refreshAttorneyBellFromNotifications(widget.userId);
+        .refreshAttorneyBellFromNotifications(widget.userId, force: true);
   }
 
   @override
@@ -63,10 +68,15 @@ class _RemindersBellButtonState extends State<RemindersBellButton> {
         ? AttorneyUi.background
         : Colors.white.withValues(alpha: 0.2);
 
-    return ValueListenableBuilder<int>(
-      valueListenable: _unread,
-      builder: (context, count, _) {
-        final badge = count < 0 ? 0 : count;
+    return AnimatedBuilder(
+      animation: Listenable.merge([
+        _unread,
+        AttorneyInboxReadStore.instance.unreadCount,
+      ]),
+      builder: (context, _) {
+        final storeCount = AttorneyInboxReadStore.instance.unreadCount.value;
+        final notifCount = _unread.value < 0 ? 0 : _unread.value;
+        final badge = storeCount > 0 ? storeCount : notifCount;
         return Tooltip(
           message: badge > 0 ? 'Reminders ($badge unread)' : 'Reminders',
           child: Material(

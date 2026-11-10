@@ -8,9 +8,11 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../config/philsms_config.dart';
 import '../config/semaphore_config.dart';
 import '../utils/hearing_sms_formatter.dart';
+import 'hearing_calendar_fields.dart';
 import 'hearing_party_names.dart';
 import 'philsms_service.dart';
 import 'semaphore_service.dart';
+import 'sms_service.dart';
 
 /// PhilSMS alerts for `hearings` collection — **not** tied to Firestore `notifications` writes.
 ///
@@ -86,12 +88,14 @@ class HearingSmsAlertService {
     }
   }
 
-  /// Skip only after a provider actually delivered the intake SMS.
+  /// Skip when Cloud Functions already owns or finished the intake SMS.
   ///
-  /// Push is sent first. `philsmsIntakeSent` is claimed before the text goes
-  /// out, so that flag alone must not hide a failed SMS.
+  /// Do **not** treat [fcmPushClaimedAt] as SMS-sent — that flag is push-only
+  /// and was blocking texts whenever the phone push was claimed first.
+  /// [philsmsIntakeSent] is the SMS claim; on send failure CF clears it.
   static bool _cloudFunctionsSendsIntakeSms(Map<String, dynamic> data) {
-    return data['philsmsLastSentAt'] != null;
+    return data['philsmsLastSentAt'] != null ||
+        data['philsmsIntakeSent'] == true;
   }
 
   /// Standalone path: `hearings` doc added/updated → SMS (if content digest is new).
@@ -140,12 +144,18 @@ class HearingSmsAlertService {
     final digestKey =
         PhilSmsHearingAlertConfig.digestForDocument(hearingDocId, hearingData);
 
-    final hearingDate = (hearingData['hearingDate'] as String?)?.trim() ?? '';
-    final hearingTime = (hearingData['hearingTime'] as String?)?.trim() ?? '';
-    final caseNo = (hearingData['caseNo'] as String?)?.trim() ?? '';
-    final caseTitle = (hearingData['caseTitle'] as String?)?.trim() ?? '';
-    final clientName = (hearingData['clientName'] as String?)?.trim() ?? '';
-    final location = _hearingLocation(hearingData);
+    // Match PDF facts: fill missing hearingDate/time and scrub emails from names.
+    final enriched = HearingCalendarFields.enrichForAlerts(hearingData);
+    final hearingDate =
+        HearingCalendarFields.hearingFieldAsString(enriched, 'hearingDate');
+    final hearingTime =
+        HearingCalendarFields.hearingFieldAsString(enriched, 'hearingTime');
+    final caseNo = HearingCalendarFields.asDisplayString(enriched['caseNo']);
+    final caseTitle =
+        HearingCalendarFields.asDisplayString(enriched['caseTitle']);
+    final clientName =
+        HearingCalendarFields.asDisplayString(enriched['clientName']);
+    final location = _hearingLocation(enriched);
 
     final phonesAlreadySent = <String>{};
     final clientUids = await _resolveClientUidsByName(hearingData);
@@ -176,8 +186,30 @@ class HearingSmsAlertService {
         location: location,
       );
 
+      if (kIsWeb) {
+        try {
+          await SmsService().queueSms(
+            to: phone,
+            body: smsText,
+            meta: {
+              'type': 'hearing_activity',
+              'hearingDocId': hearingDocId,
+            },
+          );
+          delivered = true;
+          await _markSent(smsDigestKey);
+        } catch (e) {
+          if (kDebugMode) {
+            debugPrint(
+              'HearingSmsAlertService web SMS queue [$roleLabel] failed: $e',
+            );
+          }
+        }
+        return;
+      }
+
       var philOk = false;
-      if (!kIsWeb && PhilSmsConfig.isConfigured) {
+      if (PhilSmsConfig.isConfigured) {
         final result = await PhilSmsService.instance.sendSmsWithResult(
           to: phone,
           message: smsText,
@@ -248,6 +280,10 @@ class HearingSmsAlertService {
   }
 
   String _hearingLocation(Map<String, dynamic> data) {
+    final venue = HearingCalendarFields.resolveVenueForDisplay(data);
+    if (venue.isNotEmpty && !HearingCalendarFields.isBareLocation(venue)) {
+      return venue;
+    }
     final loc = (data['location'] as String?)?.trim() ?? '';
     if (loc.isNotEmpty) return loc;
     return (data['courtBranch'] as String?)?.trim() ?? '';
@@ -276,7 +312,8 @@ class HearingSmsAlertService {
   static ({String first, String last})? _parseFirstLastFromHearing(
     String hearingName,
   ) {
-    final parts = hearingName
+    final cleaned = HearingPartyNames.stripRoles(hearingName);
+    final parts = (cleaned.isNotEmpty ? cleaned : hearingName)
         .trim()
         .replaceAll(RegExp(r'\s+'), ' ')
         .split(' ')
@@ -338,24 +375,40 @@ class HearingSmsAlertService {
   }
 
   Future<List<String>> _resolveClientUidsByName(Map<String, dynamic> data) async {
-    final clientName = (data['clientName'] as String?)?.trim() ?? '';
-    if (clientName.isEmpty) return const [];
-
     final matched = <String>{};
-    final parties = HearingPartyNames.split(clientName);
+
+    for (final key in ['involvedClientIds', 'matchedClientIds']) {
+      final arr = data[key];
+      if (arr is List) {
+        for (final uid in arr) {
+          if (uid is String && uid.trim().isNotEmpty) {
+            matched.add(uid.trim());
+          }
+        }
+      }
+    }
+    final owner = (data['ownerClientId'] as String?)?.trim() ?? '';
+    if (owner.isNotEmpty) matched.add(owner);
+
+    final clientName = (data['clientName'] as String?)?.trim() ?? '';
+    final caseTitle = (data['caseTitle'] as String?)?.trim() ?? '';
+    final combinedParties = [clientName, caseTitle].where((s) => s.isNotEmpty).join(', ');
+    if (combinedParties.isEmpty && matched.isEmpty) return const [];
+
+    final parties = HearingPartyNames.split(combinedParties);
     const fields = ['fullName', 'name', 'displayName'];
 
     void tryAdd(Map<String, dynamic> userData, String uid) {
       final role = (userData['role'] as String?)?.toLowerCase().trim() ?? '';
       if (role != 'client') return;
-      if (_clientSignUpMatchesHearing(userData, clientName)) {
+      if (_clientSignUpMatchesHearing(userData, combinedParties)) {
         matched.add(uid);
       }
     }
 
     try {
-      final queryNames = parties.isEmpty ? [clientName] : parties;
-      for (final party in queryNames.take(12)) {
+      final queryNames = parties.isEmpty ? [combinedParties] : parties;
+      for (final party in queryNames.take(16)) {
         final variants = _clientNameQueryVariants(party);
         for (final field in fields) {
           for (final nm in variants) {
@@ -373,8 +426,8 @@ class HearingSmsAlertService {
 
         final hearingParts = _parseFirstLastFromHearing(party);
         if (hearingParts != null) {
-          for (final first in _clientNameQueryVariants(hearingParts.first)) {
-            for (final last in _clientNameQueryVariants(hearingParts.last)) {
+          for (final first in _clientNameQueryVariants(hearingParts.first).take(2)) {
+            for (final last in _clientNameQueryVariants(hearingParts.last).take(2)) {
               try {
                 final q = await _db
                     .collection('users')
@@ -407,9 +460,9 @@ class HearingSmsAlertService {
       }
     }
 
-    if (kDebugMode && clientName.isNotEmpty) {
+    if (kDebugMode && combinedParties.isNotEmpty) {
       debugPrint(
-        'HearingSmsAlertService: clientName="$clientName" exact matches=${matched.length}',
+        'HearingSmsAlertService: partyBlob="$combinedParties" matches=${matched.length}',
       );
     }
     return matched.toList();
@@ -443,8 +496,13 @@ class HearingSmsAlertService {
       final snap = await _db.collection('users').doc(uid).get();
       if (!snap.exists) return null;
       final data = snap.data() ?? {};
-      final profilePhone =
-          (data['phoneNumber'] ?? data['phone'])?.toString().trim();
+      final profilePhone = (data['phoneNumber'] ??
+              data['phone'] ??
+              data['contactNumber'] ??
+              data['mobileNumber'] ??
+              data['contact'])
+          ?.toString()
+          .trim();
       if (profilePhone == null || profilePhone.isEmpty) return null;
       return profilePhone;
     } catch (e) {

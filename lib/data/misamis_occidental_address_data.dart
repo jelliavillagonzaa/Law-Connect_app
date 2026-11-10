@@ -7,16 +7,6 @@ class MisamisOccidentalAddressData {
   static const provinceName = 'Misamis Occidental';
   static const countryName = 'Philippines';
 
-  static const purokOptions = <String>[
-    'Purok 1',
-    'Purok 2',
-    'Purok 3',
-    'Purok 4',
-    'Purok 5',
-    'Purok 6',
-    'Purok 7',
-  ];
-
   final Map<String, List<String>> cities;
 
   static MisamisOccidentalAddressData? _cache;
@@ -38,17 +28,17 @@ class MisamisOccidentalAddressData {
   }
 
   static String compose({
-    required String purok,
+    required String street,
     required String barangay,
     required String city,
   }) {
     final parts = <String>[
-      purok.trim(),
+      street.trim(),
       barangay.trim(),
       city.trim(),
       provinceName,
       countryName,
     ];
-    return parts.join(', ');
+    return parts.where((part) => part.isNotEmpty).join(', ');
   }
 }

@@ -1,5 +1,8 @@
+import 'dart:async' show unawaited;
 import 'dart:convert';
+import 'dart:ui' show ImageFilter;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show HapticFeedback;
 import 'package:get/get.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -12,12 +15,11 @@ import '../../theme/app_theme.dart';
 import '../../utils/safe_network_image.dart';
 import '../chat/chat_list_page.dart';
 import '../case/search_attorney_page.dart';
-import '../notary/notary_portal.dart';
+import '../../screens/client/notary_portal_screen.dart';
+import '../../screens/client/cases_list_screen.dart';
 import '../../routes/portal_navigation.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
-
-import '../../widgets/common/min_touch_target.dart';
 
 class ClientDashboard extends StatefulWidget {
   const ClientDashboard({super.key});
@@ -117,42 +119,74 @@ class _ClientDashboardState extends State<ClientDashboard> {
       // Client-side case creation has been disabled; no FAB for creating cases.
       floatingActionButton: null,
       floatingActionButtonLocation: FloatingActionButtonLocation.endDocked,
-      bottomNavigationBar: Container(
-        decoration: BoxDecoration(
-          color: Colors.white,
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.1),
-              blurRadius: 10,
-              offset: const Offset(0, -2),
-            ),
-          ],
-        ),
-        child: SafeArea(
-          child: Container(
-            height: isMobile ? 65 : 70,
-            padding: EdgeInsets.symmetric(
-              horizontal: isMobile ? 4 : 8,
-              vertical: 4,
-            ),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: [
-                Expanded(
-                  child: _buildBottomNavItem(Icons.folder, 'My Cases', 0),
-                ),
-                Expanded(child: _buildBottomNavItem(Icons.gavel, 'Notary', 1)),
-                Expanded(
-                  child: _buildBottomNavItem(
-                    Icons.chat_bubble_outline,
-                    'Messages',
-                    2,
+      bottomNavigationBar: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 0, 14, 10),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(28),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+              child: Container(
+                height: 66,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF07152B).withValues(alpha: 0.92),
+                  borderRadius: BorderRadius.circular(28),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.14),
+                    width: 1,
                   ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xFF07152B).withValues(alpha: 0.50),
+                      blurRadius: 26,
+                      offset: const Offset(0, 8),
+                    ),
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.22),
+                      blurRadius: 10,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
                 ),
-                Expanded(
-                  child: _buildBottomNavItem(Icons.person, 'Profile', 3),
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: _buildBottomNavItem(
+                        Icons.folder_rounded,
+                        Icons.folder_outlined,
+                        'My Cases',
+                        0,
+                      ),
+                    ),
+                    Expanded(
+                      child: _buildBottomNavItem(
+                        Icons.gavel_rounded,
+                        Icons.gavel_outlined,
+                        'Notary',
+                        1,
+                      ),
+                    ),
+                    Expanded(
+                      child: _buildBottomNavItem(
+                        Icons.chat_bubble_rounded,
+                        Icons.chat_bubble_outline_rounded,
+                        'Messages',
+                        2,
+                      ),
+                    ),
+                    Expanded(
+                      child: _buildBottomNavItem(
+                        Icons.person_rounded,
+                        Icons.person_outline_rounded,
+                        'Profile',
+                        3,
+                      ),
+                    ),
+                  ],
                 ),
-              ],
+              ),
             ),
           ),
         ),
@@ -162,35 +196,7 @@ class _ClientDashboardState extends State<ClientDashboard> {
 
   Widget _buildBody({required bool isMobile}) {
     if (_selectedIndex == 0) {
-      // Cases tab is disabled for clients; show an informational message instead.
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.info_outline,
-                size: 64,
-                color: AppTheme.royalBlue,
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Client case management is no longer available in the app.',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Please contact your attorney directly for any questions about your cases.',
-                style: TextStyle(fontSize: 14, color: const Color(0xFF6D6D6D)),
-                textAlign: TextAlign.center,
-              ),
-            ],
-          ),
-        ),
-      );
+      return const CasesListScreen();
     } else if (_selectedIndex == 3) {
       return _buildProfileTab();
     }
@@ -198,51 +204,66 @@ class _ClientDashboardState extends State<ClientDashboard> {
     return const SizedBox.shrink();
   }
 
-  Widget _buildBottomNavItem(IconData icon, String label, int index) {
+  Widget _buildBottomNavItem(
+    IconData activeIcon,
+    IconData inactiveIcon,
+    String label,
+    int index,
+  ) {
     final isActive = _selectedIndex == index;
-    final isMobile = MediaQuery.of(context).size.width < 600;
-    return MinTouchTarget(
-      minSize: isMobile ? 56 : 52,
-      borderRadius: BorderRadius.circular(12),
+    const activeColor = Color(0xFFFBBF24); // Warm gold
+    final inactiveColor = Colors.white.withValues(alpha: 0.60);
+
+    return InkWell(
       onTap: () {
+        unawaited(HapticFeedback.lightImpact());
         if (index == 1) {
-          Get.to(() => const NotaryPortal());
+          Get.to(() => const NotaryPortalScreen());
         } else if (index == 2) {
           Get.to(() => const ChatListPage());
         } else if (_selectedIndex != index) {
           setState(() => _selectedIndex = index);
         }
       },
-      child: Container(
-        padding: EdgeInsets.symmetric(
-          horizontal: isMobile ? 8 : 12,
-          vertical: 8,
-        ),
+      borderRadius: BorderRadius.circular(18),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOutCubic,
+        margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
         decoration: BoxDecoration(
           color: isActive
-              ? AppTheme.royalBlue.withOpacity(0.1)
+              ? const Color(0xFFF59E0B).withValues(alpha: 0.20)
               : Colors.transparent,
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: isActive
+                ? const Color(0xFFF59E0B).withValues(alpha: 0.35)
+                : Colors.transparent,
+            width: 1,
+          ),
         ),
         child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              icon,
-              size: isMobile ? 22 : 24,
-              color: isActive ? AppTheme.royalBlue : const Color(0xFF6D6D6D),
+              isActive ? activeIcon : inactiveIcon,
+              size: 21,
+              color: isActive ? activeColor : inactiveColor,
             ),
-            const SizedBox(height: 4),
-            Flexible(
+            const SizedBox(height: 3),
+            AnimatedDefaultTextStyle(
+              duration: const Duration(milliseconds: 200),
+              curve: Curves.easeOutCubic,
+              style: TextStyle(
+                fontFamily: AppTheme.fontFamily,
+                fontSize: 10,
+                fontWeight: isActive ? FontWeight.w700 : FontWeight.w500,
+                color: isActive ? activeColor : inactiveColor,
+                letterSpacing: 0.1,
+              ),
               child: Text(
                 label,
-                style: TextStyle(
-                  fontSize: isMobile ? 10 : 12,
-                  fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
-                  color: isActive
-                      ? AppTheme.royalBlue
-                      : const Color(0xFF6D6D6D),
-                ),
                 textAlign: TextAlign.center,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
@@ -956,10 +977,12 @@ class _ClientDashboardState extends State<ClientDashboard> {
           ElevatedButton(
             onPressed: () async {
               try {
+                final phone = phoneController.text.trim();
                 await _firestoreService.updateUserProfile(user.uid, {
                   'fullName': nameController.text.trim(),
                   'name': nameController.text.trim(),
-                  'phoneNumber': phoneController.text.trim(),
+                  'phone': phone,
+                  'phoneNumber': phone,
                   'address': addressController.text.trim(),
                 });
                 await _loadUserData();

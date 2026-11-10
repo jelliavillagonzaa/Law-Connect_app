@@ -3,6 +3,7 @@ import 'package:intl/intl.dart';
 
 import '../services/hearing_calendar_fields.dart';
 import 'court_order_display.dart';
+import 'hearing_sms_formatter.dart';
 
 /// Builds readable notification text and field lists from `hearings` documents.
 class HearingNotificationFormatter {
@@ -23,6 +24,8 @@ class HearingNotificationFormatter {
     'activityType': 'Activity',
     'senderName': 'From',
     'message': 'Message',
+    'remarks': 'Remarks',
+    'notes': 'Notes / Remarks',
     'fullText': 'Order / full text',
     'createdAt': 'Recorded',
     'updatedAt': 'Last updated',
@@ -68,8 +71,19 @@ class HearingNotificationFormatter {
   ) {
     final out = <String, dynamic>{};
     for (final key in calendarHearingKeys.keys) {
-      final text = _calendarFieldText(source, key);
-      if (text.isNotEmpty) out[key] = text;
+      if (key == 'location') {
+        var venue = HearingCalendarFields.resolveVenueForDisplay(source);
+        if (venue.isEmpty) {
+          venue = _calendarFieldText(source, 'location');
+        }
+        if (venue.isEmpty) {
+          venue = _calendarFieldText(source, 'courtBranch');
+        }
+        if (venue.isNotEmpty) out['location'] = venue;
+      } else {
+        final text = _calendarFieldText(source, key);
+        if (text.isNotEmpty) out[key] = text;
+      }
     }
     return out;
   }
@@ -80,7 +94,43 @@ class HearingNotificationFormatter {
   ) {
     final rows = <MapEntry<String, String>>[];
     for (final entry in calendarHearingKeys.entries) {
-      final text = _formatValue(entry.key, data[entry.key]);
+      String? text;
+      if (entry.key == 'caseNo') {
+        final rawCase = HearingCalendarFields.asDisplayString(data['caseNo']).isNotEmpty
+            ? HearingCalendarFields.asDisplayString(data['caseNo'])
+            : HearingCalendarFields.asDisplayString(data['caseNumber']);
+        final cleanCase = HearingCalendarFields.cleanCaseDocketNo(rawCase);
+        text = cleanCase.isNotEmpty ? cleanCase : _formatValue(entry.key, data[entry.key]);
+      } else if (entry.key == 'caseTitle') {
+        var title = HearingCalendarFields.asDisplayString(data['caseTitle']);
+        if (!HearingCalendarFields.hasCaseCaptionMarker(title)) {
+          final resolved = HearingCalendarFields.resolveCaseTitleForDisplay(data);
+          if (resolved.isNotEmpty && HearingCalendarFields.hasCaseCaptionMarker(resolved)) {
+            title = resolved;
+          }
+        }
+        text = title.isNotEmpty ? title : _formatValue(entry.key, data[entry.key]);
+      } else if (entry.key == 'clientName') {
+        final resolvedClient = HearingCalendarFields.resolveClientForDisplay(data);
+        text = resolvedClient.isNotEmpty
+            ? resolvedClient
+            : _formatValue(entry.key, data[entry.key]);
+      } else if (entry.key == 'location') {
+        var venue = HearingCalendarFields.resolveVenueForDisplay(data);
+        if (venue.isEmpty) {
+          final rawLoc = _formatValue('location', data['location']) ??
+              _formatValue('courtBranch', data['courtBranch']) ??
+              _formatValue('court', data['court']) ??
+              _formatValue('court_branch', data['court_branch']) ??
+              _formatValue('venue', data['venue']);
+          if (rawLoc != null && rawLoc.isNotEmpty) {
+            venue = rawLoc;
+          }
+        }
+        text = venue.isNotEmpty ? venue : null;
+      } else {
+        text = _formatValue(entry.key, data[entry.key]);
+      }
       if (text == null || text.isEmpty) continue;
       rows.add(MapEntry(entry.value, text));
     }
@@ -182,6 +232,32 @@ class HearingNotificationFormatter {
     if (parseOrderText) {
       HearingCalendarFields.fillStructuredFieldsFromOrderText(prepared);
     }
+    final currentLoc =
+        HearingCalendarFields.fieldAsDisplayString(prepared, 'location');
+    if (currentLoc.isEmpty || HearingCalendarFields.isBareLocation(currentLoc)) {
+      final venue = HearingCalendarFields.resolveVenueForDisplay(data);
+      if (venue.isNotEmpty && !HearingCalendarFields.isBareLocation(venue)) {
+        prepared['location'] = venue;
+      }
+    }
+
+    final fullOrderText = CourtOrderTextSources.combine({...data, ...prepared});
+
+    if (_formatValue('hearingDate', prepared['hearingDate'])?.isEmpty ?? true) {
+      final extractedDate = HearingCalendarFields.extractHearingDateFromOrderText(fullOrderText);
+      if (extractedDate.isNotEmpty) {
+        prepared['hearingDate'] = extractedDate;
+      }
+    }
+
+    if (_formatValue('hearingTime', prepared['hearingTime'])?.isEmpty ?? true) {
+      final extractedTime = HearingCalendarFields.extractHearingTimeFromOrderText(fullOrderText);
+      if (extractedTime.isNotEmpty) {
+        prepared['hearingTime'] = extractedTime;
+      }
+    }
+
+    final proceeding = HearingCalendarFields.extractProceedingFromOrderText(fullOrderText);
 
     final rows = <MapEntry<String, String>>[];
     final used = <String>{};
@@ -209,26 +285,63 @@ class HearingNotificationFormatter {
         }
         if (text == null || text.isEmpty) continue;
         final parties = HearingCalendarFields.splitHearingPartyNames(text);
-        final label = parties.length > 1 ? 'Clients' : 'Client';
-        if (used.contains(label)) continue;
-        used.add(label);
-        rows.add(MapEntry(label, text));
+        final label = parties.length > 1 ? 'Involved Parties' : 'Involved Party';
+        if (!used.contains(label)) {
+          used.add(label);
+          rows.add(MapEntry(label, text));
+        }
+
+        final role = HearingCalendarFields.detectPartyRole(
+          clientName: text,
+          caseTitle: _formatValue('caseTitle', prepared['caseTitle']) ??
+              _formatValue('caseTitle', data['caseTitle']),
+          fullText: fullOrderText,
+        );
+        if (role.isNotEmpty && !used.contains('Your Role / Status')) {
+          used.add('Your Role / Status');
+          rows.add(MapEntry('Your Role / Status', role));
+        }
+        continue;
+      }
+      if (entry.key == 'hearingTime') {
+        add('hearingDate', 'Hearing date');
+        add('hearingTime', 'Hearing time');
         continue;
       }
       add(entry.key, entry.value);
     }
     add('hearingDate', 'Hearing date');
-    add('summary', 'Summary');
+
+    if (proceeding.isNotEmpty && !used.contains('Proceeding / Purpose')) {
+      used.add('Proceeding / Purpose');
+      rows.add(MapEntry('Proceeding / Purpose', proceeding));
+    }
+
+    var rawSummary = _formatValue('summary', prepared['summary']) ??
+        _formatValue('summary', data['summary']) ?? '';
+    if (rawSummary.isNotEmpty) {
+      rawSummary = HearingCalendarFields.cleanSummaryText(rawSummary);
+      if (rawSummary.isNotEmpty && !used.contains('Summary')) {
+        used.add('Summary');
+        rows.add(MapEntry('Summary', rawSummary));
+      }
+    }
+
     add('documentType', 'Document type');
     add('senderName', 'From');
+    add('remarks', 'Remarks');
+    add('notes', 'Notes / Remarks');
 
-    var fullText = CourtOrderTextSources.combine({...data, ...prepared});
+    var fullText = fullOrderText;
     if (fullText.isEmpty) {
       fullText = _formatValue(
             'fullText',
             prepared['fullText'] ?? data['fullText'],
           ) ??
           '';
+    }
+    if (CourtOrderTextSources.isInboxWrapper(fullText)) {
+      fullText = '';
     }
     if (fullText.isNotEmpty) {
       rows.add(MapEntry('Order / full text', fullText));
@@ -266,26 +379,45 @@ class HearingNotificationFormatter {
 
   /// Short subtitle for list rows.
   static String buildSummary(Map<String, dynamic> d) {
-    final summary = _s(d['summary']);
-    if (summary.isNotEmpty) return summary;
+    final enriched = HearingCalendarFields.enrichForAlerts(d);
+    final fullOrderText = CourtOrderTextSources.combine(enriched);
+    final proceeding = HearingCalendarFields.extractProceedingFromOrderText(fullOrderText);
 
     final parts = <String>[];
-    final loc = _s(d['location']);
-    final hd = _formatValue('hearingDate', d['hearingDate']);
-    final ht = _formatValue('hearingTime', d['hearingTime']);
-    final cl = _s(d['clientName']);
-    final cn = _s(d['caseNo']);
-    final br = _s(d['courtBranch']);
+    final loc = _s(enriched['location']);
+    final br = _s(enriched['courtBranch']);
+    final venue = loc.isNotEmpty ? loc : br;
+    final hd = _formatValue('hearingDate', enriched['hearingDate']) ??
+        HearingCalendarFields.extractHearingDateFromOrderText(fullOrderText);
+    final ht = _formatValue('hearingTime', enriched['hearingTime']) ??
+        HearingCalendarFields.extractHearingTimeFromOrderText(fullOrderText);
 
-    if (loc.isNotEmpty) parts.add(loc);
-    if (hd != null && hd.isNotEmpty) {
-      parts.add(ht != null && ht.isNotEmpty ? '$hd · $ht' : hd);
+    if (proceeding.isNotEmpty) {
+      parts.add(proceeding);
     }
-    if (cl.isNotEmpty) parts.add(cl);
-    if (br.isNotEmpty) parts.add(br);
-    if (cn.isNotEmpty && !parts.contains(cn)) parts.add(cn);
+    if (hd.isNotEmpty) {
+      parts.add(ht.isNotEmpty ? '$hd · $ht' : hd);
+    } else if (ht.isNotEmpty) {
+      parts.add(ht);
+    }
+    if (venue.isNotEmpty) {
+      parts.add(venue);
+    }
 
-    if (parts.isNotEmpty) return parts.take(4).join(' • ');
+    if (parts.isNotEmpty) {
+      return parts.take(3).join(' • ');
+    }
+
+    final rawSummary = _s(enriched['summary']);
+    if (rawSummary.isNotEmpty) {
+      final clean = HearingCalendarFields.cleanSummaryText(rawSummary);
+      if (clean.length > 120) {
+        final dot = clean.lastIndexOf('.', 120);
+        if (dot >= 40) return clean.substring(0, dot + 1).trim();
+        return '${clean.substring(0, 117)}...';
+      }
+      return clean;
+    }
 
     final msg = _s(d['message']);
     if (msg.isNotEmpty) {
@@ -295,42 +427,96 @@ class HearingNotificationFormatter {
     }
     final title = _s(d['caseTitle']);
     if (title.isNotEmpty) return title;
+    final cn = _s(enriched['caseNo']);
     if (cn.isNotEmpty) return cn;
     return 'Court hearing notice';
   }
 
-  /// Locked hearing push body. Keep this order:
-  /// Case No., Client, Court / Branch, then Order / notice
-  /// (case title, then "{branch} · Hearing {date}").
+  /// Phone push / in-app popup body. Date is always the first line when known.
   static String buildPopupBody(Map<String, dynamic> data) {
-    final existing = _s(data['message']);
-    if (existing.contains('Case No.:') &&
-        existing.contains('Order / notice:')) {
-      return _trimPopupExtras(existing);
-    }
+    final existing = _s(data['message']).isNotEmpty
+        ? _s(data['message'])
+        : _s(data['body']);
 
-    final lines = <String>[];
-    final cn = _s(data['caseNo']);
-    if (cn.isNotEmpty) lines.add('Case No.: $cn');
-    final cl = _s(data['clientName']);
-    if (cl.isNotEmpty) lines.add('Client: $cl');
-    final br = _s(data['courtBranch']);
-    if (br.isNotEmpty) lines.add('Court / Branch: $br');
+    final enriched = HearingCalendarFields.enrichForAlerts(data);
+    final caseNo = _s(enriched['caseNo']);
+    final caseTitle = _s(enriched['caseTitle']);
+    final clientName = _s(enriched['clientName']);
+    final hearingDate = HearingCalendarFields.hearingFieldAsString(
+      enriched,
+      'hearingDate',
+    );
+    final hearingTime = HearingCalendarFields.hearingFieldAsString(
+      enriched,
+      'hearingTime',
+    );
+    final venue = HearingCalendarFields.resolveVenueForDisplay(enriched);
+    final location = (venue.isNotEmpty &&
+            !HearingCalendarFields.isBareLocation(venue))
+        ? venue
+        : (_s(enriched['location']).isNotEmpty
+            ? _s(enriched['location'])
+            : _s(enriched['courtBranch']));
+    final hasFacts = caseNo.isNotEmpty ||
+        caseTitle.isNotEmpty ||
+        clientName.isNotEmpty ||
+        hearingDate.isNotEmpty ||
+        hearingTime.isNotEmpty ||
+        location.isNotEmpty;
 
-    final title = _s(data['caseTitle']);
-    final when = HearingCalendarFields.pushHearingWhenLine(data);
-    if (title.isNotEmpty || when.isNotEmpty) {
-      lines.add('');
-      lines.add('Order / notice:');
-      if (title.isNotEmpty) lines.add(title);
-      if (when.isNotEmpty) lines.add(when);
-    } else if (existing.isNotEmpty) {
-      lines.add('');
-      lines.add('Order / notice:');
-      lines.add(_trimPopupExtras(existing));
+    if (!hasFacts) return _trimPopupExtras(existing);
+
+    // Same copy as PhilSMS / Semaphore hearing texts (includes Date: line).
+    return HearingSmsFormatter.build(
+      caseNo: caseNo,
+      caseTitle: caseTitle,
+      clientName: clientName,
+      hearingDate: hearingDate,
+      hearingTime: hearingTime,
+      location: location,
+      reminderKind: _reminderKind(enriched),
+    );
+  }
+
+  /// Title with hearing date so collapsed trays still show when.
+  static String buildPopupTitle(Map<String, dynamic> data, {String? fallback}) {
+    final enriched = HearingCalendarFields.enrichForAlerts(data);
+    final caseNo = _s(enriched['caseNo']);
+    final hearingDate = HearingCalendarFields.hearingFieldAsString(
+      enriched,
+      'hearingDate',
+    );
+    final base = (fallback ?? '').trim().isNotEmpty
+        ? fallback!.trim()
+        : (caseNo.isNotEmpty
+            ? 'Court hearing / order — $caseNo'
+            : 'Court hearing / order');
+    if (hearingDate.isEmpty) return base;
+    if (base.contains(hearingDate)) return base;
+    return '$base · $hearingDate';
+  }
+
+  static String _reminderKind(Map<String, dynamic> data) {
+    for (final key in const ['reminderKind', 'hearingReminderKind']) {
+      final kind = _s(data[key]).toLowerCase();
+      if (kind == 'd5' ||
+          kind == 'd2' ||
+          kind == 'hearing_day' ||
+          kind == 'day_noon') {
+        return kind;
+      }
     }
-    if (lines.isEmpty) return existing;
-    return lines.join('\n');
+    final type = _s(data['type']).toLowerCase();
+    if (type.contains('hearing_reminder_d5') || type.endsWith('_d5')) {
+      return 'd5';
+    }
+    if (type.contains('hearing_reminder_d2') || type.endsWith('_d2')) {
+      return 'd2';
+    }
+    if (type.contains('hearing_day') || type.contains('day_noon')) {
+      return 'hearing_day';
+    }
+    return '';
   }
 
   static String _trimPopupExtras(String raw) {

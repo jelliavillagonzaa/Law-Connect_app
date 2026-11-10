@@ -11,7 +11,6 @@ import '../../services/auth_service.dart';
 import '../../services/hearing_calendar_fields.dart';
 import '../../services/hearing_calendar_sync_service.dart';
 import '../../services/staff_service.dart';
-import '../../services/notary_service.dart';
 import '../../services/hearing_notification_fanout_service.dart';
 import '../../utils/calendar_perf.dart';
 import '../../utils/calendar_hearing_nav.dart';
@@ -23,7 +22,6 @@ import '../../widgets/common/calendar_month_grid.dart';
 import '../../widgets/common/stable_merged_listenable_builder.dart';
 
 import 'appointment_scheduler_form.dart';
-import 'attorney_notary_request_detail_screen.dart';
 
 /// Single cell in the unified attorney calendar: client appointment OR Firestore hearing/deadline.
 class _AttorneyCalendarEntry {
@@ -71,14 +69,21 @@ class _AttorneyCalendarEntry {
   }
 
   String hearingTitle() {
-    final caseNo = HearingCalendarFields.asDisplayString(hearingEvent!['caseNo']);
-    if (caseNo.isNotEmpty) return caseNo;
+    final rawCaseNo = HearingCalendarFields.asDisplayString(hearingEvent!['caseNo']).isNotEmpty
+        ? HearingCalendarFields.asDisplayString(hearingEvent!['caseNo'])
+        : HearingCalendarFields.asDisplayString(hearingEvent!['caseNumber']);
+    final cleanNo = HearingCalendarFields.cleanCaseDocketNo(rawCaseNo);
+    if (cleanNo.isNotEmpty && !HearingCalendarFields.isPlaceholderCaseNo(cleanNo)) {
+      return cleanNo;
+    }
     final client =
-        HearingCalendarFields.asDisplayString(hearingEvent!['clientName']);
+        HearingCalendarFields.resolveClientForDisplay(hearingEvent!);
     if (client.isNotEmpty) return client;
     final caseTitle =
         HearingCalendarFields.asDisplayString(hearingEvent!['caseTitle']);
-    if (caseTitle.isNotEmpty) return caseTitle;
+    if (caseTitle.isNotEmpty && !HearingCalendarFields.isLowQualityCaseTitle(caseTitle)) {
+      return caseTitle;
+    }
     final t = HearingCalendarFields.asDisplayString(hearingEvent!['title']);
     if (t.isNotEmpty) {
       return t.replaceFirst(RegExp(r'^\[AI\]\s*'), '');
@@ -104,6 +109,29 @@ class _AttorneyCalendarEntry {
       return et[0].toUpperCase() + et.substring(1);
     }
     return 'Event';
+  }
+
+  DateTime get createdAt {
+    if (appointment != null) {
+      return appointment!.updatedAt.isAfter(appointment!.createdAt)
+          ? appointment!.updatedAt
+          : appointment!.createdAt;
+    }
+    final u = hearingEvent?['updatedAt'];
+    if (u is DateTime) return u;
+    if (u is Timestamp) return u.toDate();
+    if (u is String) {
+      final parsed = DateTime.tryParse(u);
+      if (parsed != null) return parsed;
+    }
+    final c = hearingEvent?['createdAt'];
+    if (c is DateTime) return c;
+    if (c is Timestamp) return c.toDate();
+    if (c is String) {
+      final parsed = DateTime.tryParse(c);
+      if (parsed != null) return parsed;
+    }
+    return DateTime.fromMillisecondsSinceEpoch(0);
   }
 }
 
@@ -161,7 +189,6 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       EnhancedAppointmentService();
   final AuthService _authService = AuthService();
   final StaffService _staffService = StaffService();
-  final NotaryService _notaryService = NotaryService();
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
   late final ValueNotifier<DateTime> _viewDateNotifier = ValueNotifier(
@@ -176,7 +203,6 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
 
   StreamSubscription<List<Map<String, dynamic>>>? _calendarEventsSub;
   StreamSubscription<List<Map<String, dynamic>>>? _liveHearingsSub;
-  StreamSubscription<List<Map<String, dynamic>>>? _notaryCalendarSub;
   StreamSubscription<List<AppointmentModel>>? _appointmentsSub;
   bool _ownsAppointmentsStream = false;
   Timer? _dataUiDebounce;
@@ -194,18 +220,17 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
   final ValueNotifier<int> _entriesRevisionNotifier = ValueNotifier(0);
   List<Map<String, dynamic>> _cachedHearingNavEvents = [];
   List<Map<String, dynamic>> _liveHearingRows = [];
-  List<Map<String, dynamic>> _notaryCalendarRows = [];
   int _entriesIndexGen = 0;
   bool _didRevealHearingMonth = false;
   final Set<String> _seenHearingDocIds = {};
   bool _followNewHearings = false;
   Timer? _armFollowTimer;
-  bool _notaryCalendarReady = false;
   Timer? _entriesIndexDebounce;
   Timer? _clientNamesDebounce;
   final ValueNotifier<int> _hearingNavRevision = ValueNotifier(0);
   bool _flushDataImmediately = true;
   bool _entriesIndexFlushImmediately = true;
+  DateTime _webSelectedDay = DateTime.now();
 
   final Map<String, String> _clientNameCache =
       <String, String>{}; // Cache for client full names
@@ -262,37 +287,47 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     _hydrateCalendarEventsFromCache();
     _hydrateLiveHearingsFromCache();
     _paintGridFromCachedData();
+    HearingCalendarSyncService.instance.overlaySeedRevision
+        .addListener(_onHearingOverlaySeeded);
+    // Start automated hearings immediately — do not wait for first frame/notary.
+    unawaited(_loadAutomatedHearings());
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _bindAppointments();
       _subscribeCalendarEvents();
-      _subscribeNotaryCalendar();
-      Future<void>.delayed(
-        const Duration(milliseconds: CalendarPerf.hearingStreamDeferMs),
-        () {
-          if (!mounted) return;
-          _subscribeLiveHearings();
-        },
-      );
-      Future<void>.delayed(
-        Duration(milliseconds: kIsWeb ? 200 : 2000),
-        () {
-          if (mounted) unawaited(_loadAutomatedHearings());
-        },
-      );
+      _subscribeLiveHearings();
     });
+  }
+
+  void _onHearingOverlaySeeded() {
+    if (!mounted) return;
+    final aid = HearingCalendarSyncService.overlayKey(_calendarAttorneyId());
+    final keys = HearingCalendarSyncService.instance.lastSeededOverlayKeys;
+    if (keys.isNotEmpty &&
+        !keys.contains(aid) &&
+        !keys.contains(HearingCalendarSyncService.firmOverlayId)) {
+      return;
+    }
+    final cached =
+        HearingCalendarSyncService.instance.peekHearingNavRows(aid) ??
+            HearingCalendarSyncService.instance.peekHearingNavRows(
+              HearingCalendarSyncService.firmOverlayId,
+            );
+    if (cached == null || cached.isEmpty) return;
+    final forced = cached
+        .map((r) => Map<String, dynamic>.from(r)..['fromInbox'] = true)
+        .toList();
+    _applyAutomatedHearingRows(forced);
   }
 
   List<Map<String, dynamic>> get _effectiveHearingRows => _liveHearingRows;
 
   List<Map<String, dynamic>> _gridCalendarEvents() {
-    final merged = CalendarLiveHearingMap.mergeIntoCalendarEvents(
+    return CalendarLiveHearingMap.mergeIntoCalendarEvents(
       _calendarEvents,
       _effectiveHearingRows,
     );
-    if (_notaryCalendarRows.isEmpty) return merged;
-    return [...merged, ..._notaryCalendarRows];
   }
 
   void _hydrateCalendarEventsFromCache() {
@@ -340,7 +375,7 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
   }
 
   String _entriesIndexFingerprint() =>
-      '${_appointmentsFingerprint(_appointments)}|${_calendarEventsFingerprint(_calendarEvents)}|${_calendarEventsFingerprint(_liveHearingRows)}|${_calendarEventsFingerprint(_notaryCalendarRows)}';
+      '${_appointmentsFingerprint(_appointments)}|${_calendarEventsFingerprint(_calendarEvents)}|${_calendarEventsFingerprint(_liveHearingRows)}';
 
   Future<void> _rebuildEntriesIndexAsync() async {
     final gen = ++_entriesIndexGen;
@@ -433,15 +468,18 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       }
       _hydrateCalendarEventsFromCache();
       _hydrateLiveHearingsFromCache();
+      _paintGridFromCachedData();
       _bindAppointments();
       _subscribeCalendarEvents();
       _subscribeLiveHearings();
-      _subscribeNotaryCalendar();
+      unawaited(_loadAutomatedHearings());
     }
   }
 
   @override
   void dispose() {
+    HearingCalendarSyncService.instance.overlaySeedRevision
+        .removeListener(_onHearingOverlaySeeded);
     _dataUiDebounce?.cancel();
     _entriesIndexDebounce?.cancel();
     _clientNamesDebounce?.cancel();
@@ -451,35 +489,10 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     _viewDateNotifier.dispose();
     _calendarEventsSub?.cancel();
     _liveHearingsSub?.cancel();
-    _notaryCalendarSub?.cancel();
     if (_ownsAppointmentsStream) {
       _appointmentsSub?.cancel();
     }
     super.dispose();
-  }
-
-  void _subscribeNotaryCalendar() {
-    final aid = _calendarAttorneyId();
-    if (aid.isEmpty) {
-      _notaryCalendarReady = true;
-      return;
-    }
-    _notaryCalendarSub?.cancel();
-    _notaryCalendarSub = _notaryService.watchNotaryCalendarRows(aid).listen(
-      (rows) {
-        if (!mounted) return;
-        _notaryCalendarRows = rows;
-        _notaryCalendarReady = true;
-        _scheduleEntriesIndexRebuild(immediate: true);
-        _hearingNavRevision.value++;
-        _maybeRevealHearingMonth();
-      },
-      onError: (_) {
-        if (!mounted) return;
-        _notaryCalendarReady = true;
-        _maybeRevealHearingMonth();
-      },
-    );
   }
 
   void _subscribeLiveHearings() {
@@ -563,6 +576,8 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
             : data['updatedAt'] is Timestamp
                 ? (data['updatedAt'] as Timestamp).toDate()
                 : DateTime.now());
+    final venue = HearingCalendarFields.resolveVenueForDisplay(data);
+    final courtBranch = HearingCalendarFields.asDisplayString(data['courtBranch']);
     return CalendarLiveHearingMap.gridRow(
       docId: docId,
       attorneyId: aid,
@@ -570,14 +585,18 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       caseNo: caseNo,
       clientName: HearingCalendarFields.asDisplayString(data['clientName']),
       caseTitle: HearingCalendarFields.asDisplayString(data['caseTitle']),
-      courtBranch: HearingCalendarFields.asDisplayString(data['courtBranch']),
+      courtBranch: courtBranch,
       hearingTime: HearingCalendarFields.asDisplayString(data['hearingTime']),
+      location: venue.isNotEmpty
+          ? venue
+          : HearingCalendarFields.asDisplayString(data['location']),
+      createdAt: data['createdAt'] ?? data['updatedAt'],
+      updatedAt: data['updatedAt'],
     );
   }
 
   /// Newest hearing/order rows — attorneyUid is not required.
   Future<List<Map<String, dynamic>>> _fetchHearingsForCalendar() async {
-    final aid = HearingCalendarSyncService.overlayKey(_calendarAttorneyId());
     try {
       final query = _firestore
           .collection('hearings')
@@ -602,26 +621,39 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     }
   }
 
+  bool _isLoadingAutomatedHearings = false;
+
   /// Fallback when the live overlay missed n8n / court-import hearings.
   Future<void> _loadAutomatedHearings() async {
-    if (!mounted) return;
+    if (!mounted || _isLoadingAutomatedHearings) return;
+    _isLoadingAutomatedHearings = true;
+    final aid = HearingCalendarSyncService.overlayKey(_calendarAttorneyId());
     try {
-      var rows = await HearingCalendarSyncService.instance
+      final rows = await HearingCalendarSyncService.instance
           .fetchAutomatedCalendarRows(
-            HearingCalendarSyncService.overlayKey(_calendarAttorneyId()),
+            aid,
+            onRows: (partial) {
+              if (!mounted || partial.isEmpty) return;
+              _applyAutomatedHearingRows(partial);
+            },
           );
+      if (!mounted) return;
+      if (rows.isNotEmpty) _applyAutomatedHearingRows(rows);
       final inbox = await HearingCalendarSyncService.instance
-          .fetchRowsFromHearingNotifications(
-            HearingCalendarSyncService.overlayKey(_calendarAttorneyId()),
-          );
-      rows = CalendarLiveHearingMap.mergeHearingRows(rows, inbox);
-      if (rows.isEmpty) {
-        rows = await _fetchHearingsForCalendar();
-      }
-      if (!mounted || rows.isEmpty) return;
-      _applyAutomatedHearingRows(rows);
+          .fetchRowsFromHearingNotifications(aid);
+      // Always merge resilient fetch — SAMPLE / missing-createdAt rows can be
+      // dropped by mapHearingDocs while other months still populate [rows].
+      final resilient = await _fetchHearingsForCalendar();
+      final merged = CalendarLiveHearingMap.mergeHearingRows(
+        CalendarLiveHearingMap.mergeHearingRows(rows, inbox),
+        resilient,
+      );
+      if (!mounted || merged.isEmpty) return;
+      _applyAutomatedHearingRows(merged);
     } catch (e) {
       debugPrint('[Calendar] automated hearings failed: $e');
+    } finally {
+      _isLoadingAutomatedHearings = false;
     }
   }
 
@@ -632,7 +664,8 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       rows,
     );
     final fp = CalendarPerf.eventsFingerprint(merged);
-    _jumpToInboxHearingMonth(rows);
+    // Jump BEFORE seeding seen-ids so new notifs always open their month.
+    _jumpToHearingNotifMonth(rows);
     if (fp == _lastLiveHearingsFingerprint && _liveHearingRows.isNotEmpty) {
       return;
     }
@@ -641,24 +674,37 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     _lastEntriesIndexFingerprint = '';
     _rebuildHearingNavCache();
     _hearingNavRevision.value++;
-    if (!_followNewHearingMonth(_liveHearingRows)) {
-      _maybeRevealHearingMonth();
-    }
-    unawaited(_rebuildEntriesIndexAsync());
+    _followNewHearingMonth(_liveHearingRows);
+    _scheduleEntriesIndexRebuild(immediate: true);
   }
 
-  void _jumpToInboxHearingMonth(List<Map<String, dynamic>> rows) {
+  /// Any new / inbox hearing notif → jump to that hearing's month immediately.
+  void _jumpToHearingNotifMonth(List<Map<String, dynamic>> rows) {
     DateTime? when;
     for (final r in rows) {
-      if (r['fromInbox'] != true) continue;
+      final hid = HearingCalendarFields.asDisplayString(r['hearingDocId']);
+      final fromInbox = r['fromInbox'] == true;
+      final unseen = hid.isNotEmpty && !_seenHearingDocIds.contains(hid);
+      if (!fromInbox && !unseen && _didRevealHearingMonth) continue;
       final d = _dateTimeFromField(r['eventDate']);
       if (d == null) continue;
       if (when == null || d.isAfter(when)) when = d;
     }
+    if (when == null && !_didRevealHearingMonth) {
+      for (final r in rows) {
+        final d = _dateTimeFromField(r['eventDate']);
+        if (d == null) continue;
+        if (when == null || d.isAfter(when)) when = d;
+      }
+    }
     if (when == null) return;
     final view = _viewDateNotifier.value;
-    if (when.year == view.year && when.month == view.month) return;
+    if (when.year == view.year && when.month == view.month) {
+      _didRevealHearingMonth = true;
+      return;
+    }
     _viewDateNotifier.value = DateTime(when.year, when.month);
+    _didRevealHearingMonth = true;
   }
 
   void _seedSeenHearings(List<Map<String, dynamic>> rows) {
@@ -668,7 +714,7 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
   void _scheduleFollowArm() {
     if (_followNewHearings) return;
     _armFollowTimer?.cancel();
-    _armFollowTimer = Timer(const Duration(seconds: 2), () {
+    _armFollowTimer = Timer(const Duration(milliseconds: 400), () {
       if (!mounted) return;
       _followNewHearings = true;
     });
@@ -679,7 +725,9 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     if (!_followNewHearings) {
       _seedSeenHearings(rows);
       _scheduleFollowArm();
-      return false;
+      // First paint: still reveal the hearing month immediately.
+      _maybeRevealHearingMonth();
+      return _didRevealHearingMonth;
     }
     final when = CalendarHearingNav.newestUnseenHearingDate(
       rows,
@@ -690,6 +738,7 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     final view = _viewDateNotifier.value;
     if (when.year == view.year && when.month == view.month) return true;
     _viewDateNotifier.value = DateTime(when.year, when.month);
+    _didRevealHearingMonth = true;
     return true;
   }
 
@@ -698,17 +747,14 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     return d != null && d.year == view.year && d.month == view.month;
   }
 
-  /// Do not jump away from a month that already has hearings or notary.
+  /// Jump to a month that has automated hearings.
   void _maybeRevealHearingMonth() {
-    if (_didRevealHearingMonth || !_notaryCalendarReady) return;
-    if (_liveHearingRows.isEmpty && _notaryCalendarRows.isEmpty) return;
+    if (_didRevealHearingMonth) return;
+    if (_liveHearingRows.isEmpty) return;
     final view = _viewDateNotifier.value;
     final inView = _liveHearingRows.any(
-          (ev) => _eventDateInView(ev['eventDate'], view),
-        ) ||
-        _notaryCalendarRows.any(
-          (ev) => _eventDateInView(ev['eventDate'], view),
-        );
+      (ev) => _eventDateInView(ev['eventDate'], view),
+    );
     if (inView) {
       _didRevealHearingMonth = true;
       return;
@@ -721,9 +767,6 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     }
 
     for (final ev in _liveHearingRows) {
-      consider(ev['eventDate']);
-    }
-    for (final ev in _notaryCalendarRows) {
       consider(ev['eventDate']);
     }
     final jumpTo = pick;
@@ -897,32 +940,59 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
           ? _effectiveHearingRows
           : _cachedHearingNavEvents;
 
-  /// Months with Firestore `hearings` not shown in the current calendar view.
+  /// Months with scheduled dates that are not in the current calendar view.
   List<DateTime> _hearingMonthsOutsideView(DateTime viewDate) {
-    return CalendarHearingNav.monthsOutsideView(
-      hearingRows: [..._allHearingNavEvents(), ..._notaryCalendarRows],
+    final months = CalendarHearingNav.monthsOutsideView(
+      hearingRows: _allHearingNavEvents(),
       viewDate: viewDate,
       parseDate: _dateTimeFromField,
     );
+    if (!kIsWeb) return months;
+
+    final seen = <String>{
+      for (final month in months) '${month.year}-${month.month}',
+    };
+    final out = [...months];
+    for (final key in _entriesByDayKey.keys) {
+      final parts = key.split('-');
+      if (parts.length < 2) continue;
+      final year = int.tryParse(parts[0]);
+      final month = int.tryParse(parts[1]);
+      if (year == null || month == null) continue;
+      if (year == viewDate.year && month == viewDate.month) continue;
+      if (seen.add('$year-$month')) {
+        out.add(DateTime(year, month));
+      }
+    }
+    out.sort((a, b) {
+      final byYear = a.year.compareTo(b.year);
+      return byYear != 0 ? byYear : a.month.compareTo(b.month);
+    });
+    return out;
   }
 
   Widget _buildHearingsOutsideMonthBanner(DateTime viewDate) {
     final months = _hearingMonthsOutsideView(viewDate);
     if (months.isEmpty) return const SizedBox.shrink();
-    return Material(
-      color: calendarGold.withValues(alpha: 0.35),
+    final bar = ColoredBox(
+      color: kIsWeb
+          ? const Color(0xFFFFF3C4)
+          : calendarGold.withValues(alpha: 0.35),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        padding: EdgeInsets.symmetric(
+          horizontal: kIsWeb ? 16 : 12,
+          vertical: kIsWeb ? 10 : 8,
+        ),
         child: Wrap(
-          spacing: 8,
-          runSpacing: 4,
+          spacing: kIsWeb ? 12 : 8,
+          runSpacing: kIsWeb ? 6 : 4,
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             const Icon(Icons.event_note, size: 18, color: Colors.black87),
             Text(
               'Scheduled dates on file appear in another month — View:',
               style: TextStyle(
-                fontSize: 12,
+                fontSize: kIsWeb ? 13 : 12,
                 fontWeight: FontWeight.w600,
                 color: Colors.grey[900],
               ),
@@ -931,16 +1001,23 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
               (m) => TextButton(
                 style: TextButton.styleFrom(
                   foregroundColor: calendarBlue,
-                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
                   minimumSize: Size.zero,
                   tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 ),
                 onPressed: () {
-                  _viewDateNotifier.value = DateTime(m.year, m.month);
+                  if (kIsWeb) {
+                    _goToWebMonth(m);
+                  } else {
+                    _viewDateNotifier.value = DateTime(m.year, m.month);
+                  }
                 },
                 child: Text(
                   DateFormat('MMMM yyyy').format(m),
-                  style: const TextStyle(fontWeight: FontWeight.bold),
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13,
+                  ),
                 ),
               ),
             ),
@@ -948,6 +1025,8 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
         ),
       ),
     );
+    if (!kIsWeb) return bar;
+    return SizedBox(width: double.infinity, child: bar);
   }
 
   DateTime? _dateTimeFromField(dynamic raw) {
@@ -963,6 +1042,15 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     return _entriesByDayKey[_dayKey(day)] ?? const [];
   }
 
+  static int _compareEntriesLatestFirst(
+    _AttorneyCalendarEntry a,
+    _AttorneyCalendarEntry b,
+  ) {
+    final c = b.createdAt.compareTo(a.createdAt);
+    if (c != 0) return c;
+    return b.startTime.compareTo(a.startTime);
+  }
+
   /// Same case/hearing from overlay + calendar_events can appear twice.
   List<_AttorneyCalendarEntry> _dedupeCalendarEntriesForDay(
     List<_AttorneyCalendarEntry> entries,
@@ -975,13 +1063,6 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
         continue;
       }
       final ev = e.hearingEvent!;
-      if (NotaryService.isNotaryCalendarRow(ev)) {
-        final nid = (ev['notaryRequestId'] as String?)?.trim() ??
-            (ev['id'] as String?)?.trim() ??
-            '';
-        byKey[nid.isNotEmpty ? 'n:$nid' : 'n:${e.hashCode}'] = e;
-        continue;
-      }
       final hid = HearingCalendarFields.asDisplayString(ev['hearingDocId']);
       final cn = HearingCalendarFields.asDisplayString(ev['caseNo'])
           .toLowerCase()
@@ -1003,12 +1084,13 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
           HearingCalendarFields.asDisplayString(existing.hearingEvent?['caseTitle']);
       final nextTitle =
           HearingCalendarFields.asDisplayString(ev['caseTitle']);
-      if (nextTitle.length > prevTitle.length) {
+      if (nextTitle.length > prevTitle.length ||
+          e.createdAt.isAfter(existing.createdAt)) {
         byKey[key] = e;
       }
     }
     final deduped = byKey.values.toList()
-      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+      ..sort(_compareEntriesLatestFirst);
     return deduped;
   }
 
@@ -1297,10 +1379,6 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     if (entry.appointment != null) {
       return _getAppointmentColor(entry.appointment!);
     }
-    if (entry.hearingEvent != null &&
-        NotaryService.isNotaryCalendarRow(entry.hearingEvent!)) {
-      return const Color(0xFF00897B);
-    }
     return hearingEventColor;
   }
 
@@ -1429,6 +1507,8 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       'eventType': 'hearing',
       'eventDate': apt.appointmentDateTime,
       'title': title,
+      'createdAt': apt.createdAt,
+      'updatedAt': apt.updatedAt,
       'source': 'attorney_manual',
       'clientName': apt.clientName,
       'assignedTo': attorneyId ?? apt.attorneyId,
@@ -1551,13 +1631,13 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       }
       final manualHearing = _manualHearingRowFromAppointment(created);
       final out = [...fresh, _AttorneyCalendarEntry.fromHearing(manualHearing)];
-      out.sort((a, b) => a.startTime.compareTo(b.startTime));
+      out.sort(_compareEntriesLatestFirst);
       return out;
     }
 
     if (fresh.any((e) => e.appointment?.id == created.id)) return fresh;
     final out = [...fresh, _AttorneyCalendarEntry.fromAppointment(created)];
-    out.sort((a, b) => a.startTime.compareTo(b.startTime));
+    out.sort(_compareEntriesLatestFirst);
     return out;
   }
 
@@ -1591,7 +1671,545 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     }
   }
 
+  bool _isAttorneyWebCalendar(bool isMobile) => kIsWeb && !isMobile;
+
+  void _goToWebMonth(DateTime month, {DateTime? select}) {
+    final next = DateTime(month.year, month.month);
+    _viewDateNotifier.value = next;
+    final pick = select ?? _webSelectedDay;
+    final inMonth = pick.year == next.year && pick.month == next.month;
+    setState(() {
+      _webSelectedDay = inMonth
+          ? DateTime(pick.year, pick.month, pick.day)
+          : DateTime(next.year, next.month, 1);
+    });
+  }
+
+  String _webEntryTitle(_AttorneyCalendarEntry entry) {
+    if (entry.appointment != null) {
+      return _clientLabelForGrid(entry.appointment!);
+    }
+    final ev = entry.hearingEvent;
+    if (ev != null) {
+      final caseNo = HearingCalendarFields.asDisplayString(ev['caseNo']).trim();
+      final client = HearingCalendarFields.asDisplayString(ev['clientName']).trim();
+      final hasCaseNo = caseNo.isNotEmpty && !HearingCalendarFields.isPlaceholderCaseNo(caseNo);
+      if (hasCaseNo && client.isNotEmpty) {
+        return '$caseNo · $client';
+      }
+      if (hasCaseNo) return caseNo;
+      if (client.isNotEmpty) return client;
+    }
+    final label = entry.calendarCellLabel();
+    if (label.isNotEmpty) return label;
+    return entry.hearingTitle();
+  }
+
+  String _webEntryKind(_AttorneyCalendarEntry entry) {
+    if (entry.appointment != null) return 'Appointment';
+    return 'Hearing';
+  }
+
+  String _webEntryDetail(_AttorneyCalendarEntry entry) {
+    if (entry.appointment != null) {
+      return _getAppointmentTypeLabel(entry.appointment!.appointmentType);
+    }
+    final ev = entry.hearingEvent ?? const <String, dynamic>{};
+    for (final key in ['courtBranch', 'venue', 'location', 'place']) {
+      final value = HearingCalendarFields.asDisplayString(ev[key]);
+      if (value.isNotEmpty) return value;
+    }
+    return entry.hearingTypeLabel();
+  }
+
+  /// Website chips only: automated hearings stay violet and client appointments stay yellow.
+  Color _webEntryColor(_AttorneyCalendarEntry entry) {
+    if (entry.appointment != null) return calendarGold;
+    return hearingEventColor;
+  }
+
+  Widget _buildAttorneyWebCalendar() {
+    const ink = Color(0xFF1A2744);
+    return ColoredBox(
+      color: Colors.white,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          ValueListenableBuilder<DateTime>(
+            valueListenable: _viewDateNotifier,
+            builder: (context, viewDate, _) => Padding(
+              padding: const EdgeInsets.fromLTRB(24, 18, 24, 8),
+              child: Row(
+                children: [
+                  const Text(
+                    'Calendar',
+                    style: TextStyle(
+                      fontSize: 26,
+                      fontWeight: FontWeight.w700,
+                      color: ink,
+                    ),
+                  ),
+                  Expanded(
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.chevron_left, color: ink),
+                          onPressed: () => _goToWebMonth(
+                            DateTime(viewDate.year, viewDate.month - 1),
+                          ),
+                        ),
+                        Text(
+                          DateFormat('MMMM').format(viewDate),
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                            color: ink,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Tooltip(
+                          message: 'Filter by year',
+                          child: Material(
+                            color: calendarGold,
+                            borderRadius: BorderRadius.circular(12),
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(12),
+                              onTap: () async {
+                                await _pickCalendarYear(viewDate);
+                                if (!mounted) return;
+                                _goToWebMonth(_viewDateNotifier.value);
+                              },
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 6,
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      '${viewDate.year}',
+                                      style: const TextStyle(
+                                        fontSize: 15,
+                                        fontWeight: FontWeight.w800,
+                                        color: Color(0xFF1A2744),
+                                      ),
+                                    ),
+                                    const Icon(
+                                      Icons.arrow_drop_down,
+                                      color: Color(0xFF1A2744),
+                                      size: 18,
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.chevron_right, color: ink),
+                          onPressed: () => _goToWebMonth(
+                            DateTime(viewDate.year, viewDate.month + 1),
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () {
+                            final now = DateTime.now();
+                            _goToWebMonth(now, select: now);
+                          },
+                          child: const Text(
+                            'Today',
+                            style: TextStyle(
+                              color: ink,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  FilledButton.icon(
+                    onPressed: () =>
+                        unawaited(_handleAddForDate(_webSelectedDay)),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF1B2A4E),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 12,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(24),
+                      ),
+                    ),
+                    icon: const Icon(Icons.add, size: 18),
+                    label: const Text(
+                      'Schedule',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          StableMergedListenableBuilder(
+            listenables: [_viewDateNotifier, _hearingNavRevision],
+            builder: (context, _) =>
+                _buildHearingsOutsideMonthBanner(_viewDateNotifier.value),
+          ),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final panelWidth = constraints.maxWidth >= 1180
+                      ? 300.0
+                      : 240.0;
+                  return Row(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Expanded(
+                        child: ValueListenableBuilder<DateTime>(
+                          valueListenable: _viewDateNotifier,
+                          builder: (context, viewDate, _) =>
+                              _buildWebMonthCard(viewDate),
+                        ),
+                      ),
+                      const SizedBox(width: 16),
+                      SizedBox(width: panelWidth, child: _buildWebDayPanel()),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWebMonthCard(DateTime viewDate) {
+    const labels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: const Color(0xFFF4F6FB),
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 16, 14, 12),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                for (var i = 0; i < labels.length; i++)
+                  Expanded(
+                    child: Center(
+                      child: Text(
+                        labels[i],
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: i == 6 ? sundayRed : const Color(0xFF8B95A5),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Expanded(
+              child: StableMergedListenableBuilder(
+                listenables: [_entriesRevisionNotifier],
+                builder: (context, _) {
+                  return CalendarMonthGrid(
+                    key: ValueKey(
+                      'web-month-${viewDate.year}-${viewDate.month}',
+                    ),
+                    viewDate: viewDate,
+                    isCompact: true,
+                    cellBuilder: (context, day, isCurrentMonth, isToday) {
+                      return _buildWebDayCell(
+                        day,
+                        isCurrentMonth,
+                        isToday,
+                        _getEntriesForDate(day),
+                      );
+                    },
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWebDayCell(
+    DateTime day,
+    bool isCurrentMonth,
+    bool isToday,
+    List<_AttorneyCalendarEntry> entries,
+  ) {
+    final selected = day.year == _webSelectedDay.year &&
+        day.month == _webSelectedDay.month &&
+        day.day == _webSelectedDay.day;
+    final emphasized = selected || isToday;
+    return Material(
+      color: isToday ? const Color(0xFFE7F0FF) : Colors.white,
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: () => setState(() {
+          _webSelectedDay = DateTime(day.year, day.month, day.day);
+        }),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: emphasized
+                  ? const Color(0xFF3B6FD8)
+                  : const Color(0xFFE4E8EF),
+              width: emphasized ? 1.6 : 1,
+            ),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(4, 3, 3, 2),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${day.day}',
+                  style: TextStyle(
+                    fontSize: 12,
+                    height: 1,
+                    fontWeight: isToday ? FontWeight.w700 : FontWeight.w500,
+                    color: !isCurrentMonth
+                        ? const Color(0xFFC5CAD3)
+                        : (day.weekday == DateTime.sunday
+                              ? sundayRed
+                              : const Color(0xFF1A2744)),
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Expanded(
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final layout = CalendarPerf.layoutDayCellEntries(
+                        bodyHeight: constraints.maxHeight,
+                        totalEntries: entries.length,
+                      );
+                      void selectDay() {
+                        setState(() {
+                          _webSelectedDay = DateTime(
+                            day.year,
+                            day.month,
+                            day.day,
+                          );
+                        });
+                      }
+                      if (layout.shown <= 0) {
+                        if (!layout.showMore) return const SizedBox.shrink();
+                        return _dayCellOverflowPill(entries.length, selectDay);
+                      }
+                      final chipBody =
+                          layout.chipHeight - CalendarPerf.monthCellChipGap;
+                      return Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          for (var i = 0; i < layout.shown; i++)
+                            Padding(
+                              padding: const EdgeInsets.only(
+                                bottom: CalendarPerf.monthCellChipGap,
+                              ),
+                              child: SizedBox(
+                                height: chipBody,
+                                child: _buildWebDayChip(entries[i], day),
+                              ),
+                            ),
+                          if (layout.showMore)
+                            _dayCellOverflowPill(
+                              entries.length - layout.shown,
+                              selectDay,
+                            ),
+                        ],
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWebDayChip(_AttorneyCalendarEntry entry, DateTime day) {
+    final color = _webEntryColor(entry);
+    final onGold = color == calendarGold;
+    return GestureDetector(
+      onTap: () {
+        setState(() {
+          _webSelectedDay = DateTime(day.year, day.month, day.day);
+        });
+        _showEntryDetails(entry);
+      },
+      child: Container(
+        width: double.infinity,
+        height: double.infinity,
+        alignment: Alignment.centerLeft,
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        decoration: BoxDecoration(
+          color: color,
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Text(
+          _webEntryTitle(entry),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontSize: 10,
+            height: 1.1,
+            color: onGold ? const Color(0xFF1A2744) : Colors.white,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWebDayPanel() {
+    return StableMergedListenableBuilder(
+      listenables: [_entriesRevisionNotifier],
+      builder: (context, _) {
+        final day = _webSelectedDay;
+        final entries = List<_AttorneyCalendarEntry>.from(
+          _getEntriesForDate(day),
+        )..sort(_compareEntriesLatestFirst);
+        final countLabel = entries.length == 1 ? '1 item' : '${entries.length} items';
+        return DecoratedBox(
+          decoration: BoxDecoration(
+            color: const Color(0xFFF7F8FB),
+            borderRadius: BorderRadius.circular(18),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(18, 20, 18, 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  DateFormat('EEEE, MMM d').format(day),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    color: Color(0xFF1A2744),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  countLabel,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    color: Color(0xFF8B95A5),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Expanded(
+                  child: entries.isEmpty
+                      ? const Align(
+                          alignment: Alignment.topLeft,
+                          child: Text(
+                            'Nothing scheduled',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: Color(0xFF8B95A5),
+                            ),
+                          ),
+                        )
+                      : ListView.separated(
+                          itemCount: entries.length,
+                          separatorBuilder: (_, _) => const SizedBox(height: 10),
+                          itemBuilder: (context, index) =>
+                              _buildWebEventCard(entries[index]),
+                        ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildWebEventCard(_AttorneyCalendarEntry entry) {
+    final accent = _webEntryColor(entry);
+    final kind = _webEntryKind(entry);
+    final detail = _webEntryDetail(entry);
+    final subtitle = detail.toLowerCase() == kind.toLowerCase()
+        ? '${DateFormat('h:mm a').format(entry.startTime)} · $kind'
+        : '${DateFormat('h:mm a').format(entry.startTime)} · $kind · $detail';
+    return Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: () => _showEntryDetails(entry),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          child: Row(
+            children: [
+              Container(
+                width: 4,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: accent,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _webEntryTitle(entry),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF1A2744),
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFF8B95A5),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildCalendarBody({required bool isMobile}) {
+    if (_isAttorneyWebCalendar(isMobile)) {
+      return _buildAttorneyWebCalendar();
+    }
     return Column(
       children: [
         if (widget.embedded && isMobile && widget.showTopAddButton)
@@ -2120,67 +2738,60 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       child: Container(
         width: double.infinity,
         height: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        alignment: Alignment.centerLeft,
         decoration: BoxDecoration(
           color: _getEntryColor(entry),
           borderRadius: BorderRadius.circular(4),
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          mainAxisAlignment: MainAxisAlignment.center,
-          mainAxisSize: MainAxisSize.min,
+        child: Row(
           children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    DateFormat('hh:mm a').format(entry.startTime),
-                    style: const TextStyle(
-                      fontSize: 7.5,
-                      height: 1,
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+            Expanded(
+              child: Text(
+                label,
+                style: const TextStyle(
+                  fontSize: 10,
+                  height: 1,
+                  color: Colors.white,
+                  fontWeight: FontWeight.w600,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (entry.isAiScheduled) ...[
+              const SizedBox(width: 2),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 1),
+                decoration: BoxDecoration(
+                  color: calendarGold,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+                child: const Text(
+                  'AI',
+                  style: TextStyle(
+                    fontSize: 7,
+                    height: 1,
+                    color: Colors.black87,
+                    fontWeight: FontWeight.w800,
                   ),
                 ),
-                if (entry.isAiScheduled)
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 2,
-                      vertical: 1,
-                    ),
-                    decoration: BoxDecoration(
-                      color: calendarGold,
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                    child: const Text(
-                      'AI',
-                      style: TextStyle(
-                        fontSize: 5.5,
-                        height: 1,
-                        color: Colors.black87,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-            const SizedBox(height: 1),
-            Text(
-              label,
-              style: const TextStyle(
-                fontSize: 8,
-                height: 1.05,
-                color: Colors.white,
-                fontWeight: FontWeight.w500,
               ),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
+            ],
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _dayCellOverflowPill(int hidden, VoidCallback onTap) {
+    return SizedBox(
+      height: CalendarPerf.monthCellMoreRowHeight,
+      width: double.infinity,
+      child: CalendarOverflowPill(
+        hiddenCount: hidden,
+        onTap: onTap,
+        color: calendarBlue,
       ),
     );
   }
@@ -2198,46 +2809,25 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     );
     if (layout.shown <= 0) {
       if (!layout.showMore) return const SizedBox.shrink();
-      return Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-        child: Text(
-          '+${entries.length} more',
-          style: TextStyle(fontSize: 9, color: Colors.grey[600]),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
-      );
+      return _dayCellOverflowPill(entries.length, openDay);
     }
+    final chipBody = layout.chipHeight - CalendarPerf.monthCellChipGap;
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         for (var i = 0; i < layout.shown; i++)
-          SizedBox(
-            height: layout.chipHeight,
-            child: ClipRect(
+          Padding(
+            padding: const EdgeInsets.only(
+              bottom: CalendarPerf.monthCellChipGap,
+            ),
+            child: SizedBox(
+              height: chipBody,
               child: _buildCompactDayEntry(entries[i], onOpen: openDay),
             ),
           ),
         if (layout.showMore)
-          SizedBox(
-            height: CalendarPerf.monthCellMoreRowHeight,
-            child: InkWell(
-              onTap: openDay,
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: Text(
-                    '+${entries.length - layout.shown} more',
-                    style: TextStyle(fontSize: 9, color: Colors.grey[600]),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-              ),
-            ),
-          ),
+          _dayCellOverflowPill(entries.length - layout.shown, openDay),
       ],
     );
   }
@@ -2329,46 +2919,23 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
             ),
           ),
           Expanded(
-            child: monthCellBodyHeight != null
-                ? SizedBox(
-                    height: monthCellBodyHeight,
-                    width: double.infinity,
-                    child: ClipRect(
-                      child: Align(
-                        alignment: Alignment.topLeft,
-                        child: Padding(
-                          padding: const EdgeInsets.fromLTRB(2, 0, 2, 0),
-                          child: _buildDayCellEntryColumn(
-                            entries,
-                            bodyHeight: monthCellBodyHeight,
-                            day: day,
-                          ),
-                        ),
-                      ),
-                    ),
-                  )
-                : LayoutBuilder(
-                    builder: (context, constraints) {
-                      final bodyHeight = constraints.maxHeight;
-                      return SizedBox(
-                        height: bodyHeight,
-                        width: double.infinity,
-                        child: ClipRect(
-                          child: Align(
-                            alignment: Alignment.topLeft,
-                            child: Padding(
-                              padding: const EdgeInsets.fromLTRB(2, 0, 2, 0),
-                              child: _buildDayCellEntryColumn(
-                                entries,
-                                bodyHeight: bodyHeight,
-                                day: day,
-                              ),
-                            ),
-                          ),
-                        ),
-                      );
-                    },
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final available = constraints.maxHeight;
+                final raw = available.isFinite && available > 0
+                    ? available
+                    : (monthCellBodyHeight ?? 0);
+                final bodyHeight = (raw - 2).clamp(0.0, double.infinity);
+                return Padding(
+                  padding: const EdgeInsets.fromLTRB(2, 0, 2, 2),
+                  child: _buildDayCellEntryColumn(
+                    entries,
+                    bodyHeight: bodyHeight,
+                    day: day,
                   ),
+                );
+              },
+            ),
           ),
         ],
       ),
@@ -2473,20 +3040,6 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
       return;
     }
     final ev = entry.hearingEvent;
-    if (ev != null && NotaryService.isNotaryCalendarRow(ev)) {
-      final id = (ev['notaryRequestId'] as String?)?.trim() ?? '';
-      if (id.isEmpty) return;
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => AttorneyNotaryRequestDetailScreen(
-            requestId: id,
-            actingAsStaff: widget.actingAsStaff,
-          ),
-        ),
-      );
-      return;
-    }
     if (ev != null) {
       _showHearingEventDetails(ev);
     }
@@ -2514,7 +3067,8 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     if (!mounted) return;
     // Must live outside [StatefulBuilder]'s builder — that builder re-runs on
     // every setState and would otherwise reset the list to [entries].
-    var dayEntries = List<_AttorneyCalendarEntry>.from(entries);
+    var dayEntries = List<_AttorneyCalendarEntry>.from(entries)
+      ..sort(_compareEntriesLatestFirst);
 
     final dialogMaxH = MediaQuery.sizeOf(context).height * 0.88;
 
@@ -2869,47 +3423,52 @@ class _AppointmentCalendarViewState extends State<AppointmentCalendarView> {
     );
   }
 
-  Future<void> _showHearingEventDetails(Map<String, dynamic> ev) async {
-    var display = Map<String, dynamic>.from(ev);
-    final hearingDocId = (ev['hearingDocId'] as String?)?.trim() ?? '';
-    if (hearingDocId.isNotEmpty) {
-      try {
-        final snap = await _firestore
-            .collection('hearings')
-            .doc(hearingDocId)
-            .get();
-        if (snap.exists && snap.data() != null) {
-          final hd = snap.data()!;
-          final caseMaps = <Map<String, dynamic>>[];
-          final caseId = (hd['caseId'] as String?)?.trim() ?? '';
-          if (caseId.isNotEmpty) {
-            final caseSnap = await _firestore
-                .collection('cases')
-                .doc(caseId)
-                .get();
-            if (caseSnap.exists && caseSnap.data() != null) {
-              caseMaps.add({'id': caseSnap.id, ...caseSnap.data()!});
-            }
-          }
-          final cn = (hd['caseNo'] as String?)?.trim() ?? '';
-          final siblings = _hearingSiblingsForCase(cn);
-          display = await HearingCalendarFields.loadMergedHearingForDisplay(
-            hearingDocId: hearingDocId,
-            hearingData: hd,
-            caseMaps: caseMaps,
-            siblingRows: siblings,
-          );
-          display['hearingDocId'] = hearingDocId;
-          display['readOnly'] = true;
-          display['eventType'] = 'hearing';
-          display['source'] =
-              ev['source'] as String? ?? HearingCalendarSyncService.sourceTag;
-        }
-      } catch (_) {
-        /* keep calendar_event snapshot */
+  void _showHearingEventDetails(Map<String, dynamic> ev) {
+    final display = Map<String, dynamic>.from(ev);
+    var hearingDocId = (ev['hearingDocId'] as String?)?.trim() ?? '';
+    if (hearingDocId.isEmpty) {
+      final id = (ev['id'] as String?)?.trim() ?? '';
+      if (id.startsWith('live_hearing_')) {
+        hearingDocId = id.substring('live_hearing_'.length);
       }
     }
-    if (!mounted) return;
+    if (hearingDocId.isEmpty) {
+      final did = (ev['docId'] as String?)?.trim() ?? '';
+      if (did.isNotEmpty) {
+        hearingDocId = did;
+      }
+    }
+    if (hearingDocId.isNotEmpty) {
+      display['hearingDocId'] = hearingDocId;
+    }
+    final rawCaseNo = HearingCalendarFields.asDisplayString(display['caseNo']).isNotEmpty
+        ? HearingCalendarFields.asDisplayString(display['caseNo'])
+        : HearingCalendarFields.asDisplayString(display['caseNumber']);
+    final cleanNo = HearingCalendarFields.cleanCaseDocketNo(rawCaseNo);
+    if (cleanNo.isNotEmpty && !HearingCalendarFields.isPlaceholderCaseNo(cleanNo)) {
+      display['caseNo'] = cleanNo;
+    }
+    final rawTitle = HearingCalendarFields.asDisplayString(display['caseTitle']);
+    if (!HearingCalendarFields.hasCaseCaptionMarker(rawTitle)) {
+      final resolvedTitle = HearingCalendarFields.resolveCaseTitleForDisplay(display);
+      if (resolvedTitle.isNotEmpty && HearingCalendarFields.hasCaseCaptionMarker(resolvedTitle)) {
+        display['caseTitle'] = resolvedTitle;
+      }
+    }
+    final resolvedClient = HearingCalendarFields.resolveClientForDisplay(display);
+    if (resolvedClient.isNotEmpty) {
+      display['clientName'] = resolvedClient;
+    }
+    final venue = HearingCalendarFields.resolveVenueForDisplay(display);
+    if (venue.isNotEmpty) {
+      display['location'] = venue;
+    }
+    display['readOnly'] = true;
+    display['eventType'] = 'hearing';
+    display['source'] =
+        ev['source'] as String? ?? HearingCalendarSyncService.sourceTag;
+
+    // Display immediately with zero latency.
     _showHearingEventDetailsDialog(display);
   }
 

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../models/case_model.dart';
+import '../../utils/case_status_filter.dart';
 import '../../services/admin_service.dart';
 import '../../services/case_service.dart';
 import '../../pages/case/case_detail_page.dart';
@@ -97,7 +98,7 @@ class _CaseOversightScreenState extends State<CaseOversightScreen> {
           final raw = snapshot.data ?? [];
           final cases = raw
               .where(
-                (c) => c.status == 'in_progress' || c.status == 'active',
+                (c) => !CaseStatusFilter.isCompleted(c.status),
               )
               .toList();
           return _buildCasesList(_filterCases(cases));

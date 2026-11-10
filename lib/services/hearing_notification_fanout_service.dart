@@ -9,10 +9,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../utils/hearing_notification_formatter.dart';
 import '../utils/out_of_system_notice.dart';
 import 'hearing_calendar_fields.dart';
+import 'hearing_calendar_sync_service.dart';
 import 'fcm_service.dart';
 import 'hearing_sms_alert_service.dart';
 import 'staff_application_service.dart';
 import 'firestore_mirror_helper.dart';
+import 'attorney_inbox_read_store.dart';
+import 'hearing_party_names.dart';
+import 'supabase_service.dart';
 
 /// Inbox / fan-out must not spam the console when switching attorney tabs.
 void _fanoutLog(String message) {}
@@ -104,7 +108,9 @@ class HearingNotificationFanoutService {
 
   /// Throttle client hearing sync so read notifications are not constantly re-merged.
   static final Map<String, DateTime> _lastClientSyncAt = <String, DateTime>{};
-  static const _clientSyncMinInterval = Duration(minutes: 5);
+  static final Map<String, Future<void>> _clientSyncInFlight =
+      <String, Future<void>>{};
+  static const _clientSyncMinInterval = Duration(seconds: 20);
 
   /// Throttle firm inbox backfill (opening Reminders used to fan out 20+ hearings every time).
   static final Map<String, DateTime> _lastInboxSyncAt = <String, DateTime>{};
@@ -115,7 +121,7 @@ class HearingNotificationFanoutService {
       <String, Timer>{};
 
   /// Bump when matching logic changes so older hearings can fan out again (doc IDs are stable; merge avoids dup spam).
-  static const _prefsKey = 'hearing_inapp_fanout_ids_v9';
+  static const _prefsKey = 'hearing_inapp_fanout_ids_v10';
   final Set<String> _webClientPublishedHearingIds = <String>{};
   static const _inboxReadHearingsKeyPrefix = 'inbox_read_hearing_ids_v1_';
   static const _maxIds = 1500;
@@ -350,6 +356,12 @@ class HearingNotificationFanoutService {
     _inboxBundle(userId).seedRows(clean, attachListeners: false);
     _cacheBellCount(userId, clean);
     _markInboxFresh(userId);
+
+    // Synchronize AttorneyInboxReadStore and attorney unread bell notifier
+    AttorneyInboxReadStore.instance.syncFromRows(clean);
+    final count = AttorneyInboxReadStore.instance.unreadCount.value;
+    _setAttorneyUnreadNotifBell(userId, count);
+    _setBellCount(userId, count);
   }
 
   int _unreadNotificationBellCount(List<HearingInboxRow> rows) {
@@ -389,7 +401,11 @@ class HearingNotificationFanoutService {
   }
 
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _attorneyBellSub;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _attorneyBellSub2;
   String? _attorneyBellUid;
+  Timer? _attorneyBellDebounce;
+  bool _isRefreshingBell = false;
+  DateTime? _lastAttorneyBellRefreshTime;
   final Map<String, ValueNotifier<int>> _attorneyUnreadNotifBell =
       <String, ValueNotifier<int>>{};
 
@@ -408,73 +424,296 @@ class HearingNotificationFanoutService {
     if (vn.value != v) vn.value = v;
   }
 
-  /// One Firestore listener per attorney. Badge = unread notification docs only.
+  /// Schedule a debounced bell refresh to avoid UI freezes/query flood.
+  void scheduleAttorneyBellRefresh(String userId) {
+    if (userId.isEmpty) return;
+    _attorneyBellDebounce?.cancel();
+    _attorneyBellDebounce = Timer(const Duration(milliseconds: 2500), () {
+      unawaited(refreshAttorneyBellFromNotifications(userId));
+    });
+  }
+
+  /// Firestore listeners for attorney bell. Safe and debounced.
   void attachAttorneyBellWatcher(String userId) {
     if (userId.isEmpty) return;
     if (_attorneyBellUid == userId && _attorneyBellSub != null) return;
     unawaited(_attorneyBellSub?.cancel());
+    unawaited(_attorneyBellSub2?.cancel());
+    _attorneyBellDebounce?.cancel();
     _attorneyBellUid = userId;
     _attorneyBellSub = null;
+    _attorneyBellSub2 = null;
 
-    void apply(QuerySnapshot<Map<String, dynamic>> snap) {
-      _setAttorneyUnreadNotifBell(
-        userId,
-        _countAttorneyBellFromNotifDocs(snap.docs),
-      );
+    int unread1 = 0;
+    int unread2 = 0;
+
+    void updateBellCount() {
+      final total = unread1 + unread2;
+      _setAttorneyUnreadNotifBell(userId, total);
+      _setBellCount(userId, total);
+      if (AttorneyInboxReadStore.instance.unreadCount.value != total) {
+        AttorneyInboxReadStore.instance.unreadCount.value = total;
+      }
     }
 
     Query<Map<String, dynamic>> unreadQuery() => _db
         .collection('notifications')
         .where('userId', isEqualTo: userId)
         .where('isRead', isEqualTo: false)
-        .limit(99);
+        .orderBy('createdAt', descending: true)
+        .limit(20);
 
     Query<Map<String, dynamic>> fallbackQuery() => _db
         .collection('notifications')
         .where('userId', isEqualTo: userId)
-        .limit(120);
+        .limit(20);
 
-    _attorneyBellSub = unreadQuery().snapshots().listen(
-      apply,
-      onError: (_) {
-        unawaited(_attorneyBellSub?.cancel());
-        _attorneyBellSub = fallbackQuery().snapshots().listen(
-          apply,
-          onError: (_) {
-            unawaited(refreshAttorneyBellFromNotifications(userId));
-          },
-        );
-        unawaited(refreshAttorneyBellFromNotifications(userId));
-      },
-    );
-    unawaited(refreshAttorneyBellFromNotifications(userId));
+    try {
+      _attorneyBellSub = unreadQuery().snapshots().listen(
+        (snap) {
+          unread1 = snap.docs.where((d) => d.data()['isRead'] != true).length;
+          updateBellCount();
+        },
+        onError: (_) {
+          unawaited(_attorneyBellSub?.cancel());
+          _attorneyBellSub = fallbackQuery().snapshots().listen(
+            (snap) {
+              unread1 = snap.docs.where((d) => d.data()['isRead'] != true).length;
+              updateBellCount();
+            },
+            onError: (_) {},
+          );
+        },
+      );
+    } catch (_) {}
+
+    // Also watch notifications sent with attorneyId == userId
+    try {
+      _attorneyBellSub2 = _db
+          .collection('notifications')
+          .where('attorneyId', isEqualTo: userId)
+          .where('isRead', isEqualTo: false)
+          .limit(20)
+          .snapshots()
+          .listen(
+            (snap) {
+              unread2 = snap.docs.where((d) => d.data()['isRead'] != true).length;
+              updateBellCount();
+            },
+            onError: (_) {},
+          );
+    } catch (_) {}
   }
 
-  Future<int> refreshAttorneyBellFromNotifications(String userId) async {
+  Future<int> refreshAttorneyBellFromNotifications(
+    String userId, {
+    bool force = false,
+  }) async {
     if (userId.isEmpty) return 0;
+    if (_isRefreshingBell) {
+      return attorneyUnreadNotificationBellListenable(userId).value;
+    }
+    final now = DateTime.now();
+    final minInterval = kIsWeb ? const Duration(minutes: 3) : const Duration(seconds: 15);
+    if (!force &&
+        _lastAttorneyBellRefreshTime != null &&
+        now.difference(_lastAttorneyBellRefreshTime!) < minInterval) {
+      return attorneyUnreadNotificationBellListenable(userId).value;
+    }
+    _isRefreshingBell = true;
+    _lastAttorneyBellRefreshTime = now;
     try {
-      QuerySnapshot<Map<String, dynamic>> snap;
-      try {
-        snap = await _db
-            .collection('notifications')
-            .where('userId', isEqualTo: userId)
-            .where('isRead', isEqualTo: false)
-            .limit(99)
-            .get()
-            .timeout(const Duration(seconds: 8));
-      } catch (_) {
-        snap = await _db
-            .collection('notifications')
-            .where('userId', isEqualTo: userId)
-            .limit(120)
-            .get()
-            .timeout(const Duration(seconds: 8));
+      await _ensureReadHearingIdsLoaded(userId);
+      await AttorneyInboxReadStore.instance.ensureLoaded(userId);
+      final readHearingIds = peekReadHearingIds(userId);
+
+      final seenKeys = <String>{};
+      var unreadCount = 0;
+
+      bool isRowRead(HearingInboxRow row) {
+        if (AttorneyInboxReadStore.instance.isRead(row)) return true;
+        final hid = (row.data['hearingDocId'] as String?)?.trim() ?? '';
+        if (readHearingIds.contains(row.rowKey)) return true;
+        if (hid.isNotEmpty &&
+            (readHearingIds.contains(hid) ||
+                readHearingIds.contains('hearing_$hid'))) {
+          return true;
+        }
+        if (row.notificationDocId != null &&
+            row.notificationDocId!.isNotEmpty &&
+            readHearingIds.contains(row.notificationDocId)) {
+          return true;
+        }
+        return false;
       }
-      final n = _countAttorneyBellFromNotifDocs(snap.docs);
-      _setAttorneyUnreadNotifBell(userId, n);
-      return n;
+
+      void processNotifDocs(Iterable<QueryDocumentSnapshot<Map<String, dynamic>>> docs) {
+        for (final doc in docs) {
+          if (!seenKeys.add(doc.id)) continue;
+          final data = doc.data();
+          if (data['isRead'] == true) continue;
+          final type = (data['type'] as String? ?? '').toLowerCase();
+          if (type == 'attorney_inbox_ack' || type == 'attorney_read_keys') continue;
+          if (isHearingRecordUpdateNotification(data)) continue;
+          if (HearingCalendarFields.isNonCourtHearingSpam(data)) continue;
+          if (type == 'court_email_ingest') continue;
+          if (type.startsWith('court_') && !type.contains('hearing')) continue;
+          final row = HearingInboxRow(
+            rowKey: doc.id,
+            notificationDocId: doc.id,
+            data: data,
+            sortTime: DateTime.now(),
+          );
+          if (!isRowRead(row)) {
+            unreadCount++;
+          }
+        }
+      }
+
+      // 1. notifications for userId
+      try {
+        final snap = await _db
+            .collection('notifications')
+            .where('userId', isEqualTo: userId)
+            .limit(kIsWeb ? 20 : 80)
+            .get()
+            .timeout(const Duration(seconds: 4));
+        processNotifDocs(snap.docs);
+      } catch (_) {}
+
+      // 2. notifications for attorneyId
+      try {
+        final snap = await _db
+            .collection('notifications')
+            .where('attorneyId', isEqualTo: userId)
+            .limit(kIsWeb ? 20 : 80)
+            .get()
+            .timeout(const Duration(seconds: 4));
+        processNotifDocs(snap.docs);
+      } catch (_) {}
+
+      // 3. hearing_notifications for attorneyId
+      try {
+        final snap = await _db
+            .collection('hearing_notifications')
+            .where('attorneyId', isEqualTo: userId)
+            .limit(kIsWeb ? 20 : 40)
+            .get()
+            .timeout(const Duration(seconds: 4));
+        for (final doc in snap.docs) {
+          if (!seenKeys.add('hn_${doc.id}')) continue;
+          final data = doc.data();
+          if (data['isRead'] == true || data['status'] == 'sent') continue;
+          if (HearingCalendarFields.isNonCourtHearingSpam(data)) continue;
+          final row = HearingInboxRow(
+            rowKey: 'hn_${doc.id}',
+            notificationDocId: doc.id,
+            data: data,
+            sortTime: DateTime.now(),
+          );
+          if (!isRowRead(row)) {
+            unreadCount++;
+          }
+        }
+      } catch (_) {}
+
+      // 4. hearings specifically assigned to this attorney (skipped on Web to prevent UI freeze)
+      if (!kIsWeb) {
+        try {
+          final hearingsSnaps = await Future.wait([
+            _db
+                .collection('hearings')
+                .where('attorneyUid', isEqualTo: userId)
+                .limit(40)
+                .get()
+                .catchError((_) => _db.collection('hearings').limit(0).get()),
+            _db
+                .collection('hearings')
+                .where('attorneyId', isEqualTo: userId)
+                .limit(40)
+                .get()
+                .catchError((_) => _db.collection('hearings').limit(0).get()),
+          ]).timeout(const Duration(seconds: 4));
+
+          for (final snap in hearingsSnaps) {
+            for (final doc in snap.docs) {
+              if (!seenKeys.add('hearing_${doc.id}')) continue;
+              final hd = doc.data();
+              if (!HearingNotificationFanoutService.isDisplayableHearingRow(hd)) continue;
+              if (HearingCalendarFields.isNonCourtHearingSpam(hd)) continue;
+              final row = HearingInboxRow(
+                rowKey: 'hearing_${doc.id}',
+                notificationDocId: null,
+                data: {
+                  ...hd,
+                  'hearingDocId': doc.id,
+                },
+                sortTime: DateTime.now(),
+              );
+              if (!isRowRead(row)) {
+                unreadCount++;
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
+      // 5. hearing_reminder_jobs (matches AttorneyRemindersScreen, skipped on Web to prevent UI freeze)
+      if (!kIsWeb) {
+        try {
+          QuerySnapshot<Map<String, dynamic>> jobsSnap;
+          try {
+            jobsSnap = await _db
+                .collection('hearing_reminder_jobs')
+                .orderBy('createdAt', descending: true)
+                .limit(80)
+                .get()
+                .timeout(const Duration(seconds: 4));
+          } catch (_) {
+            jobsSnap = await _db
+                .collection('hearing_reminder_jobs')
+                .limit(80)
+                .get()
+                .timeout(const Duration(seconds: 4));
+          }
+          for (final doc in jobsSnap.docs) {
+            final jd = doc.data();
+            final hid = HearingCalendarFields.asDisplayString(jd['hearingDocId']);
+            if (hid.isEmpty) continue;
+            if (!seenKeys.add('hearing_$hid')) continue;
+            final snapMap = (jd['snapshot'] is Map)
+                ? Map<String, dynamic>.from(jd['snapshot'] as Map)
+                : <String, dynamic>{};
+            if (HearingCalendarFields.isNonCourtHearingSpam(snapMap)) continue;
+            final row = HearingInboxRow(
+              rowKey: 'hearing_$hid',
+              notificationDocId: null,
+              data: {
+                'hearingDocId': hid,
+                ...snapMap,
+                'isRead': false,
+              },
+              sortTime: DateTime.now(),
+            );
+            if (!isRowRead(row)) {
+              unreadCount++;
+            }
+          }
+        } catch (_) {}
+      }
+
+      final finalCount = unreadCount;
+
+      _setAttorneyUnreadNotifBell(userId, finalCount);
+      _setBellCount(userId, finalCount);
+      if (AttorneyInboxReadStore.instance.unreadCount.value != finalCount) {
+        AttorneyInboxReadStore.instance.unreadCount.value = finalCount;
+      }
+      return finalCount;
     } catch (_) {
       return attorneyUnreadNotificationBellListenable(userId).value;
+    } finally {
+      _isRefreshingBell = false;
     }
   }
 
@@ -524,9 +763,12 @@ class HearingNotificationFanoutService {
     }
     if (all) {
       _setBellCount(userId, 0);
+      _setAttorneyUnreadNotifBell(userId, 0);
     } else if (!patchedAny) {
       final n = _bellCountMem[userId] ?? 0;
-      _setBellCount(userId, n > 0 ? n - 1 : 0);
+      final next = n > 0 ? n - 1 : 0;
+      _setBellCount(userId, next);
+      _setAttorneyUnreadNotifBell(userId, next);
     }
   }
 
@@ -1200,9 +1442,6 @@ class HearingNotificationFanoutService {
       'involvedClientIds': FieldValue.arrayUnion(clientUids.toList()),
       'matchedClientIds': FieldValue.arrayUnion(clientUids.toList()),
     };
-    if (clientUids.length == 1) {
-      link['ownerClientId'] = clientUids.first;
-    }
     final cid = caseId?.trim() ?? '';
     if (cid.isNotEmpty && (firmMaySetCaseId || clientUids.length == 1)) {
       link['caseId'] = cid;
@@ -1235,7 +1474,7 @@ class HearingNotificationFanoutService {
         }
       } catch (_) {}
     }
-    final caseNo = (d['caseNo'] as String?)?.trim() ?? '';
+    final caseNo = HearingCalendarFields.fieldAsDisplayString(d, 'caseNo');
     if (caseNo.isEmpty) return null;
     try {
       final cq = await _db
@@ -1331,7 +1570,7 @@ class HearingNotificationFanoutService {
       }
     }
 
-    final caseNo = (d['caseNo'] as String?)?.trim() ?? '';
+    final caseNo = HearingCalendarFields.fieldAsDisplayString(d, 'caseNo');
     if (caseNo.isEmpty) return null;
 
     final variants = _caseNumberQueryVariants(caseNo);
@@ -1421,7 +1660,7 @@ class HearingNotificationFanoutService {
   Future<({String id, String title})?> _resolveCaseByListenerAttorney(
     Map<String, dynamic> d,
   ) async {
-    final caseNo = (d['caseNo'] as String?)?.trim() ?? '';
+    final caseNo = HearingCalendarFields.fieldAsDisplayString(d, 'caseNo');
     if (caseNo.isEmpty) return null;
 
     final uid = FirebaseAuth.instance.currentUser?.uid;
@@ -1524,8 +1763,8 @@ class HearingNotificationFanoutService {
   }
 
   static bool _isImportedCourtRow(Map<String, dynamic> d) {
-    final cn = (d['caseNo'] as String?)?.trim() ?? '';
-    final ft = (d['fullText'] as String?)?.trim() ?? '';
+    final cn = HearingCalendarFields.fieldAsDisplayString(d, 'caseNo');
+    final ft = HearingCalendarFields.fieldAsDisplayString(d, 'fullText');
     return cn.isNotEmpty && ft.isNotEmpty;
   }
 
@@ -1585,13 +1824,14 @@ class HearingNotificationFanoutService {
   /// Values safe for Firestore `clientName ==` queries (must match profile field text).
   static Set<String> _clientNameFirestoreQueryVariants(Map<String, dynamic> ud) {
     final out = <String>{};
-    for (final field in ['fullName', 'name', 'displayName']) {
-      final v = (ud[field] as String?)?.trim();
-      if (v == null || v.isEmpty) continue;
+    void addVariants(String? raw) {
+      final v = raw?.trim();
+      if (v == null || v.isEmpty) return;
       final t = _normalizeCaseRefWhitespace(v);
+      if (t.isEmpty) return;
       out.add(t);
-      out.add(t.toLowerCase());
       out.add(t.toUpperCase());
+      out.add(t.toLowerCase());
       final titled = t
           .split(' ')
           .map((w) {
@@ -1601,6 +1841,23 @@ class HearingNotificationFanoutService {
           })
           .join(' ');
       out.add(titled);
+    }
+
+    final first = (ud['firstName'] as String?)?.trim() ?? '';
+    final last = (ud['lastName'] as String?)?.trim() ?? '';
+    if (first.isNotEmpty && last.isNotEmpty) {
+      addVariants('$first $last');
+    }
+    for (final field in ['fullName', 'name', 'displayName']) {
+      final raw = (ud[field] as String?)?.trim() ?? '';
+      addVariants(raw);
+      final words = _normalizeCaseRefWhitespace(raw)
+          .split(' ')
+          .where((w) => w.isNotEmpty)
+          .toList();
+      if (words.length >= 3) {
+        addVariants('${words.first} ${words.last}');
+      }
     }
     return out;
   }
@@ -1646,13 +1903,23 @@ class HearingNotificationFanoutService {
       'namely',
       'vs',
       'versus',
+      'people',
+      'philippines',
+      'republic',
     };
     return _normalizeCaseRefWhitespace(raw)
         .toLowerCase()
         .split(RegExp(r'\s+'))
         .map((w) => w.replaceAll(RegExp(r'[^a-z0-9]'), ''))
-        .where((w) => w.length >= 3 && !skip.contains(w))
+        .where((w) => w.length >= 2 && !skip.contains(w))
         .toList();
+  }
+
+  static bool _textContainsWord(String haystackLower, String wordLower) {
+    if (wordLower.isEmpty || haystackLower.isEmpty) return false;
+    return RegExp(
+      '(?:^|[^a-z0-9])${RegExp.escape(wordLower)}(?:[^a-z0-9]|\$)',
+    ).hasMatch(haystackLower);
   }
 
   static bool _partyMatchesStoredName(String stored, String party) {
@@ -1662,12 +1929,14 @@ class HearingNotificationFanoutService {
     if (storedNorm.toLowerCase() == partyNorm.toLowerCase()) return true;
     final storedWords = _significantNameWords(stored);
     final partyWords = _significantNameWords(party);
+    final storedLower = storedNorm.toLowerCase();
+    final partyLower = partyNorm.toLowerCase();
     if (partyWords.length >= 2 &&
-        partyWords.every((w) => storedNorm.toLowerCase().contains(w))) {
+        partyWords.every((w) => _textContainsWord(storedLower, w))) {
       return true;
     }
     if (storedWords.length >= 2 &&
-        storedWords.every((w) => partyNorm.toLowerCase().contains(w))) {
+        storedWords.every((w) => _textContainsWord(partyLower, w))) {
       return true;
     }
     if (partyWords.length >= 2 &&
@@ -1684,6 +1953,11 @@ class HearingNotificationFanoutService {
     String hearingClientName,
   ) {
     if (_partyMatchesStoredName(stored, hearingClientName)) return true;
+    final strippedWhole = HearingPartyNames.stripRoles(hearingClientName);
+    if (strippedWhole.isNotEmpty &&
+        _partyMatchesStoredName(stored, strippedWhole)) {
+      return true;
+    }
     for (final party in HearingCalendarFields.splitHearingPartyNames(
       hearingClientName,
     )) {
@@ -1701,7 +1975,9 @@ class HearingNotificationFanoutService {
       parts.add(t);
     }
 
-    add(d['clientName'] as String?);
+    add(HearingCalendarFields.fieldAsDisplayString(d, 'clientName'));
+    add(HearingCalendarFields.fieldAsDisplayString(d, 'clientFullName'));
+    add(HearingCalendarFields.fieldAsDisplayString(d, 'opposingParty'));
     for (final key in ['involvedPartyNames', 'involvedParties']) {
       final raw = d[key];
       if (raw is List) {
@@ -1710,19 +1986,55 @@ class HearingNotificationFanoutService {
         }
       }
     }
+    final captionCandidates = <String>{
+      HearingCalendarFields.fieldAsDisplayString(d, 'caseTitle'),
+      HearingCalendarFields.fieldAsDisplayString(d, 'title'),
+      HearingCalendarFields.resolveCaseTitleForDisplay(d),
+    };
+    final vs = RegExp(
+      r'\s+(?:vs\.?|versus|v\.)\s+',
+      caseSensitive: false,
+    );
+    for (final ct in captionCandidates) {
+      if (ct.isEmpty) continue;
+      if (vs.hasMatch(ct)) {
+        for (final p in ct.split(vs)) {
+          final cleaned = HearingPartyNames.stripRoles(p);
+          final low = cleaned.toLowerCase();
+          if (cleaned.isNotEmpty &&
+              !low.contains('people of the philippines') &&
+              low != 'people') {
+            add(cleaned);
+          }
+        }
+      } else if (ct == HearingCalendarFields.fieldAsDisplayString(d, 'caseTitle')) {
+        final cleaned = HearingPartyNames.stripRoles(ct);
+        if (cleaned.isNotEmpty && !cleaned.toLowerCase().contains('people')) {
+          add(cleaned);
+        }
+      }
+    }
     return parts.join(', ');
   }
 
-  /// Resolve client user IDs from [d]['clientName'] (each party, not the whole blob).
+  /// Resolve client user IDs from [d]['clientName'] / caption / order text.
   Future<Set<String>> _resolveClientUidsFromHearingName(
     Map<String, dynamic> d,
   ) async {
     final clientName = _hearingClientNameBlob(d);
-    if (clientName.isEmpty) return {};
+    final hasOrderText =
+        HearingCalendarFields.fieldAsDisplayString(d, 'fullText').isNotEmpty ||
+        HearingCalendarFields.fieldAsDisplayString(d, 'message').isNotEmpty ||
+        HearingCalendarFields.fieldAsDisplayString(d, 'description').isNotEmpty;
+    if (clientName.isEmpty && !hasOrderText) return {};
 
     final matched = <String>{};
-    final parties = HearingCalendarFields.splitHearingPartyNames(clientName);
-    final queryNames = parties.isEmpty ? [clientName] : parties;
+    final parties = clientName.isEmpty
+        ? const <String>[]
+        : HearingCalendarFields.splitHearingPartyNames(clientName);
+    final queryNames = clientName.isEmpty
+        ? const <String>[]
+        : (parties.isEmpty ? [clientName] : parties);
 
     for (final party in queryNames.take(12)) {
       final nameKeys = _clientNameMatchVariants(party);
@@ -1738,6 +2050,26 @@ class HearingNotificationFanoutService {
               final role = (u.data()['role'] as String?)?.toLowerCase() ?? '';
               if (role != 'client') continue;
               matched.add(u.id);
+            }
+          } catch (_) {}
+        }
+      }
+      final words = _significantNameWords(party);
+      if (words.length >= 2) {
+        for (final fnVariant in _clientNameMatchVariants(words.first).take(3)) {
+          try {
+            final uq = await _db
+                .collection('users')
+                .where('firstName', isEqualTo: fnVariant)
+                .limit(20)
+                .get();
+            for (final u in uq.docs) {
+              final uData = u.data();
+              final role = (uData['role'] as String?)?.toLowerCase() ?? '';
+              if (role != 'client') continue;
+              if (hearingDocMatchesClientProfile(d, uData)) {
+                matched.add(u.id);
+              }
             }
           } catch (_) {}
         }
@@ -1815,11 +2147,80 @@ class HearingNotificationFanoutService {
     }
   }
 
+  /// One browser claims the retry so several open dashboards do not each text
+  /// and push the same hearing. Shares [fcmPushClaimedAt] with Cloud Functions.
+  Future<bool> _claimMissingDevicePush(String hearingId) async {
+    final ref = _db.collection('hearings').doc(hearingId);
+    try {
+      return await _db.runTransaction((tx) async {
+        final snap = await tx.get(ref);
+        final data = snap.data() ?? const <String, dynamic>{};
+        if (data['fcmDeliveredAt'] != null) return false;
+        if (data['fcmMobileDeliveredAt'] != null) return false;
+        if (data['fcmPushClaimedAt'] != null) return false;
+        if (data['devicePushClaimedAt'] != null) return false;
+        tx.set(ref, {
+          'fcmPushClaimedAt': FieldValue.serverTimestamp(),
+          'devicePushClaimedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+        return true;
+      });
+    } catch (e) {
+      if (kDebugMode) {
+        _fanoutLog('HearingNotificationFanout claim push $hearingId: $e');
+      }
+      return false;
+    }
+  }
+
   static const _devicePushPrefsKey = 'hearing_device_push_ids_v1';
+  static const _phonePushPrefsKey = 'hearing_phone_push_ids_v1';
   final Set<String> _devicePushQueued = <String>{};
 
-  /// The server skips a second import of the same case, so the row can show
-  /// with no phone push. Queue FCM when no notification was written.
+  Map<String, String> _hearingFcmData({
+    required String hearingId,
+    required Map<String, dynamic> hearingData,
+    required String title,
+    required String body,
+    String reminderKind = '',
+  }) {
+    final enriched = HearingCalendarFields.enrichForAlerts(hearingData);
+    return {
+      'type': 'hearing_activity',
+      'hearingDocId': hearingId,
+      'title': title,
+      'body': body,
+      'caseNo': HearingCalendarFields.asDisplayString(enriched['caseNo']),
+      'caseTitle': HearingCalendarFields.asDisplayString(enriched['caseTitle']),
+      'clientName': HearingCalendarFields.asDisplayString(enriched['clientName']),
+      'hearingDate': HearingCalendarFields.hearingFieldAsString(
+        enriched,
+        'hearingDate',
+      ),
+      'hearingTime': HearingCalendarFields.hearingFieldAsString(
+        enriched,
+        'hearingTime',
+      ),
+      'location': _hearingLocationForPush(enriched),
+      'courtBranch': HearingCalendarFields.asDisplayString(
+        enriched['courtBranch'],
+      ),
+      if (reminderKind.isNotEmpty) 'reminderKind': reminderKind,
+    };
+  }
+
+  String _hearingLocationForPush(Map<String, dynamic> enriched) {
+    final venue = HearingCalendarFields.resolveVenueForDisplay(enriched);
+    if (venue.isNotEmpty && !HearingCalendarFields.isBareLocation(venue)) {
+      return venue;
+    }
+    final loc = HearingCalendarFields.asDisplayString(enriched['location']);
+    if (loc.isNotEmpty) return loc;
+    return HearingCalendarFields.asDisplayString(enriched['courtBranch']);
+  }
+
+  /// Hearing or order in the notification bell: push the phone and send SMS now.
+  /// Skipped when that push or text was already delivered.
   Future<void> queueDevicePushIfMissing(
     String hearingId,
     Map<String, dynamic> hearingData,
@@ -1828,34 +2229,74 @@ class HearingNotificationFanoutService {
     if (id.isEmpty || !isDisplayableHearingRow(hearingData)) return;
     if (!_devicePushQueued.add(id)) return;
 
-    final created = hearingData['createdAt'] is Timestamp
-        ? (hearingData['createdAt'] as Timestamp).toDate()
-        : DateTime.tryParse('${hearingData['createdAt'] ?? ''}');
-    final age = created == null
-        ? const Duration(hours: 1)
-        : DateTime.now().difference(created);
-    if (age > const Duration(hours: 12)) return;
-    if (age < const Duration(seconds: 70)) {
-      _devicePushQueued.remove(id);
-      unawaited(
-        Future<void>.delayed(const Duration(seconds: 70) - age, () {
-          return queueDevicePushIfMissing(id, hearingData);
-        }),
-      );
-      return;
-    }
-
     try {
+      // Web Chrome already shows the Cloud Function webpush card. Sending again
+      // from the open dashboard created a second push with different text.
+      if (kIsWeb) {
+        // Push is CF/webpush; still recover SMS if intake never left.
+        final webSnap = await _db.collection('hearings').doc(id).get();
+        final webData = webSnap.data() ?? hearingData;
+        await _sendHearingSmsIfNeeded(
+          id,
+          webData,
+          (await _activeAttorneyAndStaffIds()).toList(),
+        );
+        return;
+      }
+
       final prefs = await SharedPreferences.getInstance();
       final sent = prefs.getStringList(_devicePushPrefsKey) ?? <String>[];
-      if (sent.contains(id)) return;
+      final phoneSentIds =
+          prefs.getStringList(_phonePushPrefsKey) ?? <String>[];
 
-      final existing = await _db
-          .collection('notifications')
-          .where('hearingDocId', isEqualTo: id)
-          .limit(1)
-          .get();
-      if (existing.docs.isNotEmpty) {
+      final fresh = await _db.collection('hearings').doc(id).get();
+      final freshData = fresh.data() ?? hearingData;
+      // Push claim/delivery only — SMS uses philsms* flags separately.
+      bool pushAlreadyClaimed(Map<String, dynamic> data) =>
+          data['fcmPushClaimedAt'] != null ||
+          data['fcmDeliveredAt'] != null ||
+          data['fcmMobileDeliveredAt'] != null ||
+          data['devicePushClaimedAt'] != null;
+      // Give Cloud Functions time to claim + send the one hearing push.
+      if (!pushAlreadyClaimed(freshData)) {
+        await Future<void>.delayed(const Duration(seconds: 8));
+      }
+      final again = await _db.collection('hearings').doc(id).get();
+      final claimedData = again.data() ?? freshData;
+      // The Cloud Function sends the one phone push and the SMS together.
+      // A second send from the open app was a second card with different text.
+      if (pushAlreadyClaimed(claimedData)) {
+        await _sendHearingSmsIfNeeded(id, claimedData, (await _activeAttorneyAndStaffIds()).toList());
+        return;
+      }
+      final enriched = HearingCalendarFields.enrichForAlerts(
+        again.data() ?? freshData,
+      );
+      final caseNo = HearingCalendarFields.asDisplayString(enriched['caseNo']);
+      final title = HearingNotificationFormatter.buildPopupTitle(
+        enriched,
+        fallback: caseNo.isNotEmpty
+            ? 'Court hearing / order — $caseNo'
+            : 'Court hearing / order',
+      );
+      final body = HearingCalendarFields.pushHearingContext(enriched);
+      final ids = await _activeAttorneyAndStaffIds();
+      final mobileDone = freshData['fcmMobileDeliveredAt'] != null ||
+          freshData['fcmDeliveredAt'] != null ||
+          claimedData['fcmDeliveredAt'] != null ||
+          sent.contains(id) ||
+          phoneSentIds.contains(id);
+      if (mobileDone) {
+        if (!sent.contains(id)) sent.insert(0, id);
+        await prefs.setStringList(
+          _devicePushPrefsKey,
+          sent.length > 200 ? sent.sublist(0, 200) : sent,
+        );
+        await _sendHearingSmsIfNeeded(id, freshData, ids.toList());
+        return;
+      }
+      final claimed = await _claimMissingDevicePush(id);
+      if (!claimed) {
         sent.insert(0, id);
         await prefs.setStringList(
           _devicePushPrefsKey,
@@ -1864,49 +2305,104 @@ class HearingNotificationFanoutService {
         return;
       }
 
-      final caseNo = HearingCalendarFields.asDisplayString(hearingData['caseNo']);
-      final title = caseNo.isNotEmpty
-          ? 'Court hearing / order — $caseNo'
-          : 'Court hearing / order';
-      final body = HearingCalendarFields.pushHearingContext(hearingData);
-      final fcm = FCMService();
-      final ids = <String>{};
-      for (final role in const ['attorney', 'staff']) {
-        try {
-          final q = await _db
-              .collection('users')
-              .where('role', isEqualTo: role)
-              .limit(40)
-              .get();
-          for (final doc in q.docs) {
-            if (doc.data()['isActive'] == false) continue;
-            ids.add(doc.id);
-          }
-        } catch (_) {}
+      final phoneSent = await _pushHearingToPhones(
+        ids: ids,
+        title: title,
+        body: body,
+        hearingId: id,
+        caseNo: caseNo,
+        hearingData: enriched,
+      );
+      await _sendHearingSmsIfNeeded(id, freshData, ids.toList());
+      if (!phoneSent) {
+        _devicePushQueued.remove(id);
+        return;
       }
-      for (final uid in ids) {
-        await fcm.sendNotificationToUser(
-          userId: uid,
-          title: title,
-          body: body.isEmpty ? title : body,
-          data: {
-            'type': 'hearing_activity',
-            'hearingDocId': id,
-            'caseNo': caseNo,
-          },
-        );
-      }
-      sent.insert(0, id);
+      phoneSentIds.insert(0, id);
+      await prefs.setStringList(
+        _phonePushPrefsKey,
+        phoneSentIds.length > 200
+            ? phoneSentIds.sublist(0, 200)
+            : phoneSentIds,
+      );
+      if (!sent.contains(id)) sent.insert(0, id);
       await prefs.setStringList(
         _devicePushPrefsKey,
         sent.length > 200 ? sent.sublist(0, 200) : sent,
       );
+      return;
     } catch (e) {
       _devicePushQueued.remove(id);
       if (kDebugMode) {
         _fanoutLog('HearingNotificationFanout device push $id: $e');
       }
     }
+  }
+
+  Future<Set<String>> _activeAttorneyAndStaffIds() async {
+    final ids = <String>{};
+    for (final role in const ['attorney', 'staff']) {
+      try {
+        final q = await _db
+            .collection('users')
+            .where('role', isEqualTo: role)
+            .limit(40)
+            .get();
+        for (final doc in q.docs) {
+          if (doc.data()['isActive'] == false) continue;
+          ids.add(doc.id);
+        }
+      } catch (_) {}
+    }
+    return ids;
+  }
+
+  /// Same SMS as a new hearing. Skipped when that text was already delivered.
+  Future<void> _sendHearingSmsIfNeeded(
+    String hearingId,
+    Map<String, dynamic> hearingData,
+    List<String> recipientUserIds,
+  ) async {
+    if (hearingData['philsmsLastSentAt'] != null) return;
+    await HearingSmsAlertService.instance.sendAlertsForHearing(
+      hearingDocId: hearingId,
+      hearingData: hearingData,
+      recipientUserIds: recipientUserIds,
+    );
+  }
+
+  /// Website delivery does not count. Queue the phone tokens only.
+  Future<bool> _pushHearingToPhones({
+    required Set<String> ids,
+    required String title,
+    required String body,
+    required String hearingId,
+    required String caseNo,
+    Map<String, dynamic>? hearingData,
+  }) async {
+    final fcm = FCMService();
+    final seenTokens = <String>{};
+    var queued = false;
+    final pushData = _hearingFcmData(
+      hearingId: hearingId,
+      hearingData: hearingData ?? {'caseNo': caseNo},
+      title: title,
+      body: body.isEmpty ? title : body,
+    );
+    for (final uid in ids) {
+      final tokens = await fcm.mobileTokensForUser(uid);
+      for (final token in tokens) {
+        if (!seenTokens.add(token)) continue;
+        final ok = await fcm.sendNotificationToToken(
+          fcmToken: token,
+          title: title,
+          body: body.isEmpty ? title : body,
+          data: pushData,
+        );
+        if (ok) queued = true;
+      }
+    }
+    return queued;
   }
 
   /// Every active staff user gets court hearing alerts (same as attorneys).
@@ -1970,7 +2466,8 @@ class HearingNotificationFanoutService {
         !HearingCalendarFields.isLowQualityCaseTitle(title)) {
       return title;
     }
-    return (prepared['caseNo'] as String?)?.trim() ?? 'Hearing';
+    final cn = HearingCalendarFields.fieldAsDisplayString(prepared, 'caseNo');
+    return cn.isNotEmpty ? cn : 'Hearing';
   }
 
   /// Display helpers for reminders UI (raw `hearings` docs).
@@ -1991,16 +2488,14 @@ class HearingNotificationFanoutService {
     final activity = '${d['activityType'] ?? ''}'.trim().toLowerCase();
     if (source == 'n8n' || activity == 'court_import') return true;
     final cn = HearingCalendarFields.asDisplayString(d['caseNo']);
-    final ft = HearingCalendarFields.asDisplayString(d['fullText']);
-    final msg = HearingCalendarFields.asDisplayString(d['message']);
-    final summary = HearingCalendarFields.asDisplayString(d['summary']);
     final caseId = HearingCalendarFields.asDisplayString(d['caseId']);
     // Show court imports with case number and/or any body text (OCR may omit fullText).
+    // Emptiness only — copying fullText here was freezing the Reminders list.
     return caseId.isNotEmpty ||
         cn.isNotEmpty ||
-        ft.isNotEmpty ||
-        msg.isNotEmpty ||
-        summary.isNotEmpty ||
+        HearingCalendarFields.hasNonEmptyText(d['fullText']) ||
+        HearingCalendarFields.hasNonEmptyText(d['message']) ||
+        HearingCalendarFields.hasNonEmptyText(d['summary']) ||
         activity.isNotEmpty;
   }
 
@@ -2172,36 +2667,37 @@ class HearingNotificationFanoutService {
 
   /// Client bell/reminders title (not generic email-ingest "New court notice").
   static String clientInboxTitleFromHearing(Map<String, dynamic> d) {
-    final cn = (d['caseNo'] as String?)?.trim() ?? '';
-    final hid = (d['hearingDocId'] as String?)?.trim() ?? '';
+    final cn = HearingCalendarFields.fieldAsDisplayString(d, 'caseNo');
+    final hid = HearingCalendarFields.fieldAsDisplayString(d, 'hearingDocId');
     if (_isImportedCourtRow(d) || cn.isNotEmpty || hid.isNotEmpty) {
       return cn.isNotEmpty
-          ? 'New notice court hearings — $cn'
-          : 'New notice court hearings';
+          ? 'Court Hearing Notice — $cn'
+          : 'Court Hearing Notice';
     }
-    final label = (d['caseTitle'] as String?)?.trim() ?? 'Hearing';
-    return 'New notice court hearings — $label';
+    final ct = HearingCalendarFields.fieldAsDisplayString(d, 'caseTitle');
+    final label = ct.isNotEmpty ? ct : 'Hearing';
+    return 'Court Hearing Notice — $label';
   }
 
   /// Subtitle for client hearing cards when only `notifications` fields exist.
   static String clientSummaryFromNotificationMap(Map<String, dynamic> d) {
-    final existing = (d['summary'] as String?)?.trim();
-    if (existing != null && existing.isNotEmpty) return existing;
+    final existing = HearingCalendarFields.fieldAsDisplayString(d, 'summary');
+    if (existing.isNotEmpty) return existing;
 
     final parts = <String>[];
-    final cl = (d['clientName'] as String?)?.trim();
-    final br = (d['courtBranch'] as String?)?.trim();
-    final cn = (d['caseNo'] as String?)?.trim();
-    if (cl != null && cl.isNotEmpty) parts.add(cl);
-    if (br != null && br.isNotEmpty) parts.add(br);
-    if (cn != null && cn.isNotEmpty) parts.add('Case: $cn');
+    final cl = HearingCalendarFields.fieldAsDisplayString(d, 'clientName');
+    final br = HearingCalendarFields.fieldAsDisplayString(d, 'courtBranch');
+    final cn = HearingCalendarFields.fieldAsDisplayString(d, 'caseNo');
+    if (cl.isNotEmpty) parts.add(cl);
+    if (br.isNotEmpty) parts.add(br);
+    if (cn.isNotEmpty) parts.add('Case: $cn');
     if (parts.isNotEmpty) return parts.join(' • ');
     return 'Court hearing order';
   }
 
   String _buildTitle(Map<String, dynamic> d, String caseLabel) {
     if (_isImportedCourtRow(d)) {
-      final cn = (d['caseNo'] as String?)?.trim() ?? '';
+      final cn = HearingCalendarFields.fieldAsDisplayString(d, 'caseNo');
       return cn.isNotEmpty
           ? 'Court hearing / order — $cn'
           : 'Court hearing / order — $caseLabel';
@@ -2240,22 +2736,96 @@ class HearingNotificationFanoutService {
     Map<String, dynamic> userData,
   ) {
     final hearingClient = _hearingClientNameBlob(hearingData);
-    if (hearingClient.isEmpty) return false;
+    final fullText = HearingCalendarFields.fieldAsDisplayString(
+      hearingData,
+      'fullText',
+    );
+    final description = HearingCalendarFields.fieldAsDisplayString(
+      hearingData,
+      'description',
+    );
+    final summary = HearingCalendarFields.fieldAsDisplayString(
+      hearingData,
+      'summary',
+    );
+    final message = HearingCalendarFields.fieldAsDisplayString(
+      hearingData,
+      'message',
+    );
+    final searchBlob = [
+      hearingClient,
+      description,
+      summary,
+      message,
+      fullText,
+    ].where((s) => s.isNotEmpty).join('\n');
+    if (searchBlob.isEmpty) return false;
+
+    final lowerBlob = searchBlob.toLowerCase();
+
     for (final field in ['fullName', 'name', 'displayName']) {
       final stored = (userData[field] as String?)?.trim() ?? '';
-      if (stored.isNotEmpty &&
-          _namesPartialMatchForClient(stored, hearingClient)) {
+      if (stored.isEmpty) continue;
+      if (_namesPartialMatchForClient(stored, searchBlob)) {
         return true;
+      }
+      final words = _significantNameWords(stored);
+      if (words.length >= 2) {
+        final firstW = words.first;
+        final lastW = words.last;
+        if (_namesPartialMatchForClient('$firstW $lastW', searchBlob)) {
+          return true;
+        }
+        if ((firstW.length + lastW.length) >= 6 &&
+            _textContainsWord(lowerBlob, firstW) &&
+            _textContainsWord(lowerBlob, lastW)) {
+          return true;
+        }
       }
     }
     final first = (userData['firstName'] as String?)?.trim() ?? '';
     final last = (userData['lastName'] as String?)?.trim() ?? '';
-    if (first.isNotEmpty &&
-        last.isNotEmpty &&
-        _namesPartialMatchForClient('$first $last', hearingClient)) {
-      return true;
+    if (first.isNotEmpty && last.isNotEmpty) {
+      if (_namesPartialMatchForClient('$first $last', searchBlob)) {
+        return true;
+      }
+      final fLower = first.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+      final lLower = last.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+      if (fLower.length >= 2 &&
+          lLower.length >= 2 &&
+          (fLower.length + lLower.length) >= 6 &&
+          _textContainsWord(lowerBlob, fLower) &&
+          _textContainsWord(lowerBlob, lLower)) {
+        return true;
+      }
     }
     return false;
+  }
+
+  /// Whether [caseData] involves [uid] by `clientId` or named party in caption/parties.
+  bool caseMapInvolvesClientProfile(
+    Map<String, dynamic> caseData,
+    String uid,
+    Map<String, dynamic> userData,
+  ) {
+    if (caseData['isArchived'] == true) return false;
+    final status = (caseData['status'] as String?)?.trim().toLowerCase() ?? '';
+    if (status == 'under_review') return false;
+
+    final clientId = (caseData['clientId'] as String?)?.trim() ?? '';
+    if (clientId.isNotEmpty && clientId == uid) return true;
+
+    final partyScope = <String, dynamic>{
+      'caseTitle': caseData['caseTitle'],
+      'clientName': caseData['clientName'],
+      'clientFullName': caseData['clientFullName'],
+      'opposingParty': caseData['opposingParty'],
+      if (caseData['involvedPartyNames'] is List)
+        'involvedPartyNames': caseData['involvedPartyNames'],
+      if (caseData['involvedParties'] is List)
+        'involvedParties': caseData['involvedParties'],
+    };
+    return hearingDocMatchesClientProfile(partyScope, userData);
   }
 
   /// Whether [uid] (client) is named on or linked to this hearing row.
@@ -2283,13 +2853,18 @@ class HearingNotificationFanoutService {
       if (caseId.isNotEmpty) {
         try {
           final caseSnap = await _db.collection('cases').doc(caseId).get();
-          if (caseSnap.exists && caseSnap.data()?['clientId'] == uid) {
-            return true;
+          if (caseSnap.exists && caseSnap.data() != null) {
+            if (caseMapInvolvesClientProfile(caseSnap.data()!, uid, ud)) {
+              return true;
+            }
           }
         } catch (_) {}
       }
 
-      final hearingClient = (d['clientName'] as String?)?.trim() ?? '';
+      final hearingClient = HearingCalendarFields.fieldAsDisplayString(
+        d,
+        'clientName',
+      );
       if (hearingClient.isNotEmpty) {
         for (final field in ['fullName', 'name', 'displayName']) {
           final stored = (ud[field] as String?)?.trim() ?? '';
@@ -2303,12 +2878,14 @@ class HearingNotificationFanoutService {
       var resolved = await _resolveCase(d);
       if (resolved != null) {
         final caseSnap = await _db.collection('cases').doc(resolved.id).get();
-        if (caseSnap.exists && caseSnap.data()?['clientId'] == uid) {
-          return true;
+        if (caseSnap.exists && caseSnap.data() != null) {
+          if (caseMapInvolvesClientProfile(caseSnap.data()!, uid, ud)) {
+            return true;
+          }
         }
       }
 
-      final caseNo = (d['caseNo'] as String?)?.trim() ?? '';
+      final caseNo = HearingCalendarFields.fieldAsDisplayString(d, 'caseNo');
       if (caseNo.isNotEmpty) {
         final cq = await _db
             .collection('cases')
@@ -2393,9 +2970,33 @@ class HearingNotificationFanoutService {
     );
     var body = inboxBodyFromHearing(prepared);
     if (body.trim().isEmpty) body = inboxSummaryFromHearing(prepared);
+    final prepCaseNo = HearingCalendarFields.fieldAsDisplayString(
+      prepared,
+      'caseNo',
+    );
     if (body.trim().isEmpty) {
       body =
-          'Court hearing notice for ${(prepared['caseNo'] as String?)?.trim().isNotEmpty == true ? (prepared['caseNo'] as String).trim() : 'your case'}.';
+          'Court hearing notice for ${prepCaseNo.isNotEmpty ? prepCaseNo : 'your case'}.';
+    }
+
+    final partyList = <String>[];
+    for (final key in ['involvedPartyNames', 'involvedParties']) {
+      final raw = d[key] ?? prepared[key];
+      if (raw is List) {
+        for (final item in raw) {
+          final s = item?.toString().trim() ?? '';
+          if (s.isNotEmpty &&
+              !partyList.any((e) => e.toLowerCase() == s.toLowerCase())) {
+            partyList.add(s);
+          }
+        }
+      }
+    }
+    if (partyList.isEmpty) {
+      final blob = _hearingClientNameBlob(prepared);
+      if (blob.isNotEmpty) {
+        partyList.addAll(HearingCalendarFields.splitHearingPartyNames(blob));
+      }
     }
 
     final payload = <String, dynamic>{
@@ -2413,9 +3014,11 @@ class HearingNotificationFanoutService {
         prepared,
         caseMaps: caseMaps,
       ),
+      if (partyList.isNotEmpty) 'involvedPartyNames': partyList,
       if ((d['caseId'] as String?)?.trim().isNotEmpty == true)
         'caseId': (d['caseId'] as String).trim(),
     };
+    _applyResolvedCaseTitleOnPayload(payload, prepared);
     if (wasRead) {
       payload['isRead'] = true;
     } else if (!docExists) {
@@ -2429,6 +3032,67 @@ class HearingNotificationFanoutService {
       data: payload,
       options: SetOptions(merge: true),
     );
+  }
+
+  Future<void> _ensureClientSyntheticHearingNotification(
+    String uid,
+    String hearingId,
+    Map<String, dynamic> rawData,
+  ) async {
+    if (uid.isEmpty || hearingId.isEmpty) return;
+    final nid = 'hearing_inapp_${hearingId}_$uid';
+    DocumentSnapshot<Map<String, dynamic>>? existing;
+    try {
+      existing = await _db.collection('notifications').doc(nid).get();
+    } catch (_) {}
+
+    final exists = existing?.exists == true;
+    final wasRead = exists && _notificationWasRead(existing?.data());
+    if (exists) {
+      final ex = existing!.data() ?? {};
+      final exTitle = (ex['title'] as String?)?.trim() ?? '';
+      final exCaseNo = HearingCalendarFields.fieldAsDisplayString(
+        ex,
+        'caseNo',
+      );
+      final exCaseTitle = HearingCalendarFields.fieldAsDisplayString(
+        ex,
+        'caseTitle',
+      );
+      final rawCaseTitle = HearingCalendarFields.fieldAsDisplayString(
+        rawData,
+        'caseTitle',
+      );
+      final rawFullText = HearingCalendarFields.fieldAsDisplayString(
+        rawData,
+        'fullText',
+      );
+      final needsOrderTextEnrichment = rawFullText.isNotEmpty &&
+          (exCaseNo.isEmpty ||
+              exCaseTitle.isEmpty ||
+              exCaseTitle.toLowerCase() == 'hearing');
+      if (!shouldRemoveClientNotification(ex) &&
+          clientHearingInboxType((ex['type'] as String? ?? '').toLowerCase()) &&
+          !_clientHearingTitleNeedsRepair(exTitle, rawData) &&
+          !needsOrderTextEnrichment &&
+          (exCaseTitle.isNotEmpty || rawCaseTitle.isEmpty)) {
+        return;
+      }
+    }
+
+    try {
+      await _writeClientHearingNotificationPayload(
+        uid,
+        hearingId,
+        rawData,
+        docExists: exists,
+        wasRead: wasRead,
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        _fanoutLog('_ensureClientSyntheticHearingNotification $hearingId: $e');
+      }
+    }
   }
 
   /// Deletes wrong email-ingest / "New court notice" spam (not real court hearings).
@@ -2666,10 +3330,16 @@ class HearingNotificationFanoutService {
     }
   }
 
-  /// Client app: find hearings by profile name and create in-app notification rows.
+  /// Client app: find hearings & involved cases by profile name and create in-app notification rows.
   Future<void> syncClientHearingNotifications({bool force = false}) async {
     final uid = FirebaseAuth.instance.currentUser?.uid;
-    if (uid == null) return;
+    if (uid == null || uid.isEmpty) return;
+
+    final inflight = _clientSyncInFlight[uid];
+    if (inflight != null && !force) {
+      await inflight;
+      return;
+    }
 
     if (!force) {
       final last = _lastClientSyncAt[uid];
@@ -2678,8 +3348,19 @@ class HearingNotificationFanoutService {
         return;
       }
     }
-    _lastClientSyncAt[uid] = DateTime.now();
 
+    final future = _runClientHearingSyncImpl(uid);
+    _clientSyncInFlight[uid] = future;
+    try {
+      await future;
+    } finally {
+      if (identical(_clientSyncInFlight[uid], future)) {
+        _clientSyncInFlight.remove(uid);
+      }
+    }
+  }
+
+  Future<void> _runClientHearingSyncImpl(String uid) async {
     try {
       final roleSnap = await _db.collection('users').doc(uid).get();
       final ud = roleSnap.data();
@@ -2687,7 +3368,10 @@ class HearingNotificationFanoutService {
       if ((ud['role'] as String?)?.toLowerCase() != 'client') return;
 
       unawaited(purgeClientCourtEmailNotices(uid));
-      unawaited(_syncClientHearingsViaCloudFunction());
+      await _syncClientHearingsViaCloudFunction().timeout(
+        const Duration(seconds: 4),
+        onTimeout: () {},
+      );
 
       final seenHearingIds = <String>{};
 
@@ -2719,8 +3403,8 @@ class HearingNotificationFanoutService {
         if (kDebugMode) _fanoutLog('syncClientHearings linked: $e');
       }
 
-      // Firestore-secure: only query clientName values copied from the profile.
-      for (final nm in _clientNameFirestoreQueryVariants(ud).take(3)) {
+      // Firestore-secure: query clientName variants derived from the client profile.
+      for (final nm in _clientNameFirestoreQueryVariants(ud).take(12)) {
         try {
           final q = await _db
               .collection('hearings')
@@ -2735,19 +3419,343 @@ class HearingNotificationFanoutService {
         }
       }
 
+      await _syncClientHearingsFromRecentHearings(uid, ud, seenHearingIds);
+      await _syncClientHearingsFromCalendarEvents(uid, ud, seenHearingIds);
+      await _syncClientHearingsFromSupabaseMirror(uid, ud, seenHearingIds);
+      await _syncClientCasesAndHearings(uid, ud, seenHearingIds);
+
+      await _normalizeClientHearingNotificationRows(uid);
+
       try {
-        final cases = await _db
+        final badge = await countClientNotificationBadge(uid);
+        _setBellCount(uid, badge);
+      } catch (_) {}
+
+      _lastClientSyncAt[uid] = DateTime.now();
+    } catch (e) {
+      if (kDebugMode) {
+        _fanoutLog(
+          'HearingNotificationFanout.syncClientHearingNotifications: $e',
+        );
+      }
+    }
+    _refreshInboxStreamsForUser(uid);
+  }
+
+  /// Scans recent `hearings` docs for any court order involving this client's name
+  /// (e.g., plaintiff/defendant in `caseTitle` or `fullText` when `clientName` only lists the other party).
+  Future<void> _syncClientHearingsFromRecentHearings(
+    String uid,
+    Map<String, dynamic> ud,
+    Set<String> seenHearingIds,
+  ) async {
+    try {
+      final docsById = <String, QueryDocumentSnapshot<Map<String, dynamic>>>{};
+      try {
+        final ordered = await _db
+            .collection('hearings')
+            .orderBy('createdAt', descending: true)
+            .limit(120)
+            .get();
+        for (final doc in ordered.docs) {
+          docsById[doc.id] = doc;
+        }
+      } catch (_) {}
+
+      try {
+        final unordered = await _db.collection('hearings').limit(120).get();
+        for (final doc in unordered.docs) {
+          docsById.putIfAbsent(doc.id, () => doc);
+        }
+      } catch (_) {}
+
+      if (docsById.isEmpty) return;
+
+      final matchedDocs = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+      for (final doc in docsById.values) {
+        if (seenHearingIds.contains(doc.id)) continue;
+        final hd = doc.data();
+        if (HearingCalendarFields.isNonCourtHearingSpam(hd) ||
+            !isDisplayableHearingRow(hd)) {
+          continue;
+        }
+        if (hearingDocMatchesClientProfile(hd, ud)) {
+          matchedDocs.add(doc);
+        }
+      }
+      if (matchedDocs.isNotEmpty) {
+        await _ensureClientHearingsLimited(matchedDocs, seenHearingIds);
+      }
+    } catch (e) {
+      if (kDebugMode) _fanoutLog('_syncClientHearingsFromRecentHearings: $e');
+    }
+  }
+
+  /// Discovers court hearings synced to `calendar_events` (listable by clients in Firestore rules).
+  Future<void> _syncClientHearingsFromCalendarEvents(
+    String uid,
+    Map<String, dynamic> ud,
+    Set<String> seenHearingIds,
+  ) async {
+    try {
+      final docsById = <String, QueryDocumentSnapshot<Map<String, dynamic>>>{};
+      try {
+        final q = await _db
+            .collection('calendar_events')
+            .where('eventType', isEqualTo: 'hearing')
+            .limit(150)
+            .get();
+        for (final doc in q.docs) {
+          docsById[doc.id] = doc;
+        }
+      } catch (_) {}
+
+      if (docsById.isEmpty) {
+        try {
+          final q = await _db.collection('calendar_events').limit(150).get();
+          for (final doc in q.docs) {
+            docsById[doc.id] = doc;
+          }
+        } catch (_) {}
+      }
+
+      for (final calDoc in docsById.values) {
+        final cal = calDoc.data();
+        if (HearingCalendarFields.isNonCourtHearingSpam(cal)) continue;
+
+        final evType =
+            HearingCalendarFields.fieldAsDisplayString(cal, 'eventType')
+                .toLowerCase();
+        final rawHid = HearingCalendarFields.fieldAsDisplayString(
+          cal,
+          'hearingDocId',
+        );
+        final isHearingEvent = evType == 'hearing' ||
+            rawHid.isNotEmpty ||
+            calDoc.id.startsWith('hearing_cal_');
+        if (!isHearingEvent) continue;
+
+        final selectedClients = cal['selectedClientIds'];
+        final linkedByUid =
+            (cal['clientId'] as String?)?.trim() == uid ||
+            (selectedClients is List && selectedClients.contains(uid));
+        if (!linkedByUid && !hearingDocMatchesClientProfile(cal, ud)) {
+          continue;
+        }
+
+        final hid = rawHid.isNotEmpty
+            ? rawHid
+            : (calDoc.id.startsWith('hearing_cal_')
+                ? calDoc.id.substring('hearing_cal_'.length)
+                : 'cal_${calDoc.id}');
+        if (hid.isEmpty || !seenHearingIds.add(hid)) continue;
+
+        var wroteFromHearingDoc = false;
+        if (rawHid.isNotEmpty || calDoc.id.startsWith('hearing_cal_')) {
+          try {
+            final hDoc = await _db.collection('hearings').doc(hid).get();
+            if (hDoc.exists) {
+              await ensureClientHearingNotification(
+                hDoc,
+                trustClientNameMatch: true,
+              );
+              wroteFromHearingDoc = true;
+            }
+          } catch (_) {}
+        }
+        if (wroteFromHearingDoc) continue;
+
+        final eventTs = cal['eventDate'];
+        DateTime? when;
+        if (eventTs is Timestamp) {
+          when = eventTs.toDate();
+        } else if (eventTs is DateTime) {
+          when = eventTs;
+        }
+        final desc = HearingCalendarFields.fieldAsDisplayString(
+          cal,
+          'description',
+        );
+        final synth = <String, dynamic>{
+          ...cal,
+          if (HearingCalendarFields.fieldAsDisplayString(cal, 'caseTitle')
+              .isEmpty)
+            'caseTitle': HearingCalendarFields.fieldAsDisplayString(
+              cal,
+              'title',
+            ),
+          if (HearingCalendarFields.fieldAsDisplayString(cal, 'fullText')
+                  .isEmpty &&
+              desc.isNotEmpty)
+            'fullText': desc,
+          if (when != null) ...{
+            'hearingDateTime': Timestamp.fromDate(when),
+            if (HearingCalendarFields.fieldAsDisplayString(cal, 'hearingDate')
+                .isEmpty)
+              'hearingDate':
+                  '${when.year.toString().padLeft(4, '0')}-${when.month.toString().padLeft(2, '0')}-${when.day.toString().padLeft(2, '0')}',
+          },
+          if (cal['involvedParties'] is List &&
+              cal['involvedPartyNames'] == null)
+            'involvedPartyNames': cal['involvedParties'],
+        };
+        await _ensureClientSyntheticHearingNotification(uid, hid, synth);
+      }
+    } catch (e) {
+      if (kDebugMode) _fanoutLog('_syncClientHearingsFromCalendarEvents: $e');
+    }
+  }
+
+  /// Discovers mirrored `hearings` rows from Supabase when Firestore direct `hearings` read is restricted.
+  Future<void> _syncClientHearingsFromSupabaseMirror(
+    String uid,
+    Map<String, dynamic> ud,
+    Set<String> seenHearingIds,
+  ) async {
+    final supa = SupabaseService.instance.clientOrNull;
+    if (supa == null) return;
+    try {
+      final rows = await supa
+          .from('hearings')
+          .select()
+          .limit(150)
+          .timeout(const Duration(seconds: 4));
+      for (final raw in rows) {
+        final m = Map<String, dynamic>.from(raw);
+        final hid = (m['id']?.toString() ?? '').trim();
+        if (hid.isEmpty || seenHearingIds.contains(hid)) continue;
+
+        final hd = <String, dynamic>{
+          if (m['case_no'] != null) 'caseNo': m['case_no'],
+          if (m['caseNo'] != null) 'caseNo': m['caseNo'],
+          if (m['client_name'] != null) 'clientName': m['client_name'],
+          if (m['clientName'] != null) 'clientName': m['clientName'],
+          if (m['case_title'] != null) 'caseTitle': m['case_title'],
+          if (m['caseTitle'] != null) 'caseTitle': m['caseTitle'],
+          if (m['court_branch'] != null) 'courtBranch': m['court_branch'],
+          if (m['courtBranch'] != null) 'courtBranch': m['courtBranch'],
+          if (m['location'] != null) 'location': m['location'],
+          if (m['hearing_date'] != null) 'hearingDate': m['hearing_date'],
+          if (m['hearingDate'] != null) 'hearingDate': m['hearingDate'],
+          if (m['hearing_time'] != null) 'hearingTime': m['hearing_time'],
+          if (m['hearingTime'] != null) 'hearingTime': m['hearingTime'],
+          if (m['full_text'] != null) 'fullText': m['full_text'],
+          if (m['fullText'] != null) 'fullText': m['fullText'],
+          if (m['message'] != null) 'message': m['message'],
+          if (m['summary'] != null) 'summary': m['summary'],
+          if (m['activity_type'] != null) 'activityType': m['activity_type'],
+          if (m['case_id'] != null) 'caseId': m['case_id'],
+          if (m['source'] != null) 'source': m['source'],
+          if (m['involved_party_names'] is List)
+            'involvedPartyNames': m['involved_party_names'],
+        };
+        final dtStr =
+            (m['hearing_date_time'] ?? m['hearingDateTime'])?.toString() ?? '';
+        if (dtStr.isNotEmpty) {
+          final parsed = DateTime.tryParse(dtStr);
+          if (parsed != null) {
+            hd['hearingDateTime'] = Timestamp.fromDate(parsed.toLocal());
+          }
+        }
+
+        if (HearingCalendarFields.isNonCourtHearingSpam(hd) ||
+            !isDisplayableHearingRow(hd)) {
+          continue;
+        }
+        final involvedList = m['involved_client_ids'];
+        final matchedList = m['matched_client_ids'];
+        final linkedByUid =
+            m['owner_client_id']?.toString().trim() == uid ||
+            (involvedList is List && involvedList.contains(uid)) ||
+            (matchedList is List && matchedList.contains(uid));
+        if (!linkedByUid && !hearingDocMatchesClientProfile(hd, ud)) {
+          continue;
+        }
+        if (!seenHearingIds.add(hid)) continue;
+        await _ensureClientSyntheticHearingNotification(uid, hid, hd);
+      }
+    } catch (e) {
+      if (kDebugMode) _fanoutLog('_syncClientHearingsFromSupabaseMirror: $e');
+    }
+  }
+
+  /// Discovers `cases` involving [uid] (by `clientId` or party name) and ensures case & hearing notifications exist.
+  Future<void> _syncClientCasesAndHearings(
+    String uid,
+    Map<String, dynamic> ud,
+    Set<String> seenHearingIds,
+  ) async {
+    try {
+      final matchedCases =
+          <String, QueryDocumentSnapshot<Map<String, dynamic>>>{};
+      try {
+        final ownCases = await _db
             .collection('cases')
             .where('clientId', isEqualTo: uid)
-            .limit(15)
+            .limit(50)
             .get();
-        for (final c in cases.docs) {
-          try {
-            final byCaseId = await _db
-                .collection('hearings')
-                .where('caseId', isEqualTo: c.id)
-                .limit(20)
-                .get();
+        for (final doc in ownCases.docs) {
+          if (caseMapInvolvesClientProfile(doc.data(), uid, ud)) {
+            matchedCases[doc.id] = doc;
+          }
+        }
+      } catch (_) {}
+
+      try {
+        final recentCases = await _db.collection('cases').limit(150).get();
+        for (final doc in recentCases.docs) {
+          if (matchedCases.containsKey(doc.id)) continue;
+          if (caseMapInvolvesClientProfile(doc.data(), uid, ud)) {
+            matchedCases[doc.id] = doc;
+          }
+        }
+      } catch (_) {}
+
+      if (matchedCases.isEmpty) return;
+
+      final existingCaseNotifIds = <String>{};
+      final existingHearingCaseIds = <String>{};
+      try {
+        final existingNotifs = await Future.wait([
+          _db
+              .collection('notifications')
+              .where('userId', isEqualTo: uid)
+              .limit(120)
+              .get(),
+          _db
+              .collection('notifications')
+              .where('clientId', isEqualTo: uid)
+              .limit(120)
+              .get(),
+        ]);
+        for (final snap in existingNotifs) {
+          for (final n in snap.docs) {
+            final nd = n.data();
+            final cid = (nd['caseId'] as String?)?.trim() ?? '';
+            final type = (nd['type'] as String? ?? '').toLowerCase();
+            if (cid.isNotEmpty) {
+              if (clientHearingInboxType(type)) {
+                existingHearingCaseIds.add(cid);
+              } else {
+                existingCaseNotifIds.add(cid);
+              }
+            }
+          }
+        }
+      } catch (_) {}
+
+      for (final c in matchedCases.values) {
+        final m = c.data();
+        var foundHearingForCase = existingHearingCaseIds.contains(c.id);
+
+        try {
+          final byCaseId = await _db
+              .collection('hearings')
+              .where('caseId', isEqualTo: c.id)
+              .limit(20)
+              .get();
+          if (byCaseId.docs.isNotEmpty) {
+            foundHearingForCase = true;
             await _ensureClientHearingsLimited(
               byCaseId.docs,
               seenHearingIds,
@@ -2758,35 +3766,114 @@ class HearingNotificationFanoutService {
                 firmMaySetCaseId: true,
               ),
             );
-          } catch (_) {}
+          }
+        } catch (_) {}
 
-          final m = c.data();
-          for (final field in ['caseNumber', 'caseNo']) {
-            final cn = (m[field] as String?)?.trim() ?? '';
-            if (cn.isEmpty) continue;
+        for (final field in ['caseNumber', 'caseNo']) {
+          final cn = HearingCalendarFields.fieldAsDisplayString(m, field);
+          if (cn.isEmpty) continue;
+          final parsedInt = int.tryParse(cn);
+          final qVals = <Object>[cn, if (parsedInt != null) parsedInt];
+          for (final qv in qVals) {
             try {
               final hq = await _db
                   .collection('hearings')
-                  .where('caseNo', isEqualTo: cn)
+                  .where('caseNo', isEqualTo: qv)
                   .limit(10)
                   .get();
-              await _ensureClientHearingsLimited(hq.docs, seenHearingIds);
+              if (hq.docs.isNotEmpty) {
+                foundHearingForCase = true;
+                await _ensureClientHearingsLimited(hq.docs, seenHearingIds);
+              }
             } catch (_) {}
           }
         }
-      } catch (e) {
-        if (kDebugMode) _fanoutLog('syncClientHearings by case: $e');
-      }
 
-      unawaited(_normalizeClientHearingNotificationRows(uid));
-    } catch (e) {
-      if (kDebugMode) {
-        _fanoutLog(
-          'HearingNotificationFanout.syncClientHearingNotifications: $e',
+        final caseTitle = HearingCalendarFields.fieldAsDisplayString(
+          m,
+          'caseTitle',
         );
+        final caseNo = HearingCalendarFields.fieldAsDisplayString(
+          m,
+          'caseNumber',
+        ).isNotEmpty
+            ? HearingCalendarFields.fieldAsDisplayString(m, 'caseNumber')
+            : HearingCalendarFields.fieldAsDisplayString(m, 'caseNo');
+
+        // Ensure client gets a case involvement notification if none exists yet for this case.
+        if (!existingCaseNotifIds.contains(c.id) && caseTitle.isNotEmpty) {
+          final caseNotifId = 'case_involved_${c.id}_$uid';
+          try {
+            final exDoc = await _db
+                .collection('notifications')
+                .doc(caseNotifId)
+                .get();
+            if (!exDoc.exists) {
+              final ts = m['updatedAt'] is Timestamp
+                  ? m['updatedAt'] as Timestamp
+                  : (m['createdAt'] is Timestamp
+                      ? m['createdAt'] as Timestamp
+                      : Timestamp.now());
+              await HybridDatastore.set(
+                collection: 'notifications',
+                id: caseNotifId,
+                data: {
+                  'userId': uid,
+                  'clientId': uid,
+                  'type': 'case_involved',
+                  'caseId': c.id,
+                  if (caseNo.isNotEmpty) 'caseNo': caseNo,
+                  'caseTitle': caseTitle,
+                  'title': caseNo.isNotEmpty
+                      ? 'Case Notice — $caseNo'
+                      : 'Case Notice — $caseTitle',
+                  'summary':
+                      'You are listed as an involved party in "$caseTitle".',
+                  'message':
+                      'Your name is recorded on case "$caseTitle"${caseNo.isNotEmpty ? ' (Case No. $caseNo)' : ''}. Coordinate with your legal counsel for updates and schedules.',
+                  'isRead': false,
+                  'createdAt': ts,
+                },
+                options: SetOptions(merge: true),
+              );
+              existingCaseNotifIds.add(c.id);
+            }
+          } catch (_) {}
+        }
+
+        // If the case itself has a scheduled `hearingDate` and no hearing notification covers it yet, remind the client.
+        final rawCaseHearing = m['hearingDate'];
+        DateTime? caseHearingAt;
+        if (rawCaseHearing is Timestamp) {
+          caseHearingAt = rawCaseHearing.toDate();
+        } else if (rawCaseHearing is DateTime) {
+          caseHearingAt = rawCaseHearing;
+        } else if (rawCaseHearing is String && rawCaseHearing.trim().isNotEmpty) {
+          caseHearingAt = DateTime.tryParse(rawCaseHearing.trim());
+        }
+        if (caseHearingAt != null && !foundHearingForCase) {
+          final synthHid = 'case_sched_${c.id}';
+          if (seenHearingIds.add(synthHid)) {
+            final dateStr =
+                '${caseHearingAt.year.toString().padLeft(4, '0')}-${caseHearingAt.month.toString().padLeft(2, '0')}-${caseHearingAt.day.toString().padLeft(2, '0')}';
+            await _ensureClientSyntheticHearingNotification(uid, synthHid, {
+              'caseId': c.id,
+              if (caseNo.isNotEmpty) 'caseNo': caseNo,
+              if (caseTitle.isNotEmpty) 'caseTitle': caseTitle,
+              if (m['clientName'] != null) 'clientName': m['clientName'],
+              'activityType': 'schedule',
+              'hearingDate': dateStr,
+              'hearingDateTime': Timestamp.fromDate(caseHearingAt),
+              'summary': 'Scheduled court hearing for $caseTitle',
+              'message':
+                  'A court hearing is scheduled on $dateStr for ${caseTitle.isNotEmpty ? caseTitle : 'your case'}.',
+            });
+          }
+        }
       }
+    } catch (e) {
+      if (kDebugMode) _fanoutLog('syncClientHearings by case: $e');
     }
-    _refreshInboxStreamsForUser(uid);
   }
 
   /// Pull hearing docs referenced on any notification row for this client (get-by-id).
@@ -2816,7 +3903,10 @@ class HearingNotificationFanoutService {
           final hid = _hearingIdFromNotificationDoc(n.id, data);
           if (hid == null || !seenHearingIds.add(hid)) continue;
           final type = (data['type'] as String? ?? '').toLowerCase();
-          final caseNo = (data['caseNo'] as String?)?.trim() ?? '';
+          final caseNo = HearingCalendarFields.fieldAsDisplayString(
+            data,
+            'caseNo',
+          );
           final title = (data['title'] as String?)?.trim() ?? '';
           if (clientHearingInboxType(type) &&
               caseNo.isNotEmpty &&
@@ -2853,7 +3943,7 @@ class HearingNotificationFanoutService {
     }
   }
 
-  /// Fixes titles and removes wrong spam; re-links rows to real hearing docs.
+  /// Fixes titles and removes wrong spam; re-links rows to real hearing docs without stripping rich fields.
   Future<void> _normalizeClientHearingNotificationRows(String uid) async {
     try {
       final snaps = await Future.wait([
@@ -2885,14 +3975,16 @@ class HearingNotificationFanoutService {
               continue;
             }
           } catch (_) {}
+          final currentTitle = (data['title'] as String?)?.trim() ?? '';
+          if (!_clientHearingTitleNeedsRepair(currentTitle, data)) {
+            continue;
+          }
           await _writeClientHearingNotificationPayload(
             uid,
             hid,
             {
-              'caseNo': data['caseNo'],
-              'clientName': data['clientName'],
-              'courtBranch': data['courtBranch'],
-              'fullText': data['message'],
+              ...data,
+              'fullText': data['fullText'] ?? data['message'],
             },
             docExists: true,
             wasRead: _notificationWasRead(data),
@@ -2957,6 +4049,15 @@ class HearingNotificationFanoutService {
         uids,
         firmMaySetCaseId: true,
       );
+      HearingCalendarSyncService.instance.seedOverlayFromHearing(
+        hearingDocId: doc.id,
+        hearingData: d,
+        attorneyIds: [
+          if ((d['attorneyUid'] as String?)?.trim().isNotEmpty == true)
+            (d['attorneyUid'] as String).trim(),
+          ..._extraUidsFromHearing(d),
+        ],
+      );
       final parties = HearingCalendarFields.splitHearingPartyNames(
         _hearingClientNameBlob(d),
       );
@@ -2990,6 +4091,15 @@ class HearingNotificationFanoutService {
     // rows and send SMS. Push is already sent by the Cloud Function.
     if (kIsWeb && !clientScoped) {
       await _publishMatchedClientInbox(doc);
+      HearingCalendarSyncService.instance.seedOverlayFromHearing(
+        hearingDocId: doc.id,
+        hearingData: d,
+        attorneyIds: [
+          if ((d['attorneyUid'] as String?)?.trim().isNotEmpty == true)
+            (d['attorneyUid'] as String).trim(),
+          ..._extraUidsFromHearing(d),
+        ],
+      );
       unawaited(
         HearingSmsAlertService.instance.sendAlertsForHearing(
           hearingDocId: doc.id,
@@ -3076,12 +4186,12 @@ class HearingNotificationFanoutService {
     final caseMaps = await HearingCalendarFields.loadCaseMapsForHearing(d);
     if (resolved != null) {
       final rid = resolved.id;
+      final dCaseNo = HearingCalendarFields.fieldAsDisplayString(d, 'caseNo');
       if (caseMaps.every((c) => (c['id'] as String?) != rid)) {
         caseMaps.add({
           'id': rid,
           'caseTitle': resolved.title,
-          if ((d['caseNo'] as String?)?.trim().isNotEmpty == true)
-            'caseNo': (d['caseNo'] as String?)!.trim(),
+          if (dCaseNo.isNotEmpty) 'caseNo': dCaseNo,
         });
       }
     }
@@ -3102,6 +4212,18 @@ class HearingNotificationFanoutService {
     final type = 'hearing_activity';
 
     if (skipInAppWrites) {
+      // In-app already fanned out — still attempt SMS if CF did not deliver.
+      unawaited(
+        HearingSmsAlertService.instance.sendAlertsForHearing(
+          hearingDocId: doc.id,
+          hearingData: d,
+          recipientUserIds: recipientList,
+          title: title,
+          body: body,
+          summary: summary,
+          caseLabel: caseLabel,
+        ),
+      );
       return;
     }
 
@@ -3131,7 +4253,7 @@ class HearingNotificationFanoutService {
         'type': type,
         'title': rowTitle,
         'summary': summary,
-        'message': body,
+        'message': HearingNotificationFormatter.buildPopupBody(prepared),
         if (caseId.isNotEmpty) 'caseId': caseId,
         'hearingDocId': doc.id,
         ...HearingNotificationFormatter.copyHearingFieldsForNotification(
@@ -3231,6 +4353,18 @@ class HearingNotificationFanoutService {
       ),
     );
 
+    // Mark calendar overlay as soon as the reminder/notify fires.
+    final attorneySeeds = <String>{
+      for (final uid in recipientList) uid,
+      if ((d['attorneyUid'] as String?)?.trim().isNotEmpty == true)
+        (d['attorneyUid'] as String).trim(),
+    };
+    HearingCalendarSyncService.instance.seedOverlayFromHearing(
+      hearingDocId: doc.id,
+      hearingData: d,
+      attorneyIds: attorneySeeds,
+    );
+
     if (!wroteAny) return;
 
     if (!clientScoped) {
@@ -3298,6 +4432,7 @@ class HearingNotificationFanoutService {
     Set<String> readHearingIds = const {},
   }) {
     final coveredHearingIds = <String>{};
+    final seenHearingDedupKeys = <String>{};
     final rows = <HearingInboxRow>[];
     final hearingById = <String, Map<String, dynamic>>{
       for (final d in hearingDocs) d.id: d.data(),
@@ -3333,6 +4468,14 @@ class HearingNotificationFanoutService {
         }
       }
       final hid = _hearingIdFromNotificationDoc(doc.id, data);
+      final caseNo = HearingCalendarFields.asDisplayString(data['caseNo']).toLowerCase();
+      final hearingDate = HearingCalendarFields.asDisplayString(data['hearingDate']).toLowerCase();
+      final dedupKey = (hid != null && hid.isNotEmpty)
+          ? 'hid_$hid'
+          : (caseNo.isNotEmpty && hearingDate.isNotEmpty
+              ? 'c_${caseNo}_$hearingDate'
+              : 'd_${doc.id}');
+      if (!seenHearingDedupKeys.add(dedupKey)) continue;
 
       if (hid != null && hearingById.containsKey(hid)) {
         final hd = Map<String, dynamic>.from(hearingById[hid]!);
@@ -3374,8 +4517,9 @@ class HearingNotificationFanoutService {
         data['hearingDocId'] ??= hid;
         final msg = (data['message'] as String?)?.trim() ?? '';
         if (msg.isEmpty && hid != null) {
+          final cn = HearingCalendarFields.fieldAsDisplayString(data, 'caseNo');
           data['message'] =
-              'Court order for case ${(data['caseNo'] as String?)?.trim() ?? hid}. '
+              'Court order for case ${cn.isNotEmpty ? cn : hid}. '
               'Tap to read the full notice.';
         }
       }
@@ -3627,6 +4771,26 @@ class HearingNotificationFanoutService {
           pending++;
         }
       }
+
+      // Also mark hearing_notifications for this attorney
+      try {
+        final hnSnap = await _db
+            .collection('hearing_notifications')
+            .where('attorneyId', isEqualTo: userId)
+            .limit(100)
+            .get();
+        for (final doc in hnSnap.docs) {
+          if (doc.data()['isRead'] == true) continue;
+          if (!seen.add('hn_${doc.id}')) continue;
+          batch.update(doc.reference, {
+            'isRead': true,
+            'status': 'sent',
+            'readAt': FieldValue.serverTimestamp(),
+          });
+          pending++;
+        }
+      } catch (_) {}
+
       if (pending > 0) await batch.commit();
 
       if (includeGlobalHearingsFallback && !kIsWeb) {
@@ -4316,10 +5480,6 @@ class HearingNotificationFanoutService {
     bool runSync = false,
     bool forceSync = false,
   }) async {
-    if (runSync) {
-      // Inbox paint must not wait on Cloud Function / name-scan backfill.
-      unawaited(syncClientHearingNotifications(force: forceSync));
-    }
     unawaited(_ensureReadHearingIdsLoaded(userId));
     List<QueryDocumentSnapshot<Map<String, dynamic>>> notifDocs = const [];
     try {
@@ -4327,12 +5487,31 @@ class HearingNotificationFanoutService {
     } catch (_) {
       notifDocs = const [];
     }
-    final rows = buildInboxRowsFromSnapshots(
+    var rows = buildInboxRowsFromSnapshots(
       notifDocs,
       const [],
       hearingsOnly: true,
       readHearingIds: _readHearingIdsMem[userId] ?? const {},
     );
+    if (runSync) {
+      if (rows.isEmpty || forceSync) {
+        await syncClientHearingNotifications(force: forceSync);
+        try {
+          notifDocs = await _notificationDocsForInbox(
+            userId,
+            hearingsOnly: true,
+          );
+          rows = buildInboxRowsFromSnapshots(
+            notifDocs,
+            const [],
+            hearingsOnly: true,
+            readHearingIds: _readHearingIdsMem[userId] ?? const {},
+          );
+        } catch (_) {}
+      } else {
+        unawaited(syncClientHearingNotifications(force: forceSync));
+      }
+    }
     final existing = peekInboxRows(
       userId,
       includeGlobalHearingsFallback: false,
@@ -4346,6 +5525,7 @@ class HearingNotificationFanoutService {
       includeGlobalHearingsFallback: false,
       hearingsOnly: true,
     ).seedRows(toStore, hearingsSnapshot: null, attachListeners: false);
+    _cacheBellCount(userId, toStore);
     return toStore;
   }
 
@@ -4551,12 +5731,12 @@ class HearingNotificationFanoutService {
     final caseMaps = await HearingCalendarFields.loadCaseMapsForHearing(d);
     if (resolved != null) {
       final rid = resolved.id;
+      final dCaseNo = HearingCalendarFields.fieldAsDisplayString(d, 'caseNo');
       if (caseMaps.every((c) => (c['id'] as String?) != rid)) {
         caseMaps.add({
           'id': rid,
           'caseTitle': resolved.title,
-          if ((d['caseNo'] as String?)?.trim().isNotEmpty == true)
-            'caseNo': (d['caseNo'] as String?)!.trim(),
+          if (dCaseNo.isNotEmpty) 'caseNo': dCaseNo,
         });
       }
     }

@@ -82,15 +82,9 @@ class _AttorneySidebarState extends State<AttorneySidebar>
       'badge': null,
     },
     {
-      'title': 'My Cases',
+      'title': 'Cases',
       'icon': Icons.folder_outlined,
       'key': 'cases',
-      'badge': null,
-    },
-    {
-      'title': 'Pending Appointments',
-      'icon': Icons.pending_outlined,
-      'key': 'pending',
       'badge': null,
     },
     {

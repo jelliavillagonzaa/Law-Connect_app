@@ -615,7 +615,9 @@ class _AttorneyClientChatScreenState extends State<AttorneyClientChatScreen> {
                           Padding(
                             padding: const EdgeInsets.only(bottom: 4),
                             child: Text(
-                              widget.clientName,
+                              message.labelForSender(
+                                fallback: widget.clientName,
+                              ),
                               style: TextStyle(
                                 fontSize: 12,
                                 fontWeight: FontWeight.bold,

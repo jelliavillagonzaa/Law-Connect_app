@@ -302,7 +302,8 @@ class BackupService {
       if (!userDoc.exists) return false;
 
       final userData = userDoc.data();
-      return userData?['role'] == 'admin';
+      final role = (userData?['role'] ?? '').toString().toLowerCase();
+      return role == 'admin' || role == 'staff';
     } catch (e) {
       print('Error checking admin status: $e');
       return false;

@@ -191,6 +191,73 @@ Case record ID: abc123
     expect(doc.paragraphs.single, contains('Please file the pleading today so the court can act'));
   });
 
+  test('keeps court email in header, not in plaintiff name', () {
+    const sample = '''
+Republic of the Philippines
+REGIONAL TRIAL COURT
+10th Judicial Region
+BRANCH 12 - OROQUIETA CITY
+limpahanloren42@gmail.com
+JOREN LIMPAHAN
+Plaintiff,
+- versus -
+MEATHS BAES JAMBO
+Defendant.
+Civil Case No. SAMPLE
+For: Sample Case
+ORDER
+This page is a sample template prepared using the names Joren Limpahan and Meaths Baes Jambo.
+''';
+    final doc = CourtOrderDisplay.parse(sample);
+    final partyTexts = doc.parties.map((line) => line.text).join('\n');
+
+    expect(doc.header, contains('limpahanloren42@gmail.com'));
+    expect(partyTexts, contains('JOREN LIMPAHAN'));
+    expect(partyTexts, isNot(contains('@')));
+    expect(partyTexts, isNot(contains('gmail')));
+  });
+
+  test('cleans SAMPLE mashed caption into a proper pleading layout', () {
+    const sample = '''
+SAMPLE - NOT AN OFFICIAL COURT DOCUMENT Republic of the Philippines REGIONAL TRIAL COURT 10th Judicial Region BRANCH 12 - OROQUIETA CITY
+Sample document layout only JOREN LIMPAHAN
+Plaintiff,
+- versus -
+MEATHS BAES JAMBO
+Defendant.
+Civil Case No. SAMPLE
+For: Sample Case
+ORDER
+This page is a sample template prepared using the names Joren Limpahan and Meaths Baes Jambo. The wording below is placeholder text for layout demonstration only.
+''';
+
+    final doc = CourtOrderDisplay.parse(sample);
+    final partyTexts = doc.parties.map((line) => line.text).toList();
+
+    expect(doc.isPleading, isTrue);
+    expect(doc.header.first, 'Republic of the Philippines');
+    expect(doc.header, contains('REGIONAL TRIAL COURT'));
+    expect(doc.header, contains('BRANCH 12 - OROQUIETA CITY'));
+    expect(doc.header.join('\n'), isNot(contains('SAMPLE')));
+    expect(doc.header.join('\n'), isNot(contains('JOREN')));
+    expect(doc.caseMeta, contains('Civil Case No. SAMPLE'));
+    expect(partyTexts.first, contains('JOREN LIMPAHAN'));
+    expect(partyTexts, containsAll(['Plaintiff,', '- versus -', 'Defendant.']));
+    expect(
+      partyTexts.indexOf('JOREN LIMPAHAN'),
+      lessThan(partyTexts.indexOf('Plaintiff,')),
+    );
+    expect(
+      partyTexts.indexOf('MEATHS BAES JAMBO'),
+      greaterThan(partyTexts.indexOf('- versus -')),
+    );
+    expect(
+      partyTexts.indexOf('MEATHS BAES JAMBO'),
+      lessThan(partyTexts.indexOf('Defendant.')),
+    );
+    expect(doc.heading, 'ORDER');
+  });
+
   test('summary stops at the WHEREFORE sentence, not mid-word', () {
     const order = '''
 WHEREFORE, reset the pre-trial on October 28, 2026 at
@@ -219,5 +286,77 @@ SO ORDERED.
     HearingCalendarFields.fillStructuredFieldsFromOrderText(row);
     expect(row['summary'], endsWith('them.'));
     expect(row['summary'], isNot(contains('Pa')));
+  });
+
+  test('spam check does not scan an entire court order', () {
+    final order = StringBuffer('REGIONAL TRIAL COURT\n');
+    for (var i = 0; i < 4000; i++) {
+      order.writeln('The court reiterates the previous order of this Branch.');
+    }
+    order.writeln('SO ORDERED.');
+    final row = <String, dynamic>{
+      'caseNo': '5297',
+      'fullText': order.toString(),
+      'source': 'n8n',
+      'activityType': 'court_import',
+    };
+    final started = DateTime.now();
+    expect(HearingCalendarFields.isNonCourtHearingSpam(row), isFalse);
+    expect(HearingCalendarFields.hasNonEmptyText(row['fullText']), isTrue);
+    expect(
+      DateTime.now().difference(started),
+      lessThan(const Duration(milliseconds: 200)),
+    );
+    expect(
+      HearingCalendarFields.isNonCourtHearingSpam({
+        'title': 'Your BlastTV voucher code is ready',
+        'message': 'Enjoy your 30-day voucher redemption',
+      }),
+      isTrue,
+    );
+  });
+
+  test('corrects mashed two-column OCR layout into proper pleading form', () {
+    const rawOcr = '''
+Republic of the Philippines
+REGIONAL TRIAL COURT
+10th Judicial Region
+BRANCH 12 - OROQUIETA CITY
+Email Address: rtclorq012@judiciary.gov.ph
+Contact Number: 09708694723
+
+HEIRS OF VICTORIANA CALIB-OG
+Namely: ELENA G. RAMIREZ, CRISPINA ACEBES, CANDELARIA RAMIREZ, MARCELO CALIB-OG and JANE CALIB-OG,
+RUBEN MONTEJO, AXEL JOSEPH Possession L. BINAORO, DENNIS M. LUMANSOC, SPS. DANILO & PRESCILLA ARMINGOL, RUDY ACEBES & RICKY MEDINA,
+Civil Case No. 5297 versus -
+For: Recovery of Ownership with
+Plaintiff,
+- versus -
+Defendants.
+When this case was called for pre-trial, only Atty. Diogenes B. Apao, Jr. appeared in court for the answering defendants. Answering defendants' Rudy Acebes, Dennis Lumansoc and Ricky Medina, as well as other defendants' Florencia Ramirez, Herculano Acebes, Joy Sayson, Hilario Pausanos, Jr., Alberta Mabalod and Romeo Damas are all present inside the courtroom. Plaintiffs and their counsel failed to appear despite due notice.
+In view of the absence of the plaintiff and their counsel and the fact that the summons issued to defendants' Cesar M. Acebes, Feliciana M. Bari, Rene Mabalod, Sabino M. Mabalod, Jr., Rosabilla M. Galicia, Zenaida M. Dagami, Mely M. Medina and Joan M. Medina were unserved, the court could not proceed for today's pre-trial.
+WHEREFORE, reset the pre-trial on October 28, 2026 at 8:30 in the morning.
+The plaintiffs and counsel are directed to file the necessary pleading in order for the court to acquire jurisdiction over the named defendants who were not duly served of the summons issued to them. — Page 2 — Parties present and counsel are notified in open court.
+Let them sign in the minutes of the Proceedings to dispense with formal notice.
+SO ORDERED.
+Done in Open court this 9th day of September, 2026 at Oroquieta City, Philippines. ce: Atty. Annemarie A. Quiros Atty. Diogenes B. Apao, Jr.
+''';
+
+    final doc = CourtOrderDisplay.parse(rawOcr);
+    expect(doc.isPleading, isTrue);
+    expect(doc.heading, 'ORDER');
+    expect(doc.caseMeta, contains('Civil Case No. 5297'));
+    expect(doc.caseMeta, contains('For: Recovery of Ownership with Possession'));
+
+    final partyTexts = doc.parties.map((p) => p.text).toList();
+    expect(partyTexts.first, contains('HEIRS OF VICTORIANA CALIB-OG'));
+    expect(partyTexts, contains('Plaintiff,'));
+    expect(partyTexts, contains('- versus -'));
+    expect(partyTexts, contains('Defendants.'));
+
+    final defendants = doc.parties.lastWhere((p) => !p.centered).text;
+    expect(defendants, contains('RUBEN MONTEJO'));
+    expect(defendants, contains('AXEL JOSEPH L. BINAORO'));
+    expect(defendants, isNot(contains('Possession')));
   });
 }

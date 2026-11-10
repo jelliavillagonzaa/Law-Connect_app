@@ -1,12 +1,13 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import '../models/system_log_model.dart';
 import 'fcm_service.dart';
-import 'staff_auth_service.dart';
 import 'backup_service.dart';
 import 'semaphore_service.dart';
 import 'firestore_mirror_helper.dart';
+import 'hearing_calendar_fields.dart';
 
 enum _CaseAnalyticsBucket { pending, inProgress, completed }
 
@@ -615,6 +616,123 @@ class AdminService {
     };
   }
 
+  static List<Map<String, dynamic>>? _activityTrendCache;
+  static Future<List<Map<String, dynamic>>>? _activityTrendInFlight;
+  static int _activityTrendToken = 0;
+
+  /// True when the activity chart has already loaded, so PDF export can skip
+  /// another full Firestore read.
+  static bool get hasActivityTrendCache => _activityTrendCache != null;
+
+  /// Monthly counts for the admin activity chart.
+  ///
+  /// Cases use `createdAt`. Hearings use the scheduled hearing date.
+  /// Appointments are booked visits only (cancelled, declined, and the
+  /// leftover accepted request row are left out). Notary uses the preferred
+  /// date, then `createdAt`. Declined notary requests are left out.
+  ///
+  /// Repeat calls reuse the in-memory result. Pass [refresh] after the user
+  /// asks to reload.
+  Future<List<Map<String, dynamic>>> getActivityTrend({bool refresh = false}) {
+    if (!refresh) {
+      final cached = _activityTrendCache;
+      if (cached != null) return Future.value(cached);
+      final pending = _activityTrendInFlight;
+      if (pending != null) return pending;
+    }
+    final token = ++_activityTrendToken;
+    final future = _queryActivityTrend();
+    _activityTrendInFlight = future;
+    return future.then((rows) {
+      if (token == _activityTrendToken) _activityTrendCache = rows;
+      return rows;
+    }).whenComplete(() {
+      if (token == _activityTrendToken) _activityTrendInFlight = null;
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> _queryActivityTrend() async {
+    final snaps = await Future.wait([
+      _firestore.collection('cases').get(),
+      _firestore.collection('hearings').get(),
+      _firestore.collection('appointments').get(),
+    ]);
+
+    final counts = <String, List<int>>{};
+
+    void bump(DateTime? when, int index) {
+      if (when == null) return;
+      final key = _monthKey(when);
+      final row = counts.putIfAbsent(key, () => [0, 0, 0]);
+      row[index] = row[index] + 1;
+    }
+
+    for (final doc in snaps[0].docs) {
+      bump(_asDate(doc.data()['createdAt']), 0);
+    }
+    for (final doc in snaps[1].docs) {
+      final data = doc.data();
+      if (HearingCalendarFields.isEatingHearingJunk(data)) continue;
+      bump(_hearingWhen(data), 1);
+    }
+    for (final doc in snaps[2].docs) {
+      final data = doc.data();
+      final status = (data['status'] as String?)?.toLowerCase().trim() ?? '';
+      if (status == 'declined' ||
+          status == 'cancelled' ||
+          status == 'canceled') {
+        continue;
+      }
+      bump(_appointmentWhen(data), 2);
+    }
+
+    final keys = counts.keys.toList()..sort();
+    return [
+      for (final key in keys)
+        {
+          'month': key,
+          'cases': counts[key]![0],
+          'hearings': counts[key]![1],
+          'appointments': counts[key]![2],
+        },
+    ];
+  }
+
+  static DateTime? _hearingWhen(Map<String, dynamic> data) {
+    final direct = _asDate(data['hearingDateTime']) ??
+        _asDate(data['eventDate']) ??
+        _asDate(data['hearingDate']);
+    if (direct != null) return direct;
+    try {
+      return HearingCalendarFields.resolveEventDate(data);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static DateTime? _asDate(dynamic value) {
+    if (value is Timestamp) return value.toDate();
+    if (value is DateTime) return value;
+    return null;
+  }
+
+  static DateTime? _appointmentWhen(Map<String, dynamic> data) {
+    final direct = _asDate(data['appointmentDateTime']) ?? _asDate(data['finalDate']);
+    if (direct != null) return direct;
+    final dateStr = data['appointmentDate'];
+    if (dateStr is! String || dateStr.trim().isEmpty) return null;
+    final parts = dateStr.split('-');
+    if (parts.length < 3) return null;
+    final year = int.tryParse(parts[0]);
+    final month = int.tryParse(parts[1]);
+    final day = int.tryParse(parts[2]);
+    if (year == null || month == null || day == null) return null;
+    return DateTime(year, month, day);
+  }
+
+  static String _monthKey(DateTime date) =>
+      '${date.year}-${date.month.toString().padLeft(2, '0')}';
+
   // Document Management
   Future<List<Map<String, dynamic>>> getAllDocuments() async {
     final casesSnapshot = await _firestore.collection('cases').get();
@@ -697,49 +815,128 @@ class AdminService {
     );
   }
 
-  // Create staff user with custom password
+  /// Creates an auth user using a secondary Firebase app so the admin's session
+  /// is not replaced/logged out by Firebase Auth client SDK.
+  Future<String> _provisionAuthUser({
+    required String email,
+    required String password,
+  }) async {
+    const tempAppName = 'LCProvisioningApp';
+    FirebaseApp tempApp;
+    try {
+      tempApp = Firebase.app(tempAppName);
+    } catch (_) {
+      tempApp = await Firebase.initializeApp(
+        name: tempAppName,
+        options: Firebase.app().options,
+      );
+    }
+
+    final tempAuth = FirebaseAuth.instanceFor(app: tempApp);
+    final credential = await tempAuth.createUserWithEmailAndPassword(
+      email: email.trim(),
+      password: password,
+    );
+    final uid = credential.user!.uid;
+    try {
+      await tempAuth.signOut();
+    } catch (_) {}
+    return uid;
+  }
+
+  // Create staff user with custom password safely
   Future<Map<String, dynamic>> createStaffUser({
     required String email,
     required String name,
     required String password,
     String? assignedAttorneyId,
+    String? staffTitle,
     String? phone,
     String? address,
   }) async {
     try {
-      // Import staff service
-      final staffService = StaffAuthService();
+      final normalizedEmail = email.trim().toLowerCase();
 
-      // Get first attorney if none specified
-      String? attorneyId = assignedAttorneyId;
-      if (attorneyId == null || attorneyId.isEmpty) {
+      // Check if user already exists in Firestore
+      final existingUsers = await _firestore
+          .collection('users')
+          .where('email', isEqualTo: normalizedEmail)
+          .get();
+
+      if (existingUsers.docs.isNotEmpty) {
+        return {
+          'success': false,
+          'message': 'User with this email already exists',
+        };
+      }
+
+      // If no assigned attorney specified, default to first active attorney if available
+      String attorneyId = assignedAttorneyId ?? '';
+      if (attorneyId.isEmpty) {
         final attorneys = await getAllAttorneys();
         if (attorneys.isNotEmpty) {
           attorneyId = attorneys.first['id'] as String;
-        } else {
-          attorneyId = ''; // Will need to assign later
         }
       }
 
-      final result = await staffService.createStaff(
-        email: email,
-        name: name,
-        assignedAttorneyId: attorneyId,
-        password: password,
-        phone: phone,
-        address: address,
-      );
-
-      if (result['success'] == true) {
-        await logAction(
-          action: 'staff_created',
-          resourceType: 'user',
-          resourceId: result['staffId'],
-          details: 'Created staff: $name',
+      // Create in Firebase Auth safely without logging out current Admin
+      String staffId;
+      try {
+        staffId = await _provisionAuthUser(
+          email: normalizedEmail,
+          password: password.trim(),
         );
+      } on FirebaseAuthException catch (e) {
+        String msg = e.message ?? 'Failed to create staff account';
+        if (e.code == 'email-already-in-use') {
+          msg = 'An account with this email already exists in authentication.';
+        } else if (e.code == 'weak-password') {
+          msg = 'Password is too weak. Please use at least 6 characters.';
+        }
+        return {'success': false, 'message': msg};
       }
 
-      return result;
+      // Create staff document in Firestore
+      final staffData = <String, dynamic>{
+        'email': normalizedEmail,
+        'name': name.trim(),
+        'role': 'staff',
+        'assignedAttorneyId': attorneyId,
+        'isVerified': true,
+        'isActive': true,
+        'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+        if (staffTitle != null && staffTitle.trim().isNotEmpty)
+          'staffTitle': staffTitle.trim(),
+        if (phone != null && phone.trim().isNotEmpty) ...{
+          'phone': phone.trim(),
+          'phoneNumber': phone.trim(),
+        },
+        if (address != null && address.trim().isNotEmpty)
+          'address': address.trim(),
+      };
+
+      final result = await HybridDatastore.set(
+        collection: 'users',
+        id: staffId,
+        data: staffData,
+      );
+      if (!result.isSuccess) {
+        return {'success': false, 'message': result.failureMessage};
+      }
+
+      await logAction(
+        action: 'staff_created',
+        resourceType: 'user',
+        resourceId: staffId,
+        details: 'Created staff: $name',
+      );
+
+      return {
+        'success': true,
+        'message': 'Staff account created successfully.',
+        'staffId': staffId,
+      };
     } catch (e) {
       return {'success': false, 'message': 'Failed to create staff: $e'};
     }
@@ -750,12 +947,18 @@ class AdminService {
     required String name,
     required String email,
     String? specialization,
+    List<String>? specializations,
+    String? password,
+    String? phone,
+    bool isAvailable = true,
   }) async {
     try {
+      final normalizedEmail = email.trim().toLowerCase();
+
       // Check if user already exists
       final existingUsers = await _firestore
           .collection('users')
-          .where('email', isEqualTo: email)
+          .where('email', isEqualTo: normalizedEmail)
           .get();
 
       if (existingUsers.docs.isNotEmpty) {
@@ -765,31 +968,59 @@ class AdminService {
         };
       }
 
-      // Create Firebase Auth user
-      final credential = await _auth.createUserWithEmailAndPassword(
-        email: email,
-        password: 'TempPassword123!', // Temporary password - user should reset
-      );
+      final initialPassword = (password != null && password.trim().isNotEmpty)
+          ? password.trim()
+          : 'TempPassword123!';
 
-      if (credential.user == null) {
-        return {'success': false, 'message': 'Failed to create user account'};
+      // Create Firebase Auth user safely without logging out current Admin
+      String userId;
+      try {
+        userId = await _provisionAuthUser(
+          email: normalizedEmail,
+          password: initialPassword,
+        );
+      } on FirebaseAuthException catch (e) {
+        String msg = e.message ?? 'Failed to create authentication user';
+        if (e.code == 'email-already-in-use') {
+          msg = 'An account with this email already exists in authentication.';
+        } else if (e.code == 'weak-password') {
+          msg = 'Password is too weak. Please use at least 6 characters.';
+        }
+        return {'success': false, 'message': msg};
       }
 
-      final userId = credential.user!.uid;
+      // Collect specializations from List or String
+      List<String> specs = [];
+      if (specializations != null && specializations.isNotEmpty) {
+        specs = specializations
+            .map((s) => s.trim())
+            .where((s) => s.isNotEmpty)
+            .toList();
+      } else if (specialization != null && specialization.isNotEmpty) {
+        specs = specialization
+            .split(',')
+            .map((s) => s.trim())
+            .where((s) => s.isNotEmpty)
+            .toList();
+      }
 
-      // Create user document in Firestore
+      // Create user document in Firestore (storing both for full compatibility)
       final attorneyData = <String, dynamic>{
-        'name': name,
-        'email': email,
+        'name': name.trim(),
+        'email': normalizedEmail,
         'role': 'attorney',
         'isActive': true,
-        'isAvailable': true,
-        'specializations': specialization != null && specialization.isNotEmpty
-            ? specialization.split(',').map((s) => s.trim()).toList()
-            : [],
+        'isAvailable': isAvailable,
+        'specialization': specs,
+        'specializations': specs,
         'createdAt': FieldValue.serverTimestamp(),
         'updatedAt': FieldValue.serverTimestamp(),
+        if (phone != null && phone.trim().isNotEmpty) ...{
+          'phone': phone.trim(),
+          'phoneNumber': phone.trim(),
+        },
       };
+
       final result = await HybridDatastore.set(
         collection: 'users',
         id: userId,
@@ -797,8 +1028,10 @@ class AdminService {
       );
       if (!result.isSuccess) throw Exception(result.failureMessage);
 
-      // Send password reset email so attorney can set their own password
-      await _auth.sendPasswordResetEmail(email: email);
+      // Best effort send password reset email so attorney can also reset via email
+      try {
+        await _auth.sendPasswordResetEmail(email: normalizedEmail);
+      } catch (_) {}
 
       await logAction(
         action: 'attorney_created',
@@ -809,7 +1042,8 @@ class AdminService {
 
       return {
         'success': true,
-        'message': 'Attorney created successfully. Password reset email sent.',
+        'message': 'Attorney created successfully. Password: $initialPassword',
+        'userId': userId,
       };
     } catch (e) {
       return {'success': false, 'message': 'Failed to create attorney: $e'};

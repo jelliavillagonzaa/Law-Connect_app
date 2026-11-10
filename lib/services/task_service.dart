@@ -21,11 +21,12 @@ class TaskService {
   final LocalAttachmentService _localAttachmentService = LocalAttachmentService();
   final FCMService _fcmService = FCMService();
 
-  // Create task (attorney only)
+  // Create task (attorney, staff, or admin)
   Future<Map<String, dynamic>> createTask({
     required String title,
     required String description,
     required String assignedTo, // staffId
+    String? attorneyId,
     String? caseId,
     DateTime? dueDate,
     int? priority,
@@ -40,11 +41,29 @@ class TaskService {
       final userDoc = await _firestore.collection('users').doc(user.uid).get();
       final userRole = userDoc.data()?['role'] ?? 'attorney';
 
+      String resolvedAttorneyId = (attorneyId ?? '').trim();
+      if (resolvedAttorneyId.isEmpty) {
+        if (userRole == 'attorney') {
+          resolvedAttorneyId = user.uid;
+        } else {
+          resolvedAttorneyId = (userDoc.data()?['assignedAttorneyId'] as String?)?.trim() ?? '';
+          if (resolvedAttorneyId.isEmpty && caseId != null && caseId.isNotEmpty) {
+            try {
+              final cDoc = await _firestore.collection('cases').doc(caseId).get();
+              resolvedAttorneyId = (cDoc.data()?['attorneyId'] as String?)?.trim() ?? '';
+            } catch (_) {}
+          }
+          if (resolvedAttorneyId.isEmpty) {
+            resolvedAttorneyId = user.uid;
+          }
+        }
+      }
+
       final taskData = {
         'title': title,
         'description': description,
         'assignedTo': assignedTo,
-        'attorneyId': user.uid,
+        'attorneyId': resolvedAttorneyId,
         'status': 'pending',
         'createdAt': FieldValue.serverTimestamp(),
         'updatedAt': FieldValue.serverTimestamp(),
@@ -62,12 +81,14 @@ class TaskService {
       }
 
       try {
-        await _notifyStaffTaskAssigned(
-          staffId: assignedTo,
-          taskId: result.id!,
-          title: title,
-          caseId: caseId,
-        );
+        if (assignedTo != user.uid) {
+          await _notifyStaffTaskAssigned(
+            staffId: assignedTo,
+            taskId: result.id!,
+            title: title,
+            caseId: caseId,
+          );
+        }
       } catch (e) {
         if (kDebugMode) {
           print('Failed to notify staff of new task: $e');
@@ -149,18 +170,50 @@ class TaskService {
     );
   }
 
-  Stream<List<TaskModel>> getStaffTasks(String staffId) {
-    return _streamSortedTasks(
-      _firestore.collection('tasks').where('assignedTo', isEqualTo: staffId),
-    );
+  Stream<List<TaskModel>> getStaffTasks(String staffId, {String? staffEmail}) {
+    final targets = <String>{
+      staffId.trim(),
+      if (staffEmail != null && staffEmail.trim().isNotEmpty) staffEmail.trim(),
+    }.where((e) => e.isNotEmpty).toList();
+
+    if (targets.isEmpty) {
+      return Stream.value(const <TaskModel>[]);
+    }
+
+    Query<Map<String, dynamic>> query = _firestore.collection('tasks');
+    if (targets.length == 1) {
+      query = query.where('assignedTo', isEqualTo: targets.first);
+    } else {
+      query = query.where('assignedTo', whereIn: targets);
+    }
+
+    return _streamSortedTasks(query, excludeClosed: false);
   }
 
-  Stream<List<TaskModel>> getStaffTasksByStatus(String staffId, String status) {
+  Stream<List<TaskModel>> getStaffTasksByStatus(
+    String staffId,
+    String status, {
+    String? staffEmail,
+  }) {
+    final targets = <String>{
+      staffId.trim(),
+      if (staffEmail != null && staffEmail.trim().isNotEmpty) staffEmail.trim(),
+    }.where((e) => e.isNotEmpty).toList();
+
+    if (targets.isEmpty) {
+      return Stream.value(const <TaskModel>[]);
+    }
+
+    Query<Map<String, dynamic>> query = _firestore.collection('tasks');
+    if (targets.length == 1) {
+      query = query.where('assignedTo', isEqualTo: targets.first);
+    } else {
+      query = query.where('assignedTo', whereIn: targets);
+    }
+
     return _streamSortedTasks(
-      _firestore
-          .collection('tasks')
-          .where('assignedTo', isEqualTo: staffId)
-          .where('status', isEqualTo: status),
+      query.where('status', isEqualTo: status),
+      excludeClosed: false,
     );
   }
 
@@ -382,7 +435,10 @@ class TaskService {
     );
   }
 
-  Stream<List<TaskModel>> _streamSortedTasks(Query<Map<String, dynamic>> query) {
+  Stream<List<TaskModel>> _streamSortedTasks(
+    Query<Map<String, dynamic>> query, {
+    bool excludeClosed = false,
+  }) {
     return query
         .snapshots()
         .asyncMap((snapshot) async {
@@ -390,16 +446,24 @@ class TaskService {
               .map((doc) => TaskModel.fromFirestore(doc))
               .toList();
           tasks.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-          return _excludeClosedCaseTasks(tasks);
+          if (excludeClosed) {
+            return _excludeClosedCaseTasks(tasks);
+          }
+          return tasks;
         })
         .transform(
           StreamTransformer<List<TaskModel>, List<TaskModel>>.fromHandlers(
             handleError: (error, stack, sink) {
+              if (kDebugMode) {
+                print('Error in _streamSortedTasks: $error');
+              }
               sink.add(const <TaskModel>[]);
             },
           ),
         );
   }
+
+  static final Map<String, bool> _caseCompletionCache = {};
 
   /// Tasks on a completed case leave Staff Tasks; they stay on the case.
   Future<List<TaskModel>> _excludeClosedCaseTasks(List<TaskModel> tasks) async {
@@ -412,16 +476,30 @@ class TaskService {
       if (ids.isEmpty) return tasks;
 
       final closedIds = <String>{};
-      for (var i = 0; i < ids.length; i += 10) {
-        final end = i + 10 > ids.length ? ids.length : i + 10;
-        final chunk = ids.sublist(i, end);
+      final missing = <String>[];
+
+      for (final id in ids) {
+        if (_caseCompletionCache.containsKey(id)) {
+          if (_caseCompletionCache[id] == true) {
+            closedIds.add(id);
+          }
+        } else {
+          missing.add(id);
+        }
+      }
+
+      for (var i = 0; i < missing.length; i += 10) {
+        final end = i + 10 > missing.length ? missing.length : i + 10;
+        final chunk = missing.sublist(i, end);
         final snap = await _firestore
             .collection('cases')
             .where(FieldPath.documentId, whereIn: chunk)
             .get();
         for (final doc in snap.docs) {
           final status = doc.data()['status']?.toString();
-          if (CaseStatusFilter.isCompleted(status)) {
+          final isDone = CaseStatusFilter.isCompleted(status);
+          _caseCompletionCache[doc.id] = isDone;
+          if (isDone) {
             closedIds.add(doc.id);
           }
         }

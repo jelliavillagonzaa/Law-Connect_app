@@ -59,6 +59,59 @@ class EmailOtpService {
     return result.emailSent;
   }
 
+  /// Welcome mail after signup. Uses the same EmailJS template fields that
+  /// Gmail already shows: the large line and the line under it.
+  Future<bool> sendWelcome({
+    required String email,
+    required String name,
+  }) async {
+    final recipient = email.trim();
+    if (recipient.isEmpty || !recipient.contains('@')) return false;
+
+    final display = name.trim().isEmpty ? 'there' : name.trim();
+    final link = EmailBranding.websiteUrl;
+    final templateParams = <String, dynamic>{
+      'email': recipient,
+      'to_email': recipient,
+      'user_email': recipient,
+      'to_name': display,
+      'user_name': display,
+      'name': display,
+      'passcode': 'Welcome To Law Connect $display',
+      'message':
+          'Welcome To Law Connect $display. You can install the application now.',
+      'install_link': link,
+      'install_label': 'Install Law Connect',
+      'time': 'You can install the application now: $link',
+      'logo_url': EmailBranding.logoUrl,
+      'logo': EmailBranding.logoUrl,
+      'image_url': EmailBranding.logoUrl,
+      'logo_html': EmailBranding.emailJsLogoHtml,
+    };
+
+    final keyCandidates = <String>{
+      _strippedKey,
+      _configuredKey,
+    }.where((k) => k.isNotEmpty).toList();
+
+    for (final userId in keyCandidates) {
+      for (final serviceId in {_serviceId, 'default_service'}) {
+        try {
+          final response = await _postEmailJs(
+            userId: userId,
+            serviceId: serviceId,
+            templateParams: templateParams,
+          );
+          if (response.statusCode == 200) return true;
+          await Future<void>.delayed(const Duration(milliseconds: 1100));
+        } catch (e) {
+          if (kDebugMode) debugPrint('📧 Welcome email failed: $e');
+        }
+      }
+    }
+    return false;
+  }
+
   Future<EmailOtpSendResult> sendOtpDetailed({
     required String email,
     required String otp,

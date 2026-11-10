@@ -465,9 +465,12 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
     try {
       final user = FirebaseAuth.instance.currentUser;
       final staffName = user?.displayName ?? 'Staff member';
+      final remarks = _remarksController.text.trim();
 
       final title = 'Draft Case Ready for Review';
-      final body = '$staffName has created a draft case: "$caseTitle"';
+      final body = remarks.isNotEmpty
+          ? '$staffName created draft "$caseTitle". Remarks: $remarks'
+          : '$staffName has created a draft case: "$caseTitle"';
 
       // Send FCM notification
       await _fcmService.sendNotificationToUser(
@@ -478,6 +481,7 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
           'type': 'draft_case_ready',
           'caseId': caseId,
           'staffId': user?.uid,
+          if (remarks.isNotEmpty) 'remarks': remarks,
         },
       );
 
@@ -487,9 +491,11 @@ class _StaffCreateCaseDraftScreenState extends State<StaffCreateCaseDraftScreen>
         'title': title,
         'message': body,
         'type': 'draft_case_ready',
+        if (remarks.isNotEmpty) 'remarks': remarks,
         'data': {
           'caseId': caseId,
           'staffId': user?.uid,
+          if (remarks.isNotEmpty) 'remarks': remarks,
         },
         'isRead': false,
         'createdAt': FieldValue.serverTimestamp(),

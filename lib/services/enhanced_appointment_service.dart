@@ -2,6 +2,9 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
 import '../models/appointment_model.dart';
+import '../models/user_model.dart';
+import '../utils/office_time_slots.dart';
+import 'attorney_availability_service.dart';
 import 'attorney_request_notify.dart';
 import 'system_settings_service.dart';
 import 'firestore_mirror_helper.dart';
@@ -88,10 +91,30 @@ class EnhancedAppointmentService {
         }
       } catch (_) {}
 
+      var resolvedClientName = clientName.trim();
+      if (resolvedClientName.isEmpty ||
+          resolvedClientName.contains('@') ||
+          (!resolvedClientName.contains(' ') && RegExp(r'\d{3,}').hasMatch(resolvedClientName))) {
+        try {
+          final clientDoc = await _firestore.collection('users').doc(clientId).get();
+          if (clientDoc.exists && clientDoc.data() != null) {
+            final docData = clientDoc.data()!;
+            final resolved = UserModel.resolveDisplayName(docData).trim();
+            if (resolved.isNotEmpty &&
+                !resolved.contains('@') &&
+                resolved.toLowerCase() != 'client' &&
+                resolved.toLowerCase() != 'user' &&
+                (resolved.contains(' ') || !RegExp(r'\d{3,}').hasMatch(resolved))) {
+              resolvedClientName = resolved;
+            }
+          }
+        } catch (_) {}
+      }
+
       final appointment = AppointmentModel(
         id: appointmentId,
         clientId: clientId,
-        clientName: clientName,
+        clientName: resolvedClientName,
         attorneyId: finalAttorneyId,
         attorneyName: attorneyName,
         caseId: caseId,
@@ -800,8 +823,13 @@ class EnhancedAppointmentService {
         return {'success': false, 'message': 'User not authenticated'};
       }
 
+      final effectiveAttorneyId = (request.attorneyId != null &&
+              request.attorneyId!.trim().isNotEmpty)
+          ? request.attorneyId!.trim()
+          : currentUser.uid;
+
       if (await isTimeSlotTaken(
-        attorneyId: currentUser.uid,
+        attorneyId: effectiveAttorneyId,
         dateTime: finalDateTime,
         excludeAppointmentId: request.id,
       )) {
@@ -814,11 +842,26 @@ class EnhancedAppointmentService {
 
       final now = FieldValue.serverTimestamp();
 
+      var effectiveClientName = request.clientName.trim();
+      if (effectiveClientName.isEmpty ||
+          effectiveClientName.contains('@') ||
+          (!effectiveClientName.contains(' ') && RegExp(r'\d{3,}').hasMatch(effectiveClientName))) {
+        try {
+          final clientDoc = await _firestore.collection('users').doc(request.clientId).get();
+          if (clientDoc.exists && clientDoc.data() != null) {
+            final resolved = UserModel.resolveDisplayName(clientDoc.data()!).trim();
+            if (resolved.isNotEmpty && !resolved.contains('@')) {
+              effectiveClientName = resolved;
+            }
+          }
+        } catch (_) {}
+      }
+
       // 1. Confirmed appointment document
       batch.set(newAppointmentRef, {
         'clientId': request.clientId,
-        'clientName': request.clientName,
-        'attorneyId': currentUser.uid,
+        'clientName': effectiveClientName,
+        'attorneyId': effectiveAttorneyId,
         'attorneyName': request.attorneyName,
         'caseId': request.caseId,
         'caseTitle': request.caseTitle,
@@ -851,13 +894,13 @@ class EnhancedAppointmentService {
         final finalSlot = _minuteTruncated(finalDateTime);
         if (requestedSlot != finalSlot) {
           await _releaseTimeSlot(
-            attorneyId: currentUser.uid,
+            attorneyId: effectiveAttorneyId,
             dateTime: request.appointmentDateTime,
             appointmentId: request.id,
           );
         }
         await _claimTimeSlot(
-          attorneyId: currentUser.uid,
+          attorneyId: effectiveAttorneyId,
           dateTime: finalDateTime,
           appointmentId: newAppointmentRef.id,
           overwrite: true,
@@ -901,7 +944,7 @@ class EnhancedAppointmentService {
       await _scheduleThreeDayAdvanceNotification(
         appointmentId: newAppointmentRef.id,
         clientId: request.clientId,
-        attorneyId: currentUser.uid,
+        attorneyId: effectiveAttorneyId,
         appointmentDateTime: finalDateTime,
         appointmentType: appointmentType,
         clientName: request.clientName,
@@ -912,7 +955,7 @@ class EnhancedAppointmentService {
       await _scheduleSameDayReminder(
         appointmentId: newAppointmentRef.id,
         clientId: request.clientId,
-        attorneyId: currentUser.uid,
+        attorneyId: effectiveAttorneyId,
         appointmentDateTime: finalDateTime,
         appointmentType: appointmentType,
         clientName: request.clientName,
@@ -926,7 +969,7 @@ class EnhancedAppointmentService {
         final notifData = <String, dynamic>{
           'type': 'appointment_accepted',
           'clientId': request.clientId,
-          'attorneyId': currentUser.uid,
+          'attorneyId': effectiveAttorneyId,
           'appointmentId': newAppointmentRef.id,
           'title': 'Appointment Accepted',
           'message':
@@ -1277,6 +1320,16 @@ class EnhancedAppointmentService {
   }) async {
     if (attorneyId.isEmpty) return false;
     final target = _minuteTruncated(dateTime);
+    final window = OfficeTimeSlots.windowStart(dateTime);
+
+    if (window != null &&
+        await AttorneyAvailabilityService().isWindowTaken(
+          attorneyId: attorneyId,
+          dateTime: window,
+          exceptHolderId: excludeAppointmentId,
+        )) {
+      return true;
+    }
 
     try {
       final slotSnap = await _slotRef(attorneyId, target).get();
@@ -1301,7 +1354,11 @@ class EnhancedAppointmentService {
         }
         final apt = AppointmentModel.fromFirestore(doc);
         if (!_statusBlocksSlot(apt.status)) continue;
-        if (_minuteTruncated(apt.appointmentDateTime) == target) {
+        if (window != null) {
+          if (OfficeTimeSlots.occupies(window, apt.appointmentDateTime)) {
+            return true;
+          }
+        } else if (_minuteTruncated(apt.appointmentDateTime) == target) {
           return true;
         }
       }
@@ -1327,6 +1384,10 @@ class EnhancedAppointmentService {
         if (raw is Timestamp) eventDate = raw.toDate();
         if (raw is DateTime) eventDate = raw;
         if (eventDate == null) continue;
+        if (type == 'hearing' && window != null) {
+          if (OfficeTimeSlots.occupies(window, eventDate)) return true;
+          continue;
+        }
         if (_minuteTruncated(eventDate) == target) return true;
       }
     } catch (_) {}

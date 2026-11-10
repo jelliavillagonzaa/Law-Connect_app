@@ -15,6 +15,11 @@ import '../../utils/case_details_export.dart';
 import '../../utils/case_result.dart';
 import '../../utils/case_status_filter.dart';
 import '../../widgets/case/case_status_filter_button.dart';
+import '../../widgets/common/case_description_editor.dart';
+import '../../widgets/common/case_signature_pad.dart';
+import '../../widgets/case/case_billing_card.dart';
+import '../billing/billing_management_screen.dart'
+    show openPaymentHistoryScreen;
 
 class StaffCasesScreen extends StatefulWidget {
   const StaffCasesScreen({super.key, this.closedFolder = false});
@@ -117,7 +122,7 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
       body: StreamBuilder<List<CaseModel>>(
         stream: _showAllCases && _assignedAttorneyId != null
             ? _staffService.getAttorneyCases(_assignedAttorneyId!)
-            : _staffService.getAssignedCases(user.uid),
+            : _staffService.getAssignedCases(user.uid, staffEmail: user.email),
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.waiting &&
               !snapshot.hasData) {
@@ -174,67 +179,155 @@ class _StaffCasesScreenState extends State<StaffCasesScreen> {
           }
 
           return ListView.builder(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
             itemCount: filteredCases.length,
             itemBuilder: (context, index) {
               final caseModel = filteredCases[index];
+              final statusColor = _getStatusColor(caseModel.status);
+              final statusLabel = CaseStatusFilter.statusLabel(caseModel.status);
+              final hasResult = CaseStatusFilter.isCompleted(caseModel.status) &&
+                  CaseResult.label(caseModel.caseResult).isNotEmpty;
+
               return Card(
-                margin: const EdgeInsets.only(bottom: 12),
-                child: ListTile(
-                  contentPadding: const EdgeInsets.all(16),
-                  leading: CircleAvatar(
-                    backgroundColor: _getStatusColor(caseModel.status),
-                    child: Icon(
-                      _getStatusIcon(caseModel.status),
-                      color: AppTheme.cleanWhite,
-                    ),
-                  ),
-                  title: Text(
-                    caseModel.caseTitle,
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      fontSize: 16,
-                    ),
-                  ),
-                  subtitle: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const SizedBox(height: 4),
-                      Text(
-                        'Type: ${caseModel.caseType}',
-                        style: TextStyle(fontSize: 14),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        'Status: ${CaseStatusFilter.statusLabel(caseModel.status)}',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: _getStatusColor(caseModel.status),
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      if (CaseStatusFilter.isCompleted(caseModel.status) &&
-                          CaseResult.label(caseModel.caseResult).isNotEmpty) ...[
-                        const SizedBox(height: 4),
-                        Text(
-                          'Result: ${CaseResult.label(caseModel.caseResult)}',
-                          style: TextStyle(fontSize: 12),
-                        ),
-                      ],
-                      const SizedBox(height: 4),
-                      Text(
-                        'Updated: ${DateFormat('MMM dd, yyyy').format(caseModel.updatedAt)}',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: AppTheme.mutedText,
-                        ),
-                      ),
-                    ],
-                  ),
-                  trailing: const Icon(Icons.chevron_right),
+                margin: const EdgeInsets.only(bottom: 8),
+                elevation: 0,
+                color: Colors.white,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  side: const BorderSide(color: Color(0xFFE2E8F0), width: 1),
+                ),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(12),
                   onTap: () {
                     Get.to(() => StaffCaseDetailPage(caseModel: caseModel));
                   },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        // Compact leading status avatar
+                        Container(
+                          width: 38,
+                          height: 38,
+                          decoration: BoxDecoration(
+                            color: statusColor.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          alignment: Alignment.center,
+                          child: Icon(
+                            _getStatusIcon(caseModel.status),
+                            color: statusColor,
+                            size: 19,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        // Case Details
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                caseModel.caseTitle,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w700,
+                                  fontSize: 13.5,
+                                  color: AppTheme.darkText,
+                                  height: 1.25,
+                                ),
+                              ),
+                              const SizedBox(height: 5),
+                              Wrap(
+                                crossAxisAlignment: WrapCrossAlignment.center,
+                                spacing: 6,
+                                runSpacing: 4,
+                                children: [
+                                  // Status pill
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 7,
+                                      vertical: 2,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: statusColor.withValues(alpha: 0.12),
+                                      borderRadius: BorderRadius.circular(6),
+                                    ),
+                                    child: Text(
+                                      statusLabel,
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        color: statusColor,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ),
+                                  if (hasResult)
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 7,
+                                        vertical: 2,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFFF1F5F9),
+                                        borderRadius: BorderRadius.circular(6),
+                                      ),
+                                      child: Text(
+                                        CaseResult.label(caseModel.caseResult),
+                                        style: const TextStyle(
+                                          fontSize: 11,
+                                          color: AppTheme.darkText,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ),
+                                  Text(
+                                    '•',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: Colors.grey.shade400,
+                                    ),
+                                  ),
+                                  Text(
+                                    caseModel.caseType,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      color: AppTheme.mutedText,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                  Text(
+                                    '•',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: Colors.grey.shade400,
+                                    ),
+                                  ),
+                                  Text(
+                                    DateFormat('MMM dd, yyyy').format(caseModel.updatedAt),
+                                    style: const TextStyle(
+                                      fontSize: 11.5,
+                                      color: AppTheme.mutedText,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        const Icon(
+                          Icons.chevron_right_rounded,
+                          color: Color(0xFF94A3B8),
+                          size: 20,
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
               );
             },
@@ -386,13 +479,23 @@ class _StaffCaseDetailPageState extends State<StaffCaseDetailPage> {
     final resultLabel = CaseResult.label(widget.caseModel.caseResult);
     return Scaffold(
       appBar: AppBar(
-        title: Text('Case Details', style: TextStyle()),
+        title: const Text('Case Details'),
         actions: [
+          IconButton(
+            tooltip: 'Payment History (All Transactions)',
+            icon: const Icon(Icons.history_rounded),
+            onPressed: () => openPaymentHistoryScreen(
+              context,
+              recorderRole: 'staff',
+            ),
+          ),
           CaseDetailsDownloadButton(
             exportData: CaseDetailsExportData(
               caseModel: widget.caseModel,
-              clientName: _client?.name,
-              clientEmail: _client?.email,
+              clientName: _client?.name ?? widget.caseModel.clientName,
+              clientEmail: _client?.email ?? widget.caseModel.clientEmail,
+              clientPhone: _client?.phone ?? _client?.phoneNumber ?? widget.caseModel.clientPhone,
+              clientAddress: _client?.address ?? widget.caseModel.clientAddress,
             ),
           ),
         ],
@@ -491,13 +594,21 @@ class _StaffCaseDetailPageState extends State<StaffCaseDetailPage> {
                       ),
                     ),
                     const SizedBox(height: 8),
-                    Text(
-                      widget.caseModel.caseDescription,
-                      style: TextStyle(fontSize: 14),
+                    CaseDescriptionView(
+                      plainText: widget.caseModel.caseDescription,
+                      deltaJson: widget.caseModel.caseDescriptionDelta,
                     ),
+                    CaseSignatureView(progress: widget.caseModel.progress),
                   ],
                 ),
               ),
+            ),
+
+            const SizedBox(height: 16),
+            CaseBillingCard(
+              caseModel: widget.caseModel,
+              canManage: true,
+              recorderRole: 'staff',
             ),
 
             if (!isClosed) ...[

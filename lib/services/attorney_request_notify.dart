@@ -125,6 +125,10 @@ class AttorneyRequestNotify {
   }
 
   /// In-app bell, optional FCM push, optional SMS.
+  ///
+  /// [smsSentTo] and [pushTokensSent] keep one phone and one device to a
+  /// single text and a single tray card when several accounts share them.
+  /// The bell row is still written for each person.
   static Future<void> notifyParty({
     required String userId,
     required String title,
@@ -136,6 +140,8 @@ class AttorneyRequestNotify {
     bool sendInApp = true,
     bool isClient = false,
     Map<String, dynamic>? data,
+    Set<String>? smsSentTo,
+    Set<String>? pushTokensSent,
   }) async {
     final uid = userId.trim();
     if (uid.isEmpty) return;
@@ -161,6 +167,7 @@ class AttorneyRequestNotify {
             'type': type,
             ...?data,
           },
+          alreadySentTokens: pushTokensSent,
         );
       } catch (e) {
         if (kDebugMode) debugPrint('⚠️ FCM failed ($uid): $e');
@@ -170,6 +177,9 @@ class AttorneyRequestNotify {
     if (!sendSms || smsBody == null || smsBody.trim().isEmpty) return;
     final phone = await _resolveAttorneyPhone(uid);
     if (phone == null || phone.isEmpty) return;
+    final phoneKey = SmsService.normalizePhoneE164Ph(phone);
+    if (phoneKey.isEmpty) return;
+    if (smsSentTo != null && !smsSentTo.add(phoneKey)) return;
     try {
       await _sms.queueSms(
         to: phone,
@@ -182,12 +192,17 @@ class AttorneyRequestNotify {
     }
   }
 
+  static String _profilePhone(Map<String, dynamic> data) {
+    final phoneNumber = data['phoneNumber']?.toString().trim() ?? '';
+    if (phoneNumber.isNotEmpty) return phoneNumber;
+    return data['phone']?.toString().trim() ?? '';
+  }
+
   static Future<String?> _resolveAttorneyPhone(String attorneyId) async {
     try {
       final snap = await _firestore.collection('users').doc(attorneyId).get();
       final data = snap.data() ?? {};
-      final profile =
-          (data['phone'] ?? data['phoneNumber'])?.toString().trim() ?? '';
+      final profile = _profilePhone(data);
       if (profile.isNotEmpty) return profile;
       return null;
     } catch (_) {

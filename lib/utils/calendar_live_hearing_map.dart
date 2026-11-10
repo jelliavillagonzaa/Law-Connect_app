@@ -38,33 +38,61 @@ abstract final class CalendarLiveHearingMap {
     String attorneyId, {
     required bool fallbackToCreatedAt,
   }) {
-    // Hearing date only. createdAt is the upload day, so an October 28
-    // notice must not be stored on the day the document was saved.
-    final DateTime? when = parseHearingWhen(raw);
-    if (when == null) return null;
-
-    final caseNo = _firstStr(raw, const ['caseNo', 'caseNumber', 'case_number']);
-    final clientName = _firstStr(raw, const ['clientName', 'client_name']);
-    final caseTitle = _firstStr(raw, const ['caseTitle', 'case_title']);
-    final courtBranch = _firstStr(raw, const ['courtBranch', 'court_branch', 'court']);
+    final rawCaseNo = _firstStr(raw, const ['caseNo', 'caseNumber', 'case_number']);
+    final cleanCaseNo = HearingCalendarFields.cleanCaseDocketNo(rawCaseNo);
+    final caseNo = cleanCaseNo.isNotEmpty ? cleanCaseNo : rawCaseNo;
+    var clientName = _firstStr(raw, const ['clientName', 'client_name']);
+    final resolvedClient = HearingCalendarFields.resolveClientForDisplay(raw);
+    if (resolvedClient.isNotEmpty) {
+      clientName = resolvedClient;
+    }
+    var caseTitle = _firstStr(raw, const ['caseTitle', 'case_title']);
+    if (!HearingCalendarFields.hasCaseCaptionMarker(caseTitle)) {
+      final resolvedTitle = HearingCalendarFields.resolveCaseTitleForDisplay(raw);
+      if (resolvedTitle.isNotEmpty && HearingCalendarFields.hasCaseCaptionMarker(resolvedTitle)) {
+        caseTitle = resolvedTitle;
+      }
+    }
+    final courtBranch = _firstStr(
+      raw,
+      const ['courtBranch', 'court_branch', 'court', 'location'],
+    );
     final summary = _str(raw['summary']);
     final fullText = _str(raw['fullText']);
     final message = _str(raw['message']);
     final source = _str(raw['source']).toLowerCase();
     final activity = _str(raw['activityType']).toLowerCase();
-    if (caseNo.isEmpty &&
-        clientName.isEmpty &&
-        caseTitle.isEmpty &&
-        courtBranch.isEmpty &&
-        summary.isEmpty &&
-        fullText.isEmpty &&
-        message.isEmpty &&
-        source != 'n8n' &&
-        activity != 'court_import') {
-      return null;
+    final hasIdentity = caseNo.isNotEmpty ||
+        clientName.isNotEmpty ||
+        caseTitle.isNotEmpty ||
+        courtBranch.isNotEmpty ||
+        summary.isNotEmpty ||
+        fullText.isNotEmpty ||
+        message.isNotEmpty ||
+        source == 'n8n' ||
+        activity == 'court_import';
+    if (!hasIdentity) return null;
+
+    // Prefer structured hearingDate / order text. Never drop a court row that
+    // already has case identity — fall back to createdAt so it still paints.
+    DateTime? when = parseHearingWhen(raw);
+    if (when == null && fallbackToCreatedAt) {
+      when = _asDate(raw['createdAt']) ?? _asDate(raw['updatedAt']);
+      if (when != null) {
+        when = DateTime(when.year, when.month, when.day, 8, 30);
+      }
     }
+    if (when == null && hasIdentity) {
+      // Last resort: still show on the grid (upload day) so notify → calendar.
+      when = DateTime.now();
+      when = DateTime(when.year, when.month, when.day, 8, 30);
+    }
+    if (when == null) return null;
 
     final hearingTime = _firstStr(raw, const ['hearingTime', 'hearing_time']);
+    final venue = HearingCalendarFields.resolveVenueForDisplay(raw);
+    final createdAt = _asDate(raw['createdAt']) ?? _asDate(raw['updatedAt']);
+    final updatedAt = _asDate(raw['updatedAt']);
 
     return gridRow(
       docId: docId,
@@ -75,6 +103,9 @@ abstract final class CalendarLiveHearingMap {
       caseTitle: caseTitle,
       courtBranch: courtBranch,
       hearingTime: hearingTime,
+      location: venue.isNotEmpty ? venue : courtBranch,
+      createdAt: createdAt,
+      updatedAt: updatedAt,
     );
   }
 
@@ -95,12 +126,20 @@ abstract final class CalendarLiveHearingMap {
     String caseTitle = '',
     String courtBranch = '',
     String hearingTime = '',
+    String location = '',
+    dynamic createdAt,
+    dynamic updatedAt,
   }) {
-    final title = caseNo.isNotEmpty
-        ? caseNo
-        : (clientName.isNotEmpty
-            ? clientName
-            : (caseTitle.isNotEmpty ? caseTitle : 'Hearing'));
+    final cleanNo = HearingCalendarFields.cleanCaseDocketNo(caseNo);
+    final title = (cleanNo.isNotEmpty &&
+            !HearingCalendarFields.isPlaceholderCaseNo(cleanNo))
+        ? cleanNo
+        : (caseNo.isNotEmpty &&
+                !HearingCalendarFields.isPlaceholderCaseNo(caseNo))
+            ? caseNo
+            : (clientName.isNotEmpty
+                ? clientName
+                : (caseTitle.isNotEmpty ? caseTitle : 'Hearing'));
     return {
       'id': 'live_hearing_$docId',
       'hearingDocId': docId,
@@ -112,6 +151,9 @@ abstract final class CalendarLiveHearingMap {
       if (caseTitle.isNotEmpty) 'caseTitle': caseTitle,
       if (courtBranch.isNotEmpty) 'courtBranch': courtBranch,
       if (hearingTime.isNotEmpty) 'hearingTime': hearingTime,
+      if (location.isNotEmpty) 'location': location,
+      if (createdAt != null) 'createdAt': createdAt,
+      if (updatedAt != null) 'updatedAt': updatedAt,
       'source': HearingCalendarSyncService.sourceTag,
       'assignedTo': attorneyId,
       'readOnly': true,
@@ -122,16 +164,74 @@ abstract final class CalendarLiveHearingMap {
     final resolved = HearingCalendarFields.resolveEventDate(data);
     if (resolved != null) return resolved;
 
+    final fromHearingField =
+        HearingCalendarFields.resolveEventDateFromHearingDateField(data);
+    if (fromHearingField != null) return fromHearingField;
+
+    // Same display path as the notification detail panel.
+    try {
+      final prepared =
+          HearingCalendarFields.prepareForNotificationDisplay(data);
+      final fromPrepared = HearingCalendarFields.resolveEventDate(prepared) ??
+          HearingCalendarFields.resolveEventDateFromHearingDateField(prepared);
+      if (fromPrepared != null) return fromPrepared;
+    } catch (_) {}
+
     final hearingDate = data['hearingDate'] ?? data['hearing_date'] ?? data['date'];
     final fromField = _asDate(hearingDate);
     if (fromField != null) {
       return DateTime(fromField.year, fromField.month, fromField.day, 8, 30);
+    }
+    if (hearingDate is String && hearingDate.trim().isNotEmpty) {
+      final scraped = _scrapedMonthDayYear(hearingDate);
+      if (scraped != null) return scraped;
+    }
+
+    // Pull "November 1, 2026" from title / summary / body when AI omitted hearingDate.
+    for (final key in const [
+      'caseTitle',
+      'title',
+      'summary',
+      'message',
+      'fullText',
+      'clientName',
+    ]) {
+      final scraped = _scrapedMonthDayYear(_str(data[key]));
+      if (scraped != null) return scraped;
     }
 
     final hearingDateTime = data['hearingDateTime'] ?? data['eventDate'];
     if (hearingDateTime is Timestamp) return hearingDateTime.toDate();
     if (hearingDateTime is DateTime) return hearingDateTime;
     return null;
+  }
+
+  static DateTime? _scrapedMonthDayYear(String raw) {
+    if (raw.trim().isEmpty) return null;
+    final m = RegExp(
+      r'(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})\s*,?\s+(\d{4})',
+      caseSensitive: false,
+    ).firstMatch(raw);
+    if (m == null) return null;
+    const months = {
+      'january': 1,
+      'february': 2,
+      'march': 3,
+      'april': 4,
+      'may': 5,
+      'june': 6,
+      'july': 7,
+      'august': 8,
+      'september': 9,
+      'october': 10,
+      'november': 11,
+      'december': 12,
+    };
+    final month = months[m.group(1)!.toLowerCase()];
+    final day = int.tryParse(m.group(2)!);
+    final year = int.tryParse(m.group(3)!);
+    if (month == null || day == null || year == null) return null;
+    return DateTime(year, month, day, 8, 30);
   }
 
   static List<Map<String, dynamic>> mapHearingDocs(

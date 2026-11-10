@@ -9,6 +9,8 @@ import '../../widgets/secondary_button.dart';
 import '../../models/user_model.dart';
 import '../../services/firestore_service.dart';
 import '../../routes/portal_navigation.dart';
+import '../../widgets/common/change_password_dialog.dart';
+import 'help_center_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -159,10 +161,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
       try {
         final user = FirebaseAuth.instance.currentUser;
         if (user != null) {
+          final phone = phoneController.text.trim();
           await _firestoreService.updateUserProfile(user.uid, {
             'fullName': nameController.text.trim(),
             'name': nameController.text.trim(),
-            'phoneNumber': phoneController.text.trim(),
+            'phone': phone,
+            'phoneNumber': phone,
             'address': addressController.text.trim(),
           });
           await _loadUserData();
@@ -191,108 +195,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _changePassword() async {
-    final oldPasswordController = TextEditingController();
-    final newPasswordController = TextEditingController();
-    final confirmPasswordController = TextEditingController();
-
-    final result = await Get.dialog<bool>(
-      AlertDialog(
-        title: const Text('Change Password'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: oldPasswordController,
-                decoration: const InputDecoration(
-                  labelText: 'Current Password',
-                  border: OutlineInputBorder(),
-                  prefixIcon: Icon(Icons.lock),
-                ),
-                obscureText: true,
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: newPasswordController,
-                decoration: const InputDecoration(
-                  labelText: 'New Password',
-                  border: OutlineInputBorder(),
-                  prefixIcon: Icon(Icons.lock_outline),
-                ),
-                obscureText: true,
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: confirmPasswordController,
-                decoration: const InputDecoration(
-                  labelText: 'Confirm New Password',
-                  border: OutlineInputBorder(),
-                  prefixIcon: Icon(Icons.lock_outline),
-                ),
-                obscureText: true,
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Get.back(result: false),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              if (newPasswordController.text !=
-                  confirmPasswordController.text) {
-                Get.snackbar(
-                  'Error',
-                  'Passwords do not match',
-                  backgroundColor: AppTheme.error,
-                  colorText: AppTheme.white,
-                );
-                return;
-              }
-              if (newPasswordController.text.length < 6) {
-                Get.snackbar(
-                  'Error',
-                  'Password must be at least 6 characters',
-                  backgroundColor: AppTheme.error,
-                  colorText: AppTheme.white,
-                );
-                return;
-              }
-              Get.back(result: true);
-            },
-            child: const Text('Change'),
-          ),
-        ],
-      ),
-    );
-
-    if (result == true) {
-      try {
-        final user = FirebaseAuth.instance.currentUser;
-        if (user != null) {
-          // TODO: Re-authenticate with old password
-          // TODO: Update password using FirebaseAuth.instance.currentUser?.updatePassword()
-          Get.snackbar(
-            'Info',
-            'Password change functionality requires re-authentication. Please use Firebase Console or implement re-auth flow.',
-            backgroundColor: AppTheme.warning,
-            colorText: AppTheme.white,
-            duration: const Duration(seconds: 4),
-          );
-        }
-      } catch (e) {
-        if (mounted) {
-          Get.snackbar(
-            'Error',
-            'Failed to change password: $e',
-            backgroundColor: AppTheme.error,
-            colorText: AppTheme.white,
-          );
-        }
-      }
-    }
+    await ChangePasswordDialog.show(context);
   }
 
   Future<void> _logout() async {
@@ -484,6 +387,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     text: 'Change Password',
                     icon: Icons.lock_outline,
                     onPressed: _changePassword,
+                  ),
+                  const SizedBox(height: 12),
+                  SecondaryButton(
+                    text: 'Help Center',
+                    icon: Icons.help_outline,
+                    onPressed: () => Get.to(() => const HelpCenterScreen()),
                   ),
                   const SizedBox(height: 12),
                   SizedBox(

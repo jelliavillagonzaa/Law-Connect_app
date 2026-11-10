@@ -62,10 +62,37 @@ Future<List<UserModel>> loadBookableAttorneys() async {
   return bookable;
 }
 
-/// Opens the request-appointment flow without flashing Choose Attorney
-/// when the firm has only one bookable attorney.
+/// Opens the request form directly when the firm has one bookable attorney.
+/// Choose Attorney is only shown when there are several, or none.
 Future<void> openRequestAppointmentFlow() async {
-  await Get.to(() => const AttorneySelectionScreen());
+  Get.dialog(
+    const Center(child: CircularProgressIndicator()),
+    barrierDismissible: false,
+  );
+  List<UserModel> attorneys;
+  try {
+    attorneys = await loadBookableAttorneys();
+  } catch (_) {
+    if (Get.isDialogOpen == true) Get.back();
+    await Get.to(() => const AttorneySelectionScreen());
+    return;
+  }
+  if (Get.isDialogOpen == true) Get.back();
+
+  if (attorneys.length == 1) {
+    final attorney = attorneys.first;
+    await Get.to(
+      () => RequestAppointmentScreen(
+        attorneyId: attorney.id,
+        attorneyName: attorneyDisplayName(attorney),
+      ),
+    );
+    return;
+  }
+
+  await Get.to(
+    () => AttorneySelectionScreen(initialAttorneys: attorneys),
+  );
 }
 
 /// Shown only when the firm has multiple bookable attorneys (or none).

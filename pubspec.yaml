@@ -23,7 +23,7 @@ dependencies:
   cloud_functions: ^5.1.1
   http: ^1.2.0
   url_launcher: ^6.3.2
-  intl: ^0.19.0
+  intl: 0.20.2
   add_2_calendar: ^2.1.0
   file_picker: ^8.1.2
   google_maps_flutter: ^2.9.0
@@ -38,13 +38,26 @@ dependencies:
   supabase_flutter: ^2.12.2
   firebase_app_check: ^0.3.2+10
   google_fonts: ^6.2.1
+  flutter_quill: 11.4.2
+  flutter_localizations:
+    sdk: flutter
 
 flutter:
   uses-material-design: true
   assets:
     - assets/logo.png
     - assets/Landingpage.png
+    - assets/brainstorming.webp
+    - assets/supreme-court.webp
+    - assets/justice-court.webp
     - assets/data/misamis_occidental_addresses.json
+    - assets/notary/
+    - assets/notary/valid_ids_example.jpg
+    - assets/notary/affidavit_of_loss.jpg
+    - assets/notary/joint_affidavit.jpg
+    - assets/notary/special_power_of_attorney.jpg
+    - assets/notary/psa_birth_cert_example.jpg
+    - assets/notary/deed_of_sale.jpg
   fonts:
     - family: NotoSans
       fonts:

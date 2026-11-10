@@ -5,7 +5,7 @@ import '../../models/case_request_model.dart';
 import '../../screens/attorney/attorney_create_case_screen.dart';
 import '../../theme/app_theme.dart';
 
-class CaseRequestsWidget extends StatelessWidget {
+class CaseRequestsWidget extends StatefulWidget {
   final String attorneyId;
   final bool isMobile;
 
@@ -16,10 +16,32 @@ class CaseRequestsWidget extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
-    final requestService = CaseRequestService();
+  State<CaseRequestsWidget> createState() => _CaseRequestsWidgetState();
+}
 
-    final compact = !isMobile;
+class _CaseRequestsWidgetState extends State<CaseRequestsWidget> {
+  final CaseRequestService _requestService = CaseRequestService();
+  late Stream<List<CaseRequestModel>> _requestsStream;
+
+  @override
+  void initState() {
+    super.initState();
+    _requestsStream =
+        _requestService.getAttorneyCaseRequests(widget.attorneyId);
+  }
+
+  @override
+  void didUpdateWidget(CaseRequestsWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.attorneyId != widget.attorneyId) {
+      _requestsStream =
+          _requestService.getAttorneyCaseRequests(widget.attorneyId);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final compact = !widget.isMobile;
 
     return SingleChildScrollView(
       physics: const AlwaysScrollableScrollPhysics(
@@ -104,7 +126,7 @@ class CaseRequestsWidget extends StatelessWidget {
             ),
             const SizedBox(height: 16),
             StreamBuilder<List<CaseRequestModel>>(
-              stream: requestService.getAttorneyCaseRequests(attorneyId),
+              stream: _requestsStream,
               builder: (context, snapshot) {
                 final requests = snapshot.data ?? [];
                 final isWaiting =
@@ -168,7 +190,7 @@ class CaseRequestsWidget extends StatelessWidget {
                 return Column(
                   mainAxisSize: MainAxisSize.min,
                   children: requests.map((request) {
-                    return _buildRequestCard(context, request, requestService);
+                    return _buildRequestCard(context, request, _requestService);
                   }).toList(),
                 );
               },

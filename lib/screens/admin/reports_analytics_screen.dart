@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'dart:convert';
+import 'package:flutter/services.dart' show rootBundle;
 import 'dart:typed_data';
 import 'package:get/get.dart';
 import 'package:intl/intl.dart';
@@ -7,6 +7,7 @@ import 'package:syncfusion_flutter_pdf/pdf.dart';
 import '../../services/admin_service.dart';
 import '../../theme/app_theme.dart';
 import '../../utils/report_exporter/report_exporter.dart';
+import '../../widgets/admin/admin_activity_trend_panel.dart';
 import '../../widgets/admin/admin_cases_by_type_panel.dart';
 import '../../widgets/admin/admin_page_header.dart';
 import '../../widgets/admin/admin_ui_theme.dart';
@@ -38,12 +39,14 @@ class ReportsAnalyticsScreen extends StatefulWidget {
 class _ReportsAnalyticsScreenState extends State<ReportsAnalyticsScreen> {
   final AdminService _adminService = AdminService();
   bool _isLoading = true;
+  bool _exporting = false;
   Map<String, dynamic>? _analytics;
 
   @override
   void initState() {
     super.initState();
     _loadAnalytics();
+    _adminService.getActivityTrend();
   }
 
   Future<void> _loadAnalytics({bool showFullScreenSpinner = true}) async {
@@ -284,6 +287,17 @@ class _ReportsAnalyticsScreenState extends State<ReportsAnalyticsScreen> {
                           _buildCasesByTypeSection(),
                         ],
                       ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Card(
+                    elevation: 2,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(AdminUi.radius),
+                    ),
+                    child: const Padding(
+                      padding: EdgeInsets.all(20),
+                      child: AdminActivityTrendPanel(),
                     ),
                   ),
                 ],
@@ -590,163 +604,62 @@ class _ReportsAnalyticsScreenState extends State<ReportsAnalyticsScreen> {
   }
 
   Future<void> _exportReport() async {
-    Get.dialog(
-      const Center(child: CircularProgressIndicator()),
-      barrierDismissible: false,
-    );
-
+    if (_exporting) return;
+    _exporting = true;
+    final waiting = _analytics == null || !AdminService.hasActivityTrendCache;
+    if (waiting) {
+      Get.snackbar(
+        'Reports',
+        'Saving PDF…',
+        snackPosition: SnackPosition.BOTTOM,
+        backgroundColor: AppTheme.royalBlue,
+        colorText: Colors.white,
+        duration: const Duration(seconds: 2),
+      );
+    }
     try {
-      // Prefer using already-loaded analytics to match what's on-screen.
-      // Fall back to service call if needed.
       final analytics = _analytics ?? await _adminService.getAnalytics();
-
-      Get.back(); // Close loading
+      if (!mounted) return;
+      List<Map<String, dynamic>> activityTrend = const [];
+      try {
+        activityTrend = await _adminService.getActivityTrend();
+      } catch (_) {}
+      if (!mounted) return;
 
       final generatedAt = DateTime.now();
-      final filenameBase =
-          'analytics-report-${DateFormat('yyyyMMdd-HHmm').format(generatedAt)}';
-
-      final textBytes = _buildPlainTextBytes(analytics, generatedAt);
-      final wordBytes = _buildWordDocBytes(analytics, generatedAt);
-      final pdfBytes = _buildPdfBytes(analytics, generatedAt);
-
-      // Show export actions (downloadable files), not raw JSON.
-      Get.dialog(
-        AlertDialog(
-          title: const Text('Export Successful'),
-          content: SizedBox(
-            width: double.maxFinite,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text('Your analytics report is ready to download.'),
-                const SizedBox(height: 12),
-                Text(
-                  'Generated: ${DateFormat('MMM dd, yyyy • hh:mm a').format(generatedAt)}',
-                  style: TextStyle(fontSize: 12, color: Colors.grey[700]),
-                ),
-                const SizedBox(height: 16),
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton.icon(
-                    onPressed: () async {
-                      try {
-                        await saveBytes(
-                          bytes: textBytes,
-                          filename: '$filenameBase.txt',
-                          mimeType: 'text/plain',
-                        );
-                        Get.snackbar(
-                          'Downloaded',
-                          'Text report saved. Open with Notepad or any text app.',
-                          backgroundColor: Colors.green,
-                          colorText: Colors.white,
-                        );
-                      } catch (e) {
-                        Get.snackbar(
-                          'Error',
-                          'Failed to download text report: $e',
-                          backgroundColor: Colors.red,
-                          colorText: Colors.white,
-                        );
-                      }
-                    },
-                    icon: const Icon(Icons.text_snippet_outlined),
-                    label: const Text('Download Text (.txt)'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: AppTheme.royalBlue,
-                      foregroundColor: Colors.white,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: () async {
-                          try {
-                            await saveBytes(
-                              bytes: wordBytes,
-                              filename: '$filenameBase.rtf',
-                              mimeType: 'application/rtf',
-                            );
-                            Get.snackbar(
-                              'Downloaded',
-                              'RTF report saved. Open with Microsoft Word or Google Docs.',
-                              backgroundColor: Colors.green,
-                              colorText: Colors.white,
-                            );
-                          } catch (e) {
-                            Get.snackbar(
-                              'Error',
-                              'Failed to download RTF report: $e',
-                              backgroundColor: Colors.red,
-                              colorText: Colors.white,
-                            );
-                          }
-                        },
-                        icon: const Icon(Icons.description_outlined),
-                        label: const Text('Word (RTF)'),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        onPressed: () async {
-                          try {
-                            await saveBytes(
-                              bytes: pdfBytes,
-                              filename: '$filenameBase.pdf',
-                              mimeType: 'application/pdf',
-                            );
-                            Get.snackbar(
-                              'Downloaded',
-                              'PDF report saved to your device.',
-                              backgroundColor: Colors.green,
-                              colorText: Colors.white,
-                            );
-                          } catch (e) {
-                            Get.snackbar(
-                              'Error',
-                              'Failed to download PDF report: $e',
-                              backgroundColor: Colors.red,
-                              colorText: Colors.white,
-                            );
-                          }
-                        },
-                        icon: const Icon(Icons.picture_as_pdf_outlined),
-                        label: const Text('PDF'),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: AppTheme.gold,
-                          foregroundColor: Colors.black87,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  'Tip: Use Text (.txt) for readable stats in Notepad. RTF is for Word only — do not open RTF in Notepad.',
-                  style: TextStyle(fontSize: 12, color: Colors.grey[700]),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(onPressed: () => Get.back(), child: const Text('Close')),
-          ],
-        ),
+      final filename =
+          'analytics-report-${DateFormat('yyyyMMdd-HHmm').format(generatedAt)}.pdf';
+      final pdfBytes = await _buildPdfBytes(
+        analytics,
+        generatedAt,
+        activityTrend,
+      );
+      await saveBytes(
+        bytes: pdfBytes,
+        filename: filename,
+        mimeType: 'application/pdf',
+      );
+      if (!mounted) return;
+      if (waiting) Get.closeCurrentSnackbar();
+      Get.snackbar(
+        'Downloaded',
+        'PDF report saved to your device.',
+        snackPosition: SnackPosition.BOTTOM,
+        backgroundColor: Colors.green,
+        colorText: Colors.white,
+        duration: const Duration(seconds: 2),
       );
     } catch (e) {
-      Get.back(); // Close loading
+      if (!mounted) return;
       Get.snackbar(
         'Error',
         'Failed to export report: $e',
+        snackPosition: SnackPosition.BOTTOM,
         backgroundColor: Colors.red,
         colorText: Colors.white,
       );
+    } finally {
+      _exporting = false;
     }
   }
 
@@ -762,152 +675,399 @@ class _ReportsAnalyticsScreenState extends State<ReportsAnalyticsScreen> {
     return {};
   }
 
-  /// Human-readable lines matching the on-screen analytics report.
-  List<String> _buildReportLines(
-    Map<String, dynamic> analytics,
-    DateTime generatedAt,
-  ) {
-    final casesByType = _parseCasesByType(analytics['casesByType']);
-    final generated = DateFormat('MMMM dd, yyyy - hh:mm a').format(generatedAt);
-
-    final lines = <String>[
-      'Reports & Analytics',
-      '',
-      'Generated: $generated',
-      '',
-      'User Statistics',
-      'Total Users: ${_intValue(analytics['totalUsers'])}',
-      'Clients: ${_intValue(analytics['clients'])}',
-      'Attorneys: ${_intValue(analytics['attorneys'])}',
-      'Admins: ${_intValue(analytics['admins'])}',
-      '',
-      'Case Statistics',
-      'Total Cases: ${_intValue(analytics['totalCases'])}',
-      'Pending Cases: ${_intValue(analytics['pendingCases'])}',
-      'In Progress Cases: ${_intValue(analytics['inProgressCases'])}',
-      'Completed Cases: ${_intValue(analytics['completedCases'])}',
-    ];
-
-    if (casesByType.isNotEmpty) {
-      lines.addAll(['', 'Cases by Type']);
-      for (final e in casesByType.entries) {
-        lines.add('${e.key}: ${_intValue(e.value)}');
-      }
+  List<int> _activityShares(List<int> counts) {
+    final total = counts.fold<int>(0, (sum, value) => sum + value);
+    if (total <= 0) return List<int>.filled(counts.length, 0);
+    final exact = [for (final value in counts) value * 100 / total];
+    final floors = [for (final value in exact) value.floor()];
+    var leftover = 100 - floors.fold<int>(0, (sum, value) => sum + value);
+    final order = List<int>.generate(counts.length, (i) => i)
+      ..sort((a, b) => (exact[b] - floors[b]).compareTo(exact[a] - floors[a]));
+    var cursor = 0;
+    while (leftover > 0 && order.isNotEmpty) {
+      floors[order[cursor % order.length]]++;
+      leftover--;
+      cursor++;
     }
-
-    return lines;
+    return floors;
   }
 
-  Uint8List _buildPlainTextBytes(
+  Future<Uint8List> _buildPdfBytes(
     Map<String, dynamic> analytics,
-    DateTime generatedAt,
-  ) {
-    final body = _buildReportLines(analytics, generatedAt).join('\r\n');
-    return Uint8List.fromList(utf8.encode(body));
-  }
-
-  String _escapeRtf(String text) {
-    final buffer = StringBuffer();
-    for (final codeUnit in text.runes) {
-      if (codeUnit == 0x5c) {
-        buffer.write(r'\\');
-      } else if (codeUnit == 0x7b) {
-        buffer.write(r'\{');
-      } else if (codeUnit == 0x7d) {
-        buffer.write(r'\}');
-      } else if (codeUnit < 0x80) {
-        buffer.writeCharCode(codeUnit);
-      } else {
-        final signed = codeUnit > 0x7fff ? codeUnit - 0x10000 : codeUnit;
-        buffer.write('\\u$signed?');
-      }
-    }
-    return buffer.toString();
-  }
-
-  bool _isReportHeading(String line) {
-    return line == 'Reports & Analytics' ||
-        line == 'User Statistics' ||
-        line == 'Case Statistics' ||
-        line == 'Cases by Type';
-  }
-
-  Uint8List _buildWordDocBytes(
-    Map<String, dynamic> analytics,
-    DateTime generatedAt,
-  ) {
-    final lines = _buildReportLines(analytics, generatedAt);
-    final rtf = StringBuffer()
-      ..write(r'{\rtf1\ansi\deff0{\fonttbl{\f0\fswiss Arial;}}')
-      ..write(r'\f0\fs24');
-
-    for (final line in lines) {
-      if (line.isEmpty) {
-        rtf.write(r'\par');
-        continue;
-      }
-      if (_isReportHeading(line)) {
-        rtf.write(r'\b ');
-        rtf.write(_escapeRtf(line));
-        rtf.write(r'\b0\par');
-      } else {
-        rtf.write(_escapeRtf(line));
-        rtf.write(r'\par');
-      }
-    }
-
-    rtf.write('}');
-    return Uint8List.fromList(utf8.encode(rtf.toString()));
-  }
-
-  Uint8List _buildPdfBytes(
-    Map<String, dynamic> analytics,
-    DateTime generatedAt,
-  ) {
+    DateTime generatedAt, [
+    List<Map<String, dynamic>> activityTrend = const [],
+  ]) async {
     final doc = PdfDocument();
-    final page = doc.pages.add();
+    doc.pageSettings.orientation = PdfPageOrientation.portrait;
+    const headerHeight = 78.0;
+    const footerHeight = 28.0;
+    doc.pageSettings.margins = PdfMargins()
+      ..left = 36
+      ..right = 36
+      ..top = headerHeight
+      ..bottom = footerHeight + 8;
+
+    final navy = PdfColor(16, 36, 72);
+    final ink = PdfColor(28, 42, 68);
+    final muted = PdfColor(96, 110, 130);
+    final line = PdfColor(214, 222, 232);
+    final zebra = PdfColor(245, 248, 252);
+    final gold = PdfColor(212, 160, 23);
+
+    final fontBrand = PdfStandardFont(
+      PdfFontFamily.helvetica,
+      14,
+      style: PdfFontStyle.bold,
+    );
     final fontTitle = PdfStandardFont(
       PdfFontFamily.helvetica,
-      18,
+      13,
       style: PdfFontStyle.bold,
     );
-    final fontH = PdfStandardFont(
+    final fontSection = PdfStandardFont(
       PdfFontFamily.helvetica,
-      12,
+      11,
       style: PdfFontStyle.bold,
     );
-    final font = PdfStandardFont(PdfFontFamily.helvetica, 11);
+    final fontBold = PdfStandardFont(
+      PdfFontFamily.helvetica,
+      9,
+      style: PdfFontStyle.bold,
+    );
+    final font = PdfStandardFont(PdfFontFamily.helvetica, 9);
+    final fontSmall = PdfStandardFont(PdfFontFamily.helvetica, 8);
 
-    double y = 0;
-    void line(String text, {PdfFont? f, double gap = 18}) {
-      page.graphics.drawString(
-        text,
-        f ?? font,
-        bounds: Rect.fromLTWH(0, y, page.getClientSize().width, 20),
+    Uint8List? logoBytes;
+    try {
+      final data = await rootBundle.load('assets/logo.png');
+      logoBytes = data.buffer.asUint8List();
+    } catch (_) {}
+
+    final pageSize = doc.pageSettings.size;
+    final header = PdfPageTemplateElement(
+      Rect.fromLTWH(0, 0, pageSize.width, headerHeight),
+    );
+    header.graphics.drawRectangle(
+      brush: PdfSolidBrush(navy),
+      bounds: Rect.fromLTWH(0, 0, pageSize.width, headerHeight),
+    );
+    header.graphics.drawRectangle(
+      brush: PdfSolidBrush(gold),
+      bounds: Rect.fromLTWH(0, headerHeight - 3, pageSize.width, 3),
+    );
+    if (logoBytes != null) {
+      header.graphics.drawImage(
+        PdfBitmap(logoBytes),
+        const Rect.fromLTWH(36, 14, 50, 50),
       );
-      y += gap;
+    }
+    header.graphics.drawString(
+      'Law Connect',
+      fontBrand,
+      brush: PdfBrushes.white,
+      bounds: const Rect.fromLTWH(96, 18, 220, 18),
+    );
+    header.graphics.drawString(
+      'Admin Console',
+      fontSmall,
+      brush: PdfSolidBrush(PdfColor(190, 205, 224)),
+      bounds: const Rect.fromLTWH(96, 38, 220, 12),
+    );
+    header.graphics.drawString(
+      'Reports & Analytics',
+      fontTitle,
+      brush: PdfBrushes.white,
+      bounds: Rect.fromLTWH(280, 16, pageSize.width - 316, 18),
+      format: PdfStringFormat(alignment: PdfTextAlignment.right),
+    );
+    header.graphics.drawString(
+      DateFormat('MMMM d, yyyy  •  h:mm a').format(generatedAt),
+      fontSmall,
+      brush: PdfSolidBrush(PdfColor(190, 205, 224)),
+      bounds: Rect.fromLTWH(280, 38, pageSize.width - 316, 12),
+      format: PdfStringFormat(alignment: PdfTextAlignment.right),
+    );
+    doc.template.top = header;
+
+    final footer = PdfPageTemplateElement(
+      Rect.fromLTWH(0, 0, pageSize.width, footerHeight),
+    );
+    footer.graphics.drawLine(
+      PdfPen(line, width: 0.6),
+      const Offset(36, 0),
+      Offset(pageSize.width - 36, 0),
+    );
+    footer.graphics.drawString(
+      'Law Connect  ·  Justice Within Reach',
+      fontSmall,
+      brush: PdfSolidBrush(muted),
+      bounds: Rect.fromLTWH(36, 8, pageSize.width - 180, 12),
+    );
+    final pageNumber = PdfPageNumberField(
+      font: fontSmall,
+      brush: PdfSolidBrush(muted),
+    );
+    final pageCount = PdfPageCountField(
+      font: fontSmall,
+      brush: PdfSolidBrush(muted),
+    );
+    PdfCompositeField(
+      font: fontSmall,
+      brush: PdfSolidBrush(muted),
+      text: 'Page {0} of {1}',
+      fields: <PdfAutomaticField>[pageNumber, pageCount],
+    ).draw(footer.graphics, Offset(pageSize.width - 120, 8));
+    doc.template.bottom = footer;
+
+    PdfPage page = doc.pages.add();
+    var g = page.graphics;
+    var size = page.getClientSize();
+    var y = 4.0;
+
+    void continueOn(PdfPage next, double top) {
+      page = next;
+      g = page.graphics;
+      size = page.getClientSize();
+      y = top;
     }
 
-    final reportLines = _buildReportLines(analytics, generatedAt);
-    for (final reportLine in reportLines) {
-      if (reportLine.isEmpty) {
-        y += 8;
-        continue;
+    void ensureSpace(double needed) {
+      if (y + needed <= size.height) return;
+      continueOn(doc.pages.add(), 4);
+    }
+
+    void sectionTitle(String title) {
+      ensureSpace(28);
+      g.drawRectangle(
+        brush: PdfSolidBrush(navy),
+        bounds: Rect.fromLTWH(0, y + 1, 3, 12),
+      );
+      g.drawString(
+        title,
+        fontSection,
+        brush: PdfSolidBrush(navy),
+        bounds: Rect.fromLTWH(10, y, size.width - 10, 16),
+      );
+      y += 20;
+    }
+
+    PdfGrid styledGrid({
+      required List<String> headers,
+      required List<List<String>> rows,
+      List<PdfTextAlignment>? align,
+    }) {
+      final grid = PdfGrid();
+      grid.columns.add(count: headers.length);
+      grid.headers.add(1);
+      grid.style = PdfGridStyle(
+        font: font,
+        cellPadding: PdfPaddings(left: 8, right: 8, top: 5, bottom: 5),
+      );
+      for (var c = 0; c < headers.length; c++) {
+        final cell = grid.headers[0].cells[c];
+        cell.value = headers[c];
+        cell.style.backgroundBrush = PdfSolidBrush(navy);
+        cell.style.textBrush = PdfBrushes.white;
+        cell.style.font = fontBold;
+        cell.style.borders.all = PdfPen(navy, width: 0.2);
+        cell.stringFormat = PdfStringFormat(
+          alignment: align != null && c < align.length
+              ? align[c]
+              : PdfTextAlignment.left,
+          lineAlignment: PdfVerticalAlignment.middle,
+        );
       }
-      if (reportLine == 'Reports & Analytics') {
-        line(reportLine, f: fontTitle, gap: 24);
-        continue;
+      for (var r = 0; r < rows.length; r++) {
+        final row = grid.rows.add();
+        final bg = r.isOdd ? zebra : PdfColor(255, 255, 255);
+        for (var c = 0; c < headers.length; c++) {
+          final cell = row.cells[c];
+          cell.value = c < rows[r].length ? rows[r][c] : '';
+          cell.style.font = c == 0 ? font : fontBold;
+          cell.style.backgroundBrush = PdfSolidBrush(bg);
+          cell.style.textBrush = PdfSolidBrush(ink);
+          cell.style.borders.all = PdfPen(line, width: 0.4);
+          cell.stringFormat = PdfStringFormat(
+            alignment: align != null && c < align.length
+                ? align[c]
+                : PdfTextAlignment.left,
+            lineAlignment: PdfVerticalAlignment.middle,
+          );
+        }
       }
-      if (_isReportHeading(reportLine)) {
-        y += 6;
-        line(reportLine, f: fontH);
-        continue;
+      return grid;
+    }
+
+    PdfLayoutResult? drawGrid(PdfGrid grid, {double x = 0, double? width}) {
+      final result = grid.draw(
+        page: page,
+        bounds: Rect.fromLTWH(
+          x,
+          y,
+          width ?? size.width,
+          size.height - y,
+        ),
+        format: PdfLayoutFormat(layoutType: PdfLayoutType.paginate),
+      );
+      return result;
+    }
+
+    final userRows = [
+      ['Total users', _intValue(analytics['totalUsers']).toString()],
+      ['Clients', _intValue(analytics['clients']).toString()],
+      ['Attorneys', _intValue(analytics['attorneys']).toString()],
+      ['Admins', _intValue(analytics['admins']).toString()],
+    ];
+    final caseRows = [
+      ['Total cases', _intValue(analytics['totalCases']).toString()],
+      ['Pending', _intValue(analytics['pendingCases']).toString()],
+      ['In progress', _intValue(analytics['inProgressCases']).toString()],
+      ['Completed', _intValue(analytics['completedCases']).toString()],
+    ];
+
+    sectionTitle('Overview');
+    final gap = 14.0;
+    final colW = (size.width - gap) / 2;
+    final leftGrid = styledGrid(
+      headers: ['User statistics', 'Count'],
+      rows: userRows,
+      align: const [PdfTextAlignment.left, PdfTextAlignment.right],
+    );
+    final rightGrid = styledGrid(
+      headers: ['Case statistics', 'Count'],
+      rows: caseRows,
+      align: const [PdfTextAlignment.left, PdfTextAlignment.right],
+    );
+    final leftResult = drawGrid(leftGrid, width: colW);
+    final rightResult = drawGrid(rightGrid, x: colW + gap, width: colW);
+    final overviewBottom = mathMax(
+      leftResult?.bounds.bottom ?? y,
+      rightResult?.bounds.bottom ?? y,
+    );
+    final overviewPage = rightResult?.page ?? leftResult?.page ?? page;
+    continueOn(overviewPage, overviewBottom + 18);
+
+    final casesByType = _parseCasesByType(analytics['casesByType']);
+    final typeRows = casesByType.entries
+        .map((e) => MapEntry(e.key, _intValue(e.value)))
+        .where((e) => e.value > 0)
+        .toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    sectionTitle('Cases by Type');
+    if (typeRows.isEmpty) {
+      ensureSpace(16);
+      g.drawString(
+        'No cases in this report.',
+        font,
+        brush: PdfSolidBrush(muted),
+        bounds: Rect.fromLTWH(0, y, size.width, 14),
+      );
+      y += 22;
+    } else {
+      final typeGrid = styledGrid(
+        headers: ['Case type', 'Count'],
+        rows: [
+          for (final row in typeRows) [row.key, row.value.toString()],
+        ],
+        align: const [PdfTextAlignment.left, PdfTextAlignment.right],
+      );
+      final typeResult = drawGrid(typeGrid);
+      if (typeResult != null) {
+        continueOn(typeResult.page, typeResult.bounds.bottom + 18);
       }
-      line(reportLine);
+    }
+
+    var cases = 0;
+    var hearings = 0;
+    var appointments = 0;
+    for (final row in activityTrend) {
+      cases += _intValue(row['cases']);
+      hearings += _intValue(row['hearings']);
+      appointments += _intValue(row['appointments']);
+    }
+    final shares = _activityShares([cases, hearings, appointments]);
+
+    sectionTitle('Activity Trend');
+    final summary = styledGrid(
+      headers: ['Summary', 'Cases', 'Hearings', 'Appointments'],
+      rows: [
+        [
+          'Count',
+          '$cases',
+          '$hearings',
+          '$appointments',
+        ],
+        [
+          'Share',
+          '${shares[0]}%',
+          '${shares[1]}%',
+          '${shares[2]}%',
+        ],
+      ],
+      align: const [
+        PdfTextAlignment.left,
+        PdfTextAlignment.center,
+        PdfTextAlignment.center,
+        PdfTextAlignment.center,
+      ],
+    );
+    final summaryResult = drawGrid(summary);
+    if (summaryResult != null) {
+      continueOn(summaryResult.page, summaryResult.bounds.bottom + 16);
+    }
+
+    if (activityTrend.isEmpty) {
+      ensureSpace(16);
+      g.drawString(
+        'No case, hearing, or appointment activity recorded.',
+        font,
+        brush: PdfSolidBrush(muted),
+        bounds: Rect.fromLTWH(0, y, size.width, 14),
+      );
+    } else {
+      ensureSpace(18);
+      g.drawString(
+        'Monthly activity',
+        fontBold,
+        brush: PdfSolidBrush(ink),
+        bounds: Rect.fromLTWH(0, y, size.width, 14),
+      );
+      y += 16;
+      final monthGrid = styledGrid(
+        headers: ['Month', 'Cases', 'Hearings', 'Appointments'],
+        rows: [
+          for (final row in activityTrend)
+            [
+              _pdfMonthLabel(row['month']?.toString() ?? ''),
+              _intValue(row['cases']).toString(),
+              _intValue(row['hearings']).toString(),
+              _intValue(row['appointments']).toString(),
+            ],
+        ],
+        align: const [
+          PdfTextAlignment.left,
+          PdfTextAlignment.center,
+          PdfTextAlignment.center,
+          PdfTextAlignment.center,
+          PdfTextAlignment.center,
+        ],
+      );
+      drawGrid(monthGrid);
     }
 
     final bytes = doc.saveSync();
     doc.dispose();
     return Uint8List.fromList(bytes);
   }
+
+  String _pdfMonthLabel(String key) {
+    final parts = key.split('-');
+    if (parts.length != 2) return key.isEmpty ? '-' : key;
+    final year = int.tryParse(parts[0]);
+    final month = int.tryParse(parts[1]);
+    if (year == null || month == null || month < 1 || month > 12) return key;
+    return DateFormat('MMMM yyyy').format(DateTime(year, month));
+  }
+
+  double mathMax(double a, double b) => a > b ? a : b;
 }

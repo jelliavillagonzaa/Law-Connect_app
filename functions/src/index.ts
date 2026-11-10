@@ -29,7 +29,7 @@ import {
   imapCourtEmailManual,
   onCourtEmailNotificationSuppress,
   onCourtEmailQueueNotify,
-  processCourtEmailQueue,
+  processCourtEmailQueueIdle,
 } from "./courtEmailIngestDisabled";
 
 /** Optional SMTP for `email_requests` (hearing + other queued mail). */
@@ -302,5 +302,5 @@ export {
   imapCourtEmailManual,
   onCourtEmailNotificationSuppress,
   onCourtEmailQueueNotify,
-  processCourtEmailQueue,
+  processCourtEmailQueueIdle,
 };

@@ -19,6 +19,8 @@ const {
   buildHearingSmsText,
   formatHearingSmsTime,
   formatHearingSmsLocation,
+  reminderProviderComplete,
+  reminderLegacyLocked,
 } = require(join(__dir, "../lib/hearingSmsAlerts.js"));
 
 let failed = 0;
@@ -176,6 +178,28 @@ const today = buildHearingSmsText({
   reminderKind: "hearing_day",
 });
 assert(today.includes("Your hearing is today."), "hearing-day lead-in");
+
+assert(
+  reminderProviderComplete(undefined, true, true) === false,
+  "new number still needs PhilSMS and Semaphore",
+);
+assert(
+  reminderProviderComplete({ phil: true }, true, true) === false,
+  "Semaphore still sends when only PhilSMS succeeded",
+);
+assert(
+  reminderProviderComplete({ phil: true, sem: true }, true, true) === true,
+  "both providers delivered skips that number",
+);
+assert(
+  reminderLegacyLocked({}, true) === true,
+  "old sent reminder without a phone list is not texted again",
+);
+assert(
+  reminderLegacyLocked({ "639171234567": { phil: true, sem: true } }, true) ===
+    false,
+  "a saved phone list can still text a newly changed number",
+);
 
 if (failed) {
   console.error(`\n${failed} check(s) failed`);

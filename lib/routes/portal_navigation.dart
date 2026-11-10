@@ -1,4 +1,3 @@
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:get/get.dart';
 
 import 'deferred_route_loaders.dart';
@@ -6,10 +5,10 @@ import 'deferred_route_loaders.dart';
 export 'deferred_route_loaders.dart'
     show prefetchAllPortalDashboards, prefetchPortalDashboard;
 
-/// After logout: website stays on the firm-portal landing; the app goes
-/// to the original white-card [LoginPage].
+/// After logout, open the firm-portal login screen. The public landing
+/// page at `/` stays as-is.
 void navigateAfterLogout() {
-  Get.offAllNamed(kIsWeb ? '/' : '/LoginPage');
+  Get.offAllNamed('/LoginPage');
 }
 
 /// Central post-login navigation — always uses deferred GetX routes so heavy
@@ -21,13 +20,12 @@ void navigateToPortalDashboard(String portalRole) {
     // Prefetch is optional — never block a successful login.
   }
   final route = switch (portalRole.toLowerCase()) {
-    'admin' => '/AdminDashboard',
+    'admin' || 'staff' => '/StaffDashboard',
     'attorney' => '/AttorneyDashboard',
-    'staff' => '/StaffDashboard',
     _ => '/ClientDashboard',
   };
   Get.offAllNamed(
     route,
-    arguments: null,
+    arguments: portalRole.toLowerCase() == 'admin' ? {'initialItem': 'admin_dashboard'} : null,
   );
 }

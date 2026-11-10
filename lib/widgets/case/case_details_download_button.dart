@@ -16,7 +16,7 @@ class CaseDetailsDownloadButton extends StatelessWidget {
 
   Future<void> _downloadWord() async {
     try {
-      final bytes = buildCaseDetailsWordBytes(exportData);
+      final bytes = await buildCaseDetailsWordBytes(exportData);
       await saveBytes(
         bytes: bytes,
         filename: '${exportData.safeFilenameStem()}.rtf',

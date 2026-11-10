@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_quill/flutter_quill.dart';
 import 'package:get/get.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -12,7 +13,13 @@ import '../../utils/case_details_export.dart';
 import '../../utils/case_status_filter.dart';
 import '../../utils/case_history.dart';
 import '../../utils/case_result.dart';
+import '../../utils/case_description_format.dart';
 import '../../utils/currency.dart';
+import '../../widgets/common/case_description_editor.dart';
+import '../../widgets/common/case_signature_pad.dart';
+import '../../widgets/case/case_billing_card.dart';
+import '../../screens/billing/billing_management_screen.dart'
+    show openPaymentHistoryScreen;
 import '../../theme/app_theme.dart';
 
 class CaseDetailPage extends StatefulWidget {
@@ -144,7 +151,7 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     const Text(
-                      'It will leave My Cases and move to Closed cases.',
+                      'It will leave Cases and move to Closed cases.',
                     ),
                     const SizedBox(height: 16),
                     const Text(
@@ -197,89 +204,18 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
 
   Future<void> _editCaseDetails() async {
     final caseModel = await _caseService.getCase(widget.caseId);
-    if (caseModel == null) return;
-
-    final titleController = TextEditingController(text: caseModel.caseTitle);
-    final descriptionController = TextEditingController(
-      text: caseModel.caseDescription,
-    );
-    final typeController = TextEditingController(text: caseModel.caseType);
+    if (caseModel == null || !mounted) return;
 
     final result = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Edit Case Details'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: titleController,
-                decoration: const InputDecoration(
-                  labelText: 'Case Title',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: typeController,
-                decoration: const InputDecoration(
-                  labelText: 'Case Type',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: descriptionController,
-                decoration: const InputDecoration(
-                  labelText: 'Description',
-                  border: OutlineInputBorder(),
-                ),
-                maxLines: 5,
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppTheme.royalBlue,
-              foregroundColor: Colors.white,
-            ),
-            child: const Text('Save'),
-          ),
-        ],
-      ),
+      barrierDismissible: false,
+      builder: (context) => _EditCaseDetailsDialog(caseModel: caseModel),
     );
 
-    if (result == true) {
-      try {
-        await _caseService.updateCaseDetails(
-          caseId: widget.caseId,
-          caseTitle: titleController.text.trim(),
-          caseDescription: descriptionController.text.trim(),
-          caseType: typeController.text.trim(),
-        );
-        Get.snackbar(
-          'Success',
-          'Case details updated successfully',
-          backgroundColor: Colors.green,
-          colorText: Colors.white,
-        );
-        setState(() {}); // Refresh the page
-      } catch (e) {
-        Get.snackbar(
-          'Error',
-          'Failed to update case: $e',
-          backgroundColor: Colors.red,
-          colorText: Colors.white,
-        );
-      }
+    if (result == true && mounted) {
+      setState(() {
+        _caseFuture = _caseService.getCase(widget.caseId);
+      });
     }
   }
 
@@ -289,6 +225,24 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
       appBar: AppBar(
         title: const Text('Case Details'),
         actions: [
+          FutureBuilder<String?>(
+            future: _roleFuture,
+            builder: (context, roleSnapshot) {
+              final role = roleSnapshot.data?.toLowerCase();
+              if (role == null || role == 'client') {
+                return const SizedBox.shrink();
+              }
+              return IconButton(
+                tooltip: 'Payment History (All Transactions)',
+                icon: const Icon(Icons.history_rounded),
+                onPressed: () => openPaymentHistoryScreen(
+                  context,
+                  recorderRole: role,
+                  recorderName: role == 'attorney' ? _attorneyUser?.name : null,
+                ),
+              );
+            },
+          ),
           FutureBuilder<CaseModel?>(
             future: _caseFuture,
             builder: (context, caseSnapshot) {
@@ -428,13 +382,82 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
                           ),
                         ),
                         const SizedBox(height: 8),
-                        Text(
-                          caseModel.caseDescription,
-                          style: const TextStyle(fontSize: 16),
+                        CaseDescriptionView(
+                          plainText: caseModel.caseDescription,
+                          deltaJson: caseModel.caseDescriptionDelta,
                         ),
+                        if (caseModel.remarks != null &&
+                            caseModel.remarks!.isNotEmpty) ...[
+                          const SizedBox(height: 12),
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(14),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFFFFBEB),
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: const Color(0xFFFDE68A),
+                              ),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Row(
+                                  children: [
+                                    Icon(
+                                      Icons.notes_rounded,
+                                      size: 18,
+                                      color: Color(0xFFB45309),
+                                    ),
+                                    SizedBox(width: 8),
+                                    Text(
+                                      'Remarks for Review',
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.bold,
+                                        color: Color(0xFF92400E),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 6),
+                                SelectableText(
+                                  caseModel.remarks!,
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    color: Color(0xFF78350F),
+                                    height: 1.4,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                        CaseSignatureView(progress: caseModel.progress),
                       ],
                     ),
                   ),
+                ),
+                FutureBuilder<String?>(
+                  future: _roleFuture,
+                  builder: (context, roleSnapshot) {
+                    final role = roleSnapshot.data?.toLowerCase();
+                    final currentUid = FirebaseAuth.instance.currentUser?.uid;
+                    final isClient = role == 'client' ||
+                        (currentUid != null &&
+                            currentUid == caseModel.clientId &&
+                            role != 'attorney' &&
+                            role != 'admin' &&
+                            role != 'staff');
+                    return CaseBillingCard(
+                      caseModel: caseModel,
+                      canManage: !isClient,
+                      recorderRole: isClient ? 'client' : (role ?? 'staff'),
+                      recorderName: role == 'attorney'
+                          ? _attorneyUser?.name
+                          : (isClient ? _clientUser?.name : null),
+                    );
+                  },
                 ),
                 if (_historyEvents(caseModel).isNotEmpty)
                   Card(
@@ -1036,6 +1059,184 @@ class _CaseDetailPageState extends State<CaseDetailPage> {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _EditCaseDetailsDialog extends StatefulWidget {
+  const _EditCaseDetailsDialog({required this.caseModel});
+
+  final CaseModel caseModel;
+
+  @override
+  State<_EditCaseDetailsDialog> createState() => _EditCaseDetailsDialogState();
+}
+
+class _EditCaseDetailsDialogState extends State<_EditCaseDetailsDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _titleController;
+  late final TextEditingController _typeController;
+  late final QuillController _descriptionController;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _titleController = TextEditingController(text: widget.caseModel.caseTitle);
+    _typeController = TextEditingController(text: widget.caseModel.caseType);
+    _descriptionController = createCaseDescriptionController(
+      deltaJson: widget.caseModel.caseDescriptionDelta,
+      plainFallback: widget.caseModel.caseDescription,
+    );
+  }
+
+  @override
+  void dispose() {
+    _titleController.dispose();
+    _typeController.dispose();
+    _descriptionController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    if (!(_formKey.currentState?.validate() ?? false)) return;
+    setState(() => _saving = true);
+    try {
+      await CaseService().updateCaseDetails(
+        caseId: widget.caseModel.id,
+        caseTitle: _titleController.text.trim(),
+        caseType: _typeController.text.trim(),
+        caseDescription: caseDescriptionPlainText(_descriptionController),
+        caseDescriptionDelta: caseDescriptionDeltaJson(_descriptionController),
+      );
+      if (!mounted) return;
+      Get.snackbar(
+        'Success',
+        'Case details updated successfully',
+        backgroundColor: Colors.green,
+        colorText: Colors.white,
+      );
+      Navigator.pop(context, true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _saving = false);
+      Get.snackbar(
+        'Error',
+        'Failed to update case: $e',
+        backgroundColor: Colors.red,
+        colorText: Colors.white,
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      insetPadding: const EdgeInsets.all(24),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 860, maxHeight: 760),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
+          child: Form(
+            key: _formKey,
+            child: Column(
+              children: [
+                const Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    'Edit Case Details',
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Expanded(
+                  child: SingleChildScrollView(
+                    child: Column(
+                      children: [
+                        TextFormField(
+                          controller: _titleController,
+                          decoration: const InputDecoration(
+                            labelText: 'Case Title',
+                            border: OutlineInputBorder(),
+                          ),
+                          validator: (value) =>
+                              (value == null || value.trim().isEmpty)
+                                  ? 'Please enter a title'
+                                  : null,
+                        ),
+                        const SizedBox(height: 16),
+                        TextFormField(
+                          controller: _typeController,
+                          decoration: const InputDecoration(
+                            labelText: 'Case Type',
+                            border: OutlineInputBorder(),
+                          ),
+                          validator: (value) =>
+                              (value == null || value.trim().isEmpty)
+                                  ? 'Please enter a case type'
+                                  : null,
+                        ),
+                        const SizedBox(height: 16),
+                        const Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text(
+                            'Description *',
+                            style: TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        CaseDescriptionEditor(
+                          controller: _descriptionController,
+                          minHeight: 240,
+                          validator: (value) {
+                            if (value.trim().isEmpty) {
+                              return 'Please enter a description';
+                            }
+                            if (value.trim().length < 20) {
+                              return 'Description must be at least 20 characters';
+                            }
+                            return null;
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    TextButton(
+                      onPressed: _saving
+                          ? null
+                          : () => Navigator.pop(context, false),
+                      child: const Text('Cancel'),
+                    ),
+                    const SizedBox(width: 8),
+                    ElevatedButton(
+                      onPressed: _saving ? null : _save,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppTheme.royalBlue,
+                        foregroundColor: Colors.white,
+                      ),
+                      child: _saving
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : const Text('Save'),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

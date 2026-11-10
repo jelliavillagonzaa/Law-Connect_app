@@ -19,12 +19,16 @@ class AttorneyInboxReadStore {
   final Set<String> _keys = <String>{};
   String? _uid;
   bool _loaded = false;
+  bool _serverLoaded = false;
 
-  Future<void> ensureLoaded(String userId, {bool server = false}) async {
+  Future<void> ensureLoaded(String userId, {bool server = true}) async {
     if (userId.isEmpty) return;
-    if (_loaded && _uid == userId && !server) return;
+    final userChanged = _uid != userId;
+    if (userChanged) {
+      _serverLoaded = false;
+    }
     _uid = userId;
-    if (!_loaded) {
+    if (!_loaded || userChanged) {
       _keys.clear();
       try {
         final prefs = await SharedPreferences.getInstance();
@@ -32,19 +36,25 @@ class AttorneyInboxReadStore {
       } catch (_) {}
       _loaded = true;
     }
-    if (!server) return;
+    if (!server || (_serverLoaded && !userChanged)) return;
+    _serverLoaded = true;
+    // Load read keys from Firestore once to survive logout/login and new sessions
     try {
       final doc = await FirebaseFirestore.instance
           .collection('notifications')
           .doc('attorney_read_keys_$userId')
-          .get(const GetOptions(source: Source.cache))
-          .timeout(const Duration(milliseconds: 400));
+          .get()
+          .timeout(const Duration(seconds: 4));
       final raw = doc.data()?['keys'];
       if (raw is List) {
         for (final k in raw) {
           final s = '$k'.trim();
           if (s.isNotEmpty) _keys.add(s);
         }
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setStringList('$_prefsPrefix$userId', _keys.toList());
+        } catch (_) {}
       }
     } catch (_) {}
   }
@@ -52,6 +62,18 @@ class AttorneyInboxReadStore {
   bool isRead(HearingInboxRow row) {
     if (row.data['isRead'] == true) return true;
     if (_keys.contains(row.rowKey)) return true;
+    if (row.rowKey.startsWith('hearing_')) {
+      final stripped = row.rowKey.substring('hearing_'.length);
+      if (_keys.contains(stripped)) return true;
+    }
+    if (row.rowKey.startsWith('hn_')) {
+      final stripped = row.rowKey.substring('hn_'.length);
+      if (_keys.contains(stripped)) return true;
+    }
+    if (row.rowKey.startsWith('appt_')) {
+      final stripped = row.rowKey.substring('appt_'.length);
+      if (_keys.contains(stripped)) return true;
+    }
     final nid = row.notificationDocId?.trim() ?? '';
     if (nid.isNotEmpty && _keys.contains(nid)) return true;
     final hid = (row.data['hearingDocId'] as String?)?.trim() ?? '';

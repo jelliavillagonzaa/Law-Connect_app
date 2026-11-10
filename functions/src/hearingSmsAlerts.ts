@@ -132,9 +132,173 @@ export function formatSmsRole(role: string): string {
   return "Firm";
 }
 
-function hearingLocation(data: HearingDoc & Record<string, unknown>): string {
+export function isBareLocation(raw?: string | null): boolean {
+  if (!raw) return true;
+  const t = raw.trim();
+  if (!t) return true;
+  if (/^(?:branch\s*\d*|\d+)[\s,.]*$/i.test(t)) return true;
+  const hasSeparator =
+    t.includes("-") || t.includes("–") || t.includes("—") || t.includes(",");
+  const hasDetails =
+    /\b(city|province|hall of justice|rtc|mtc|mtcc|municipal|regional|court|judicial)\b/i.test(
+      t,
+    );
+  return !hasSeparator && !hasDetails;
+}
+
+export function extractLocationFromOrderText(text: string, fallback = ""): string {
+  // 1. Check for full branch with city/suffix: e.g. "BRANCH 12 - OROQUIETA CITY" or "BRANCH 12, OROQUIETA CITY"
+  const branchFull = text.match(
+    /branch\s*(\d+)(?:\s*[-–—]\s*([^\r\n]+)|,\s*([^\r\n]+))/i,
+  );
+  if (branchFull) {
+    const branchNum = branchFull[1];
+    let city = (branchFull[2] || branchFull[3] || "").trim();
+    city = city.replace(/[\r\n]+/g, " ").replace(/[.,\s]+$/, "").trim();
+    if (city) {
+      return `Branch ${branchNum} - ${city}`;
+    }
+  }
+
+  // 2. Check for city before branch, e.g. "QUEZON CITY, BRANCH 45"
+  const cityBeforeBranch = text.match(
+    /([A-Za-z\s.]+City|[A-Za-z\s.]+Province)\s*[,–—-]\s*branch\s*(\d+)/i,
+  );
+  if (cityBeforeBranch) {
+    const cityPre = cityBeforeBranch[1].trim();
+    const branchNum = cityBeforeBranch[2].trim();
+    return `Branch ${branchNum} - ${cityPre}`;
+  }
+
+  const branch = text.match(/branch\s*(\d+)(?:\s*[-–—]\s*([A-Za-z .]+))?/i);
+  const rtc = text.match(
+    /((?:regional|municipal|metropolitan)\s+trial\s+court[^\n,]{0,80})/i,
+  );
+  const region = text.match(/(\d+(?:st|nd|rd|th)\s+judicial region)/i);
+
+  let city = (branch?.[2] || "").trim();
+  if (!city) {
+    const nextLineCity = text.match(
+      /branch\s*\d+\s*[\r\n]+\s*([A-Za-z\s.]+City|[A-Za-z\s.]+Province|Hall of Justice[^\r\n]*)/i,
+    );
+    if (nextLineCity) {
+      city = nextLineCity[1].replace(/[.,\s]+$/, "").trim();
+    }
+  }
+  if (!city) {
+    const cityMatch = text.match(
+      /\b([A-Za-z\s.]+City|Hall of Justice[^\r\n,]*)/i,
+    );
+    if (cityMatch) {
+      city = cityMatch[1].replace(/[.,\s]+$/, "").trim();
+    }
+  }
+
+  const parts: string[] = [];
+  if (branch) parts.push(`Branch ${branch[1]}`);
+  if (rtc) {
+    let court = rtc[1].replace(/\s+/g, " ").trim();
+    if (region && !court.toLowerCase().includes("judicial")) {
+      court = `${court}, ${region[1]}`;
+    }
+    if (city && !court.toLowerCase().includes(city.toLowerCase())) {
+      court = `${court}, ${city}`;
+    }
+    parts.push(court);
+  } else if (city) {
+    parts.push(city);
+  }
+
+  if (parts.length >= 2) {
+    return parts.join(" — ");
+  }
+  if (parts.length === 1 && !isBareLocation(parts[0])) {
+    return parts[0];
+  }
+  if (branch && city) {
+    return `Branch ${branch[1]} - ${city}`;
+  }
+  if (fallback && !isBareLocation(fallback)) return fallback;
+  if (parts.length) return parts[0];
+  return fallback;
+}
+
+export function resolveVenueForDisplay(data: Record<string, unknown>): string {
+  let loc = asString(data.location).trim();
+  let court = asString(data.courtBranch).trim();
+  if (!loc) loc = asString(data.venue).trim();
+  if (!court) {
+    court = asString(data.court).trim() || asString(data.court_branch).trim();
+  }
+
+  if (isBareLocation(loc) && !isBareLocation(court)) loc = court;
+  if (isBareLocation(court) && !isBareLocation(loc)) court = loc;
+
+  if (isBareLocation(loc) || isBareLocation(court)) {
+    const blob = [
+      asString(data.fullText),
+      asString(data.orderText),
+      asString(data.message),
+      asString(data.summary),
+    ]
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+    if (blob) {
+      const extracted = extractLocationFromOrderText(blob, loc || court);
+      if (extracted && !isBareLocation(extracted)) {
+        if (isBareLocation(loc)) loc = extracted;
+        if (isBareLocation(court)) court = extracted;
+      }
+    }
+  }
+
+  if (!loc) return court;
+  if (!court) return loc;
+  const ll = loc.toLowerCase();
+  const cl = court.toLowerCase();
+  if (ll.includes(cl) || cl.includes(ll)) {
+    return loc.length >= court.length ? loc : court;
+  }
+  return `${court} — ${loc}`;
+}
+
+export function hearingLocation(data: HearingDoc & Record<string, unknown>): string {
   const row = hearingRow(data);
-  return asString(row.location) || asString(row.courtBranch) || "";
+  const venue = resolveVenueForDisplay(row as Record<string, unknown>);
+  if (venue && !isBareLocation(venue)) return venue;
+  const direct = asString(row.location) || asString(row.courtBranch) || "";
+  return venue || direct;
+}
+
+function stripEmailsFromParty(raw: string): string {
+  return raw
+    .replace(/[\w.+-]+@,?\s*[\w.-]+\.\w{2,}/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function extractHearingDateFromOrderText(text: string): string {
+  const reset = text.match(
+    /(?:reset|set|schedul\w*|next hearing)\b[^\n.]{0,80}?\bon\s+(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\.?\s+(\d{1,2})\s*,?\s+(\d{4})/i,
+  );
+  if (reset) {
+    return `${reset[1]} ${reset[2]}, ${reset[3]}`;
+  }
+  const m = text.match(
+    /(?:on\s+)?(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\s*,?\s+(\d{4})/i,
+  );
+  if (!m) return "";
+  return `${m[1]} ${m[2]}, ${m[3]}`;
+}
+
+export function extractHearingTimeFromOrderText(text: string): string {
+  const clock = text.match(
+    /(\d{1,2}:\d{2})\s*(?:o['']?clock\s+)?(?:in the morning|in the afternoon|a\.?m\.?|p\.?m\.?)/i,
+  );
+  if (clock) return clock[0].replace(/\s+/g, " ").trim();
+  const at = text.match(/at\s+(\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?)/i);
+  return (at?.[1] ?? "").trim();
 }
 
 export function hearingFieldsForSms(data: HearingDoc & Record<string, unknown>): {
@@ -146,12 +310,27 @@ export function hearingFieldsForSms(data: HearingDoc & Record<string, unknown>):
   location: string;
 } {
   const row = hearingRow(data);
+  const blob = [
+    asString(row.fullText),
+    asString(row.message),
+    asString(row.summary),
+  ]
+    .filter(Boolean)
+    .join("\n");
+  let hearingDate = asString(row.hearingDate);
+  let hearingTime = asString(row.hearingTime);
+  if (!hearingDate && blob) {
+    hearingDate = extractHearingDateFromOrderText(blob);
+  }
+  if (!hearingTime && blob) {
+    hearingTime = extractHearingTimeFromOrderText(blob);
+  }
   return {
     caseNo: asString(row.caseNo),
-    caseTitle: asString(row.caseTitle),
-    clientName: asString(row.clientName),
-    hearingDate: asString(row.hearingDate),
-    hearingTime: asString(row.hearingTime),
+    caseTitle: stripEmailsFromParty(asString(row.caseTitle)),
+    clientName: stripEmailsFromParty(asString(row.clientName)),
+    hearingDate,
+    hearingTime,
     location: hearingLocation(data),
   };
 }
@@ -276,22 +455,23 @@ export function buildHearingSmsText(params: {
 
   const caseLine = formatHearingSmsCaseNumber(params.caseNo ?? "");
   if (caseLine) lines.push(caseLine);
-  lines.push(
-    ...hearingSmsCaptionLines(params.caseTitle ?? "", params.clientName ?? ""),
-  );
 
-  if (copy) {
-    lines.push("");
-  } else {
-    lines.push("", "Hearing Details:");
-  }
-
+  // Date/time/location first so push trays and short SMS previews keep them.
   const date = (params.hearingDate ?? "").trim();
   if (date) lines.push(`Date: ${date}`);
   const time = formatHearingSmsTime(params.hearingTime ?? "");
   if (time) lines.push(`Time: ${time}`);
   const loc = formatHearingSmsLocation(params.location ?? "");
   if (loc) lines.push(`Location: ${loc}`);
+
+  const caption = hearingSmsCaptionLines(
+    params.caseTitle ?? "",
+    params.clientName ?? "",
+  );
+  if (caption.length) {
+    lines.push("");
+    lines.push(...caption);
+  }
 
   lines.push("");
   lines.push(copy?.closing ?? "Please be reminded of your scheduled hearing.");
@@ -331,7 +511,13 @@ async function resolvePhoneForUser(
     const snap = await db.collection("users").doc(uid).get();
     if (!snap.exists) return null;
     const data = snap.data() ?? {};
-    const profilePhone = asString(data.phoneNumber || data.phone);
+    const profilePhone = asString(
+      data.phoneNumber ||
+      data.phone ||
+      data.contactNumber ||
+      data.mobileNumber ||
+      data.contact,
+    );
     return profilePhone || null;
   } catch (e) {
     logger.warn("hearingSms: phone lookup failed", {
@@ -463,51 +649,112 @@ export async function sendHearingSmsAlerts(params: {
     }
   };
 
-  const hearingClientName = asString(hearingRow(hearingData).clientName);
+  // Sequential + short gap so back-to-back hearings do not trip provider
+  // rate limits (PhilSMS "exceeded sending limit") while Semaphore still runs.
+  const queue: Array<() => Promise<void>> = [];
+  for (const target of firmSmsTargets(cfg)) {
+    queue.push(() => trySend(target.phone, "firm_default", target.roleLabel));
+  }
+
+  const rowData = hearingRow(hearingData);
+  const hearingClientName = asString(rowData.clientName);
+  const caseTitle = asString(rowData.caseTitle);
+  const fullText = asString(rowData.fullText);
+
   const exactClientUids = await resolveClientUidsByExactHearingName(
     db,
     hearingClientName,
+    { caseTitle, fullText },
   );
-  for (const uid of exactClientUids) {
-    const phone = await resolvePhoneForUser(db, uid, cfg);
-    if (phone) {
-      await trySend(phone, `client_exact_${uid}`, "Client");
+
+  const allInvolvedClientUids = new Set<string>(exactClientUids);
+  for (const key of ["involvedClientIds", "matchedClientIds"]) {
+    const arr = rowData[key];
+    if (Array.isArray(arr)) {
+      for (const uid of arr) {
+        if (typeof uid === "string" && uid) allInvolvedClientUids.add(uid);
+      }
+    }
+  }
+  const ownerId = asString(rowData.ownerClientId);
+  if (ownerId) allInvolvedClientUids.add(ownerId);
+
+  // Check any recipients who are role == 'client'
+  for (const uid of recipientUserIds) {
+    if (!allInvolvedClientUids.has(uid)) {
+      try {
+        const snap = await db.collection("users").doc(uid).get();
+        if (snap.exists && asString(snap.data()?.role).toLowerCase() === "client") {
+          allInvolvedClientUids.add(uid);
+        }
+      } catch {
+        /* skip */
+      }
+    }
+  }
+
+  const clientPhones = await Promise.all(
+    [...allInvolvedClientUids].map(async (uid) => ({
+      uid,
+      phone: await resolvePhoneForUser(db, uid, cfg),
+    })),
+  );
+  for (const row of clientPhones) {
+    if (row.phone) {
+      const phone = row.phone;
+      const uid = row.uid;
+      queue.push(() => trySend(phone, `client_${uid}`, "Client"));
     } else {
       logger.warn("hearingSms: matched client has no phone", {
         hearingDocId,
-        uid,
+        uid: row.uid,
         clientName: hearingClientName,
       });
     }
   }
-  if (hearingClientName && !exactClientUids.length) {
+  if (hearingClientName && !allInvolvedClientUids.size) {
     logger.info("hearingSms: no client with exact sign-up name match", {
       hearingDocId,
       clientName: hearingClientName,
     });
   }
 
-  const clientSet = new Set(exactClientUids);
-  for (const uid of recipientUserIds) {
-    if (clientSet.has(uid)) continue;
-    const roleLabel = await resolveRoleLabelForUser(db, uid);
+  const clientSet = new Set(allInvolvedClientUids);
+  const firmRows = await Promise.all(
+    recipientUserIds
+      .filter((uid) => !clientSet.has(uid))
+      .map(async (uid) => {
+        const roleLabel = await resolveRoleLabelForUser(db, uid);
+        const phone = await resolvePhoneForUser(db, uid, cfg);
+        return { uid, roleLabel, phone };
+      }),
+  );
+  for (const row of firmRows) {
     const isFirm =
-      roleLabel === "Attorney" ||
-      roleLabel === "Staff" ||
-      roleLabel === "Admin";
+      row.roleLabel === "Attorney" ||
+      row.roleLabel === "Staff" ||
+      row.roleLabel === "Admin";
     // firmPhonesOnly skips extra clients. Attorney and staff still get the
     // same SMS as the push, using the phone on their user profile.
     if (cfg.firmPhonesOnly && !isFirm) continue;
-    const phone = await resolvePhoneForUser(db, uid, cfg);
-    if (!phone) {
+    if (!row.phone) {
       logger.warn("hearingSms: push recipient has no phone", {
         hearingDocId,
-        uid,
-        role: roleLabel,
+        uid: row.uid,
+        role: row.roleLabel,
       });
       continue;
     }
-    await trySend(phone, `uid_${uid}`, roleLabel);
+    const phone = row.phone;
+    const uid = row.uid;
+    const roleLabel = row.roleLabel;
+    queue.push(() => trySend(phone, `uid_${uid}`, roleLabel));
+  }
+  for (let i = 0; i < queue.length; i++) {
+    await queue[i]();
+    if (i < queue.length - 1) {
+      await new Promise((r) => setTimeout(r, 350));
+    }
   }
 
   if (anyOk) {
@@ -554,6 +801,53 @@ export function isActiveHearingSmsReminderKind(kind: string): boolean {
   return k === "d5" || k === "d2" || k === "hearing_day";
 }
 
+export type ReminderPhoneState = { phil?: boolean; sem?: boolean };
+
+/** True when every configured provider already delivered to this number. */
+export function reminderProviderComplete(
+  state: ReminderPhoneState | undefined,
+  wantPhil: boolean,
+  wantSem: boolean,
+): boolean {
+  if (!wantPhil && !wantSem) return true;
+  if (!state) return false;
+  if (wantPhil && state.phil !== true) return false;
+  if (wantSem && state.sem !== true) return false;
+  return true;
+}
+
+/**
+ * Hearings marked sent before per-phone tracking have no ledger.
+ * Those stay locked so a scheduler rerun does not text everyone again.
+ * A ledger entry lets a new profile number still receive that reminder.
+ */
+export function reminderLegacyLocked(
+  ledger: Record<string, ReminderPhoneState>,
+  sentFlag: boolean,
+): boolean {
+  return sentFlag && Object.keys(ledger).length === 0;
+}
+
+function reminderPhoneLedger(
+  data: Record<string, unknown>,
+  kind: string,
+): Record<string, ReminderPhoneState> {
+  const root = data.philsmsReminderPhones;
+  if (!root || typeof root !== "object") return {};
+  const row = (root as Record<string, unknown>)[kind];
+  if (!row || typeof row !== "object") return {};
+  const out: Record<string, ReminderPhoneState> = {};
+  for (const [phone, state] of Object.entries(row as Record<string, unknown>)) {
+    if (!state || typeof state !== "object") continue;
+    const s = state as Record<string, unknown>;
+    const next: ReminderPhoneState = {};
+    if (s.phil === true) next.phil = true;
+    if (s.sem === true) next.sem = true;
+    if (next.phil || next.sem) out[phone] = next;
+  }
+  return out;
+}
+
 /** Pre-hearing reminder SMS (5 days / 2 days / hearing day) — PhilSMS + Semaphore. */
 export async function sendHearingReminderPhilSms(params: {
   db: admin.firestore.Firestore;
@@ -582,7 +876,13 @@ export async function sendHearingReminderPhilSms(params: {
     (existingData.philsmsRemindersSent as Record<string, boolean> | undefined) ??
     {};
   const flag = reminderSentFlag(reminderKind);
-  if (sentMap[reminderKind] || (flag && existingData[flag] === true)) {
+  const wantPhil = Boolean(cfg.apiToken.trim());
+  const wantSem = Boolean(semaphore?.apiKey.trim());
+  const ledger = reminderPhoneLedger(existingData, reminderKind);
+  const alreadySent =
+    sentMap[reminderKind] === true ||
+    (flag != null && existingData[flag] === true);
+  if (reminderLegacyLocked(ledger, alreadySent)) {
     logger.info("hearingSms: reminder already sent", { hearingDocId, reminderKind });
     return;
   }
@@ -594,6 +894,7 @@ export async function sendHearingReminderPhilSms(params: {
 
   const philCfg = { apiToken: cfg.apiToken, senderId: cfg.senderId };
   let anyOk = false;
+  let ledgerDirty = false;
 
   const tryReminderSend = async (
     phone: string,
@@ -602,11 +903,16 @@ export async function sendHearingReminderPhilSms(params: {
   ): Promise<void> => {
     const normalized = normalizePhilSmsRecipient(phone);
     if (normalized.length < 11) return;
+    const prior = ledger[normalized] ?? {};
+    if (reminderProviderComplete(prior, wantPhil, wantSem)) return;
     const smsText = buildHearingSmsText(smsBase);
-    if (cfg.apiToken.trim()) {
+    const next: ReminderPhoneState = { ...prior };
+    if (wantPhil && next.phil !== true) {
       const result = await sendPhilSms(philCfg, phone, smsText);
       if (result.ok) {
+        next.phil = true;
         anyOk = true;
+        ledgerDirty = true;
         logger.info("hearingSms: reminder sent", {
           hearingDocId,
           reminderKind,
@@ -624,15 +930,17 @@ export async function sendHearingReminderPhilSms(params: {
         });
       }
     }
-    if (semaphore?.apiKey.trim()) {
+    if (wantSem && next.sem !== true) {
       try {
         await sendViaSemaphore({
-          apiKey: semaphore.apiKey,
+          apiKey: semaphore!.apiKey,
           to: phone,
           body: smsText,
-          senderName: semaphore.senderName,
+          senderName: semaphore!.senderName,
         });
+        next.sem = true;
         anyOk = true;
+        ledgerDirty = true;
         logger.info("hearingSms: Semaphore reminder sent", {
           hearingDocId,
           reminderKind,
@@ -650,7 +958,14 @@ export async function sendHearingReminderPhilSms(params: {
         });
       }
     }
+    if (next.phil || next.sem) {
+      ledger[normalized] = next;
+    }
   };
+
+  for (const target of firmSmsTargets(cfg)) {
+    await tryReminderSend(target.phone, "firm_default", target.roleLabel);
+  }
 
   for (const role of ["attorney", "staff"] as const) {
     try {
@@ -688,11 +1003,19 @@ export async function sendHearingReminderPhilSms(params: {
     if (phone) await tryReminderSend(phone, `client_exact_${uid}`, "Client");
   }
 
-  if (anyOk) {
+  if (anyOk || ledgerDirty) {
+    const previousLedger =
+      existingData.philsmsReminderPhones &&
+      typeof existingData.philsmsReminderPhones === "object"
+        ? { ...(existingData.philsmsReminderPhones as Record<string, unknown>) }
+        : {};
     const patch: Record<string, unknown> = {
-      philsmsRemindersSent: { ...sentMap, [reminderKind]: true },
+      philsmsReminderPhones: { ...previousLedger, [reminderKind]: ledger },
     };
-    if (flag) patch[flag] = true;
+    if (anyOk) {
+      patch.philsmsRemindersSent = { ...sentMap, [reminderKind]: true };
+      if (flag) patch[flag] = true;
+    }
     await hearingRef.set(patch, { merge: true });
   }
 }

@@ -52,16 +52,15 @@ class _AdminDashboardState extends State<AdminDashboard> {
         _firestore.collection('users').where('role', isEqualTo: 'client').count().get(),
         _firestore.collection('users').where('role', isEqualTo: 'attorney').count().get(),
         _firestore.collection('cases').count().get(),
-        _firestore.collection('cases').where('status', isEqualTo: 'pending').count().get(),
-        _firestore.collection('cases').where('status', isEqualTo: 'in_progress').count().get(),
+        _firestore.collection('cases').where('status', isEqualTo: 'completed').count().get(),
       ]);
 
       final totalUsers = countResults[0].count ?? 0;
       final clients = countResults[1].count ?? 0;
       final attorneys = countResults[2].count ?? 0;
       final totalCases = countResults[3].count ?? 0;
-      final pendingCases = countResults[4].count ?? 0;
-      final activeCases = countResults[5].count ?? 0;
+      final completedCases = countResults[4].count ?? 0;
+      final activeCases = (totalCases - completedCases).clamp(0, totalCases);
 
       final logsSnapshot = await _firestore
           .collection('system_logs')
@@ -105,8 +104,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
           'totalClients': clients,
           'attorneys': attorneys,
           'totalCases': totalCases,
-          'pendingCases': pendingCases,
           'activeCases': activeCases,
+          'completedCases': completedCases,
         };
         _recentActivity = recentActivity;
         _systemAlerts = alerts;
@@ -272,28 +271,29 @@ class _AdminDashboardState extends State<AdminDashboard> {
                   StatCard(
                     title: 'Total Cases',
                     value: '${_stats['totalCases'] ?? 0}',
-                    description: 'All cases',
+                    description: 'Firm caseload',
                     icon: Icons.folder_outlined,
                     iconColor: AppTheme.inkSteel,
                     backgroundColor: AppTheme.pastelSteel,
                     percentageChange: '+15%',
                   ),
                   StatCard(
-                    title: 'Pending Cases',
-                    value: '${_stats['pendingCases'] ?? 0}',
-                    description: 'Awaiting review',
-                    icon: Icons.pending_outlined,
-                    iconColor: AppTheme.inkCoral,
-                    backgroundColor: AppTheme.pastelPink,
-                  ),
-                  StatCard(
                     title: 'Active Cases',
                     value: '${_stats['activeCases'] ?? 0}',
-                    description: 'In progress',
+                    description: 'Ongoing & open',
                     icon: Icons.work_outline,
                     iconColor: AppTheme.inkBlue,
                     backgroundColor: AppTheme.pastelBlueGray,
                     percentageChange: '+5%',
+                  ),
+                  StatCard(
+                    title: 'Completed Cases',
+                    value: '${_stats['completedCases'] ?? 0}',
+                    description: 'Closed & resolved',
+                    icon: Icons.task_alt_rounded,
+                    iconColor: AppTheme.inkGreen,
+                    backgroundColor: AppTheme.pastelMint,
+                    percentageChange: '+8%',
                   ),
                 ],
               );

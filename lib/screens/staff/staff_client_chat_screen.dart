@@ -165,7 +165,7 @@ class _StaffClientChatScreenState extends State<StaffClientChatScreen> {
           onPressed: () => Navigator.of(context).pop(),
         ),
         title: Text(
-          'Message', // Changed from widget.clientName
+          widget.clientName,
           style: TextStyle(
             fontWeight: FontWeight.bold,
             fontSize: 18,
@@ -592,7 +592,7 @@ class _StaffClientChatScreenState extends State<StaffClientChatScreen> {
                           Padding(
                             padding: const EdgeInsets.only(bottom: 4),
                             child: Text(
-                              'Staff',
+                              'You',
                               style: TextStyle(
                                 fontSize: 12,
                                 fontWeight: FontWeight.bold,
@@ -604,7 +604,9 @@ class _StaffClientChatScreenState extends State<StaffClientChatScreen> {
                           Padding(
                             padding: const EdgeInsets.only(bottom: 4),
                             child: Text(
-                              widget.clientName,
+                              message.labelForSender(
+                                fallback: widget.clientName,
+                              ),
                               style: TextStyle(
                                 fontSize: 12,
                                 fontWeight: FontWeight.bold,

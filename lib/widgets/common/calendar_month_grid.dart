@@ -1,5 +1,48 @@
 import 'package:flutter/material.dart';
 
+/// "+N" slot inside a month day cell. Tap opens the full day list.
+class CalendarOverflowPill extends StatelessWidget {
+  const CalendarOverflowPill({
+    super.key,
+    required this.hiddenCount,
+    required this.onTap,
+    this.color = const Color.fromARGB(255, 46, 109, 192),
+  });
+
+  final int hiddenCount;
+  final VoidCallback onTap;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xFFE4EAF6),
+      borderRadius: BorderRadius.circular(4),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(4),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              '+$hiddenCount',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 10,
+                height: 1,
+                fontWeight: FontWeight.w800,
+                color: color,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// Fixed 6×7 month grid — faster than [GridView] for month navigation (no scroll).
 class CalendarMonthGrid extends StatelessWidget {
   const CalendarMonthGrid({
@@ -7,10 +50,14 @@ class CalendarMonthGrid extends StatelessWidget {
     required this.viewDate,
     required this.cellBuilder,
     this.isCompact = false,
+    this.sundayFirst = false,
   });
 
   final DateTime viewDate;
   final bool isCompact;
+
+  /// Website attorney calendar labels are S–S. The app grid stays Monday-first.
+  final bool sundayFirst;
   final Widget Function(
     BuildContext context,
     DateTime day,
@@ -18,14 +65,20 @@ class CalendarMonthGrid extends StatelessWidget {
     bool isToday,
   ) cellBuilder;
 
-  static List<DateTime> computeDays(DateTime viewDate) {
+  static List<DateTime> computeDays(
+    DateTime viewDate, {
+    bool sundayFirst = false,
+  }) {
     final firstDayOfMonth = DateTime(viewDate.year, viewDate.month, 1);
     final lastDayOfMonth = DateTime(viewDate.year, viewDate.month + 1, 0);
-    final firstDayWeekday = firstDayOfMonth.weekday;
     final daysInMonth = lastDayOfMonth.day;
+    // DateTime.weekday: Monday = 1 … Sunday = 7.
+    final leading = sundayFirst
+        ? firstDayOfMonth.weekday % 7
+        : firstDayOfMonth.weekday - 1;
 
     final days = <DateTime>[];
-    for (var i = firstDayWeekday - 1; i > 0; i--) {
+    for (var i = leading; i > 0; i--) {
       days.add(firstDayOfMonth.subtract(Duration(days: i)));
     }
     for (var i = 1; i <= daysInMonth; i++) {
@@ -40,7 +93,7 @@ class CalendarMonthGrid extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final days = computeDays(viewDate);
+    final days = computeDays(viewDate, sundayFirst: sundayFirst);
     final now = DateTime.now();
     final viewMonth = viewDate.month;
     final pad = isCompact ? 8.0 : 16.0;

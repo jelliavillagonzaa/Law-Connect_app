@@ -13,15 +13,62 @@ import {
   splitHearingPartyNames,
   type HearingDoc,
 } from "./hearingNotifications";
+import { sendHearingSmsAlerts } from "./hearingSmsAlerts";
 import { isOutOfSystemPumpedNoticeText } from "./outOfSystemNotice";
 
 const ingestSecret = defineSecret("INGEST_SECRET");
 const ingestSecretParam = defineString("INGEST_SECRET_FALLBACK", {
   default: "",
 });
+/** Same secret as onHearingActivityCreated — n8n must SMS in-request (CPU freezes after HTTP). */
+const philsmsApiTokenParam = defineSecret("PHILSMS_API_TOKEN");
+const philsmsSenderIdParam = defineString("PHILSMS_SENDER_ID", {
+  default: "PhilSMS",
+});
+const philsmsAlertPhonesParam = defineString("PHILSMS_ALERT_PHONES", {
+  default: "09351914214",
+});
+const philsmsStaffAlertPhonesParam = defineString("PHILSMS_STAFF_ALERT_PHONES", {
+  default: "",
+});
+const philsmsFirmPhonesOnlyParam = defineString("PHILSMS_FIRM_PHONES_ONLY", {
+  default: "true",
+});
+const semaphoreApiKeyParam = defineString("SEMAPHORE_API_KEY", { default: "" });
+const semaphoreSenderNameParam = defineString("SEMAPHORE_SENDER_NAME", {
+  default: "LAWCONNECT",
+});
+
+function parsePhoneList(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+}
 
 function asString(v: unknown): string {
-  return v === undefined || v === null ? "" : String(v).trim();
+  if (v === undefined || v === null) return "";
+  if (typeof v === "string") return v.trim();
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (v instanceof Date) return v.toISOString();
+  if (Array.isArray(v)) {
+    for (const item of v) {
+      const s = asString(item);
+      if (s) return s;
+    }
+    return "";
+  }
+  if (typeof v === "object") {
+    // n8n / AI nodes sometimes send { value: "June 15, 2024" } or
+    // { date: "...", formatted: "..." } â€” never store "[object Object]".
+    const rec = v as Record<string, unknown>;
+    for (const key of ["value", "text", "formatted", "display", "date", "start", "label", "name"]) {
+      const s = asString(rec[key]);
+      if (s) return s;
+    }
+    return "";
+  }
+  return "";
 }
 
 function stripHtml(raw: string): string {
@@ -222,8 +269,7 @@ function isPlaceholderCaseNo(cn: string): boolean {
     s === "n/a" ||
     s === "na" ||
     s === "none" ||
-    s === "unknown" ||
-    s === "test"
+    s === "unknown"
   );
 }
 
@@ -327,10 +373,10 @@ function hasStructuredHearingFields(raw: Record<string, unknown>): boolean {
   ]);
   return Boolean(
     (caseNo && !isPlaceholderCaseNo(caseNo) ? caseNo : "") ||
-      pickString(raw, ["clientName", "client", "party", "parties"]) ||
-      pickString(raw, ["hearingDate", "hearing_date", "date"]) ||
-      pickString(raw, ["courtBranch", "court", "branch", "location"]) ||
-      pickString(raw, ["hearingTime", "hearing_time", "time"]),
+    pickString(raw, ["clientName", "client", "party", "parties"]) ||
+    pickString(raw, ["hearingDate", "hearing_date", "date"]) ||
+    pickString(raw, ["courtBranch", "court", "branch", "location"]) ||
+    pickString(raw, ["hearingTime", "hearing_time", "time"]),
   );
 }
 
@@ -384,6 +430,16 @@ function isCourtOrderText(text: string): boolean {
   return false;
 }
 
+function cleanCaseDocketNo(raw: string): string {
+  if (!raw) return "";
+  const t = raw.trim();
+  const stripped = t.replace(
+    /^(?:civil|criminal|special(?:\s+proceedings)?|spec\.?\s*proc\.?|spec\.?)?\s*case\s*(?:no\.?|#)?\s*[:\-]?\s*/i,
+    "",
+  ).trim();
+  return stripped || t;
+}
+
 function extractCaseNo(text: string, fallback: string): string {
   const patterns = [
     /((?:spec(?:ial)?\.?\s*case\s*no\.?\s*)[A-Za-z0-9\-_/]+)/i,
@@ -393,12 +449,78 @@ function extractCaseNo(text: string, fallback: string): string {
   ];
   for (const re of patterns) {
     const m = text.match(re);
-    if (m?.[1]) return m[1].replace(/\s+/g, " ").trim();
+    if (m?.[1]) {
+      const clean = cleanCaseDocketNo(m[1].replace(/\s+/g, " ").trim());
+      if (clean) return clean;
+    }
   }
-  return fallback;
+  return cleanCaseDocketNo(fallback);
 }
 
 function extractCaseTitle(text: string): string {
+  // Line-based Philippine court caption matching:
+  const lines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const vsIdx = lines.findIndex(
+    (l) =>
+      /^[-–—]?\s*(?:versus|vs\.?)\s*[-–—]?$/i.test(l) ||
+      /[-–—]\s*versus\s*[-–—]/i.test(l),
+  );
+  if (vsIdx !== -1) {
+    const plaintiffLines: string[] = [];
+    for (let i = vsIdx - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (
+        /^(?:Republic|REGIONAL|MUNICIPAL|10th|\d+(?:st|nd|rd|th)\s+Judicial|BRANCH|Email|Contact)/i.test(
+          line,
+        )
+      ) {
+        break;
+      }
+      if (/^Plaintiffs?,?$/i.test(line)) continue;
+      plaintiffLines.unshift(line);
+    }
+    const plaintiff = plaintiffLines.join(" ");
+    const mainPlaintiff = plaintiff
+      .split(/,\s*Namely:/i)[0]
+      .split(/Namely:/i)[0]
+      .trim();
+
+    const defLines: string[] = [];
+    for (let i = vsIdx + 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (/^(?:Civil|Criminal|Special|Spec\.?)\s*Case/i.test(line)) continue;
+      if (/^\d{3,}/.test(line)) continue;
+      if (
+        /^(?:For\s*:|Recovery of|Ownership|Possession|Damages|Injunction)/i.test(
+          line,
+        )
+      ) {
+        continue;
+      }
+      if (/^[xX]\s*[-–—]+\s*[xX]$/.test(line) || /^ORDER$/i.test(line)) break;
+      if (/Defendants?,?\.?$/i.test(line)) {
+        const cleaned = line.replace(/,?\s*Defendants?,?\.?$/i, "").trim();
+        if (cleaned) defLines.push(cleaned);
+        break;
+      }
+      defLines.push(line);
+    }
+    let defendants = defLines
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .replace(/,?\s*Defendants?,?\.?$/i, "")
+      .trim();
+    while (defendants.endsWith(",")) {
+      defendants = defendants.slice(0, -1).trim();
+    }
+    if (mainPlaintiff.length >= 3 && defendants.length >= 3) {
+      return `${mainPlaintiff} vs. ${defendants}`;
+    }
+  }
+
   const vs = text.match(
     /([A-Z][A-Za-z0-9.,'’&\-\s]{3,80}?)\s+(?:vs\.?|versus)\s+([A-Z][A-Za-z0-9.,'’&\-\s]{3,120})/,
   );
@@ -410,13 +532,22 @@ function extractCaseTitle(text: string): string {
 
 function extractClient(text: string, caseTitle: string, fallback: string): string {
   const fb = normalizeWhitespace(fallback);
+  const vsParts = caseTitle.split(/\s+vs\.?\s+/i);
+  const vsRight = vsParts.length > 1 ? vsParts[1].trim() : "";
+
+  const representsDefendants =
+    /(?:appeared\s+in\s+court\s+for|counsel\s+for)\s+(?:the\s+)?(?:answering\s+)?defendants/i.test(
+      text,
+    );
+  if ((representsDefendants || vsRight) && vsRight.length > 3) {
+    return vsRight;
+  }
+
   const hasManyParties =
     /[,;&]|\band\b/i.test(fb) || splitHearingPartyNames(fb).length > 1;
-  if (hasManyParties) return fb;
+  if (hasManyParties && !fb.toLowerCase().startsWith("heirs of")) return fb;
 
-  const vsLeft = caseTitle.includes(" vs.")
-    ? caseTitle.split(/\s+vs\.?\s+/i)[0].trim()
-    : "";
+  const vsLeft = vsParts.length ? vsParts[0].trim() : "";
   const petitioner = text.match(
     /(?:petitioner|plaintiff|applicant)\s*[:\-]\s*([^\n]{3,400})/i,
   );
@@ -438,7 +569,7 @@ function normalizeWhitespace(s: string): string {
 
 function extractHearingDate(text: string): string {
   const m = text.match(
-    /(?:on\s+)?(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})/i,
+    /(?:on\s+)?(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\s*,?\s+(\d{4})/i,
   );
   if (!m) return "";
   return `${m[1]} ${m[2]}, ${m[3]}`;
@@ -454,16 +585,69 @@ function extractHearingTime(text: string): string {
 }
 
 function extractLocation(text: string, fallback: string): string {
-  const branch = text.match(/branch\s*(\d+)/i);
-  const rtc = text.match(
-    /(regional trial court[^,\n]{0,80}(?:,\s*[A-Za-z .]+)?)/i,
+  const branchFull = text.match(
+    /branch\s*(\d+)(?:\s*[-–—]\s*([^\r\n]+)|,\s*([^\r\n]+))/i,
   );
+  if (branchFull) {
+    const branchNum = branchFull[1];
+    let city = (branchFull[2] || branchFull[3] || "").trim();
+    city = city.replace(/[\r\n]+/g, " ").replace(/[.,\s]+$/, "").trim();
+    if (city) {
+      return `Branch ${branchNum} - ${city}`;
+    }
+  }
+  const branch = text.match(/branch\s*(\d+)(?:\s*[-–—]\s*([A-Za-z .]+))?/i);
+  const rtc = text.match(
+    /((?:regional|municipal|metropolitan)\s+trial\s+court[^\n,]{0,80}(?:,\s*[A-Za-z .]+)?)/i,
+  );
+  const region = text.match(/(\d+(?:st|nd|rd|th)\s+judicial region)/i);
+
+  let city = (branch?.[2] || "").trim();
+  if (!city) {
+    const nextLineCity = text.match(
+      /branch\s*\d+\s*[\r\n]+\s*([A-Za-z\s.]+City|[A-Za-z\s.]+Province|Hall of Justice[^\r\n]*)/i,
+    );
+    if (nextLineCity) {
+      city = nextLineCity[1].replace(/[.,\s]+$/, "").trim();
+    }
+  }
+
   if (branch && rtc) {
-    return `Branch ${branch[1]} — ${rtc[1].replace(/\s+/g, " ").trim()}`;
+    let court = rtc[1].replace(/\s+/g, " ").trim();
+    if (region && !court.toLowerCase().includes("judicial")) {
+      court = `${court}, ${region[1]}`;
+    }
+    if (city && !court.toLowerCase().includes(city.toLowerCase())) {
+      court = `${court}, ${city}`;
+    }
+    return `Branch ${branch[1]} — ${court}`;
+  }
+  if (branch && city) {
+    return `Branch ${branch[1]} - ${city}`;
   }
   if (rtc) return rtc[1].replace(/\s+/g, " ").trim();
-  if (branch) return fallback || `Branch ${branch[1]}`;
+  if (branch) {
+    if (fallback && !/^(?:branch\s*\d+|\d+)$/i.test(fallback.trim())) {
+      return fallback;
+    }
+    return `Branch ${branch[1]}`;
+  }
   return fallback;
+}
+
+function cleanOrderSummaryText(text: string): string {
+  let s = text.replace(/\s+/g, " ").trim();
+  s = s.replace(/\s+,/g, ",");
+  s = s.replace(/\s+\./g, ".");
+  // Strip trailing incomplete time markers or dangling prepositions like " a...", " on", " at"
+  s = s.replace(/\s+(?:a|p)\.{0,3}$/i, "");
+  s = s.replace(/\s+(?:on|at|for|the|and|or|in)\s*\.{0,3}$/i, "");
+  s = s.replace(/[,;:\s–—]+$/, "").trim();
+  if (s && !/[.!?]$/.test(s)) s = `${s}.`;
+  if (s && s[0].toLowerCase() === s[0]) {
+    s = s[0].toUpperCase() + s.slice(1);
+  }
+  return s;
 }
 
 function extractSummary(text: string): string {
@@ -472,20 +656,33 @@ function extractSummary(text: string): string {
     let chunk = text.slice(start);
     const stop = chunk.search(/\b(?:SO ORDERED|Page\s+\d+)\b/i);
     if (stop > 15) chunk = chunk.slice(0, stop);
-    chunk = chunk.replace(/\s+/g, " ").trim();
+    chunk = cleanOrderSummaryText(chunk);
     const max = 420;
     if (chunk.length > max) {
       const dot = chunk.lastIndexOf(".", max);
       if (dot >= 40) chunk = chunk.slice(0, dot + 1).trim();
     }
-    return chunk;
+    return cleanOrderSummaryText(chunk);
   }
   const reset = text.match(
-    /(?:reset|set|scheduled)[\s\S]{10,280}?(?:morning|afternoon|a\.m\.|p\.m\.)/i,
+    /(?:hearing\s+of\s+the\s+above-entitled\s+case|the\s+continuation\s+of\s+(?:the\s+)?proceedings|the\s+court\s+hereby\s+sets|reset|set|scheduled)[\s\S]{10,400}?(?:morning|afternoon|a\.?m\.?|p\.?m\.?|o['’]?clock)/i,
   );
-  if (reset) return reset[0].replace(/\s+/g, " ").trim();
-  const clean = text.replace(/\s+/g, " ").trim();
-  return clean.length > 280 ? `${clean.slice(0, 277)}…` : clean;
+  if (reset) {
+    let s = reset[0];
+    const rest = text.slice(reset.index!);
+    const sentenceEnd = rest.match(/^[\s\S]+?\.\s+/);
+    if (sentenceEnd && sentenceEnd[0].length <= 420) {
+      s = sentenceEnd[0];
+    }
+    return cleanOrderSummaryText(s);
+  }
+  const clean = cleanOrderSummaryText(text);
+  if (clean.length > 280) {
+    const dot = clean.lastIndexOf(".", 280);
+    if (dot >= 50) return clean.slice(0, dot + 1).trim();
+    return `${clean.slice(0, 277)}…`;
+  }
+  return clean;
 }
 
 function parseHearingTimestamp(dateStr: string, timeStr: string): admin.firestore.Timestamp | null {
@@ -580,20 +777,28 @@ async function fanOutHearingInbox(params: {
   const clientUids: string[] = [];
   if (attorneyUid) recipients.add(attorneyUid);
   try {
-    const [attorneys, admins, matchedClients] = await Promise.all([
+    const [attorneys, staff, admins, matchedClients] = await Promise.all([
       db.collection("users").where("role", "==", "attorney").limit(40).get(),
+      db.collection("users").where("role", "==", "staff").limit(40).get(),
       db.collection("users").where("role", "==", "admin").limit(15).get(),
-      Promise.race([
-        resolveClientUidsByHearingName(db, clientName, {
-          scanAllClients: false,
-        }),
-        new Promise<string[]>((resolve) => {
-          setTimeout(() => resolve([]), 1500);
-        }),
-      ]),
+      resolveClientUidsByHearingName(db, clientName, {
+        scanAllClients: true,
+        caseTitle,
+        fullText: orderText,
+      }),
     ]);
-    for (const d of attorneys.docs) recipients.add(d.id);
-    for (const d of admins.docs) recipients.add(d.id);
+    for (const d of attorneys.docs) {
+      if (d.data()?.isActive === false) continue;
+      recipients.add(d.id);
+    }
+    for (const d of staff.docs) {
+      if (d.data()?.isActive === false) continue;
+      recipients.add(d.id);
+    }
+    for (const d of admins.docs) {
+      if (d.data()?.isActive === false) continue;
+      recipients.add(d.id);
+    }
     for (const uid of matchedClients) {
       recipients.add(uid);
       clientUids.push(uid);
@@ -616,11 +821,18 @@ async function fanOutHearingInbox(params: {
   if (recipients.size) {
     try {
       const hearingDoc = hearingPayload as HearingDoc;
-      const title = `Court hearing / order — ${asString(hearingPayload.caseNo) || "Court order"}`;
+      const caseLabel = asString(hearingPayload.caseNo) || "Court order";
+      const dateLabel = (hearingDate || "").trim();
+      const title = dateLabel
+        ? `Court hearing / order — ${caseLabel} · ${dateLabel}`
+        : `Court hearing / order — ${caseLabel}`;
       const body = buildNotificationBody(hearingDoc, {
         caseId: caseId || hearingRef.id,
         caseTitle: caseTitle || asString(hearingPayload.caseNo) || "Hearing",
       });
+      // Inbox only here. Do NOT claim fcmPushClaimedAt — that left zombie
+      // claims when FCM failed and silenced onHearingActivityCreated.
+      // Phone push + SMS are owned by onHearingActivityCreated (every hearing).
       await deliverHearingNotification({
         db,
         caseId: caseId || "",
@@ -646,6 +858,41 @@ async function fanOutHearingInbox(params: {
           hearingTime: hearingTime || "",
         },
       });
+
+      // SMS in this HTTP request as well (CF also tries; per-doc claim dedupes).
+      const alertPhones = parsePhoneList(philsmsAlertPhonesParam.value());
+      const staffRaw = philsmsStaffAlertPhonesParam.value().trim();
+      const staffAlertPhones = staffRaw
+        ? parsePhoneList(staffRaw)
+        : alertPhones;
+      const firmOnlyRaw = philsmsFirmPhonesOnlyParam.value().trim().toLowerCase();
+      try {
+        await sendHearingSmsAlerts({
+          db,
+          hearingDocId: hearingRef.id,
+          hearingData: hearingPayload as HearingDoc & Record<string, unknown>,
+          recipientUserIds: [...recipients],
+          title,
+          body,
+          cfg: {
+            apiToken: philsmsApiTokenParam.value().trim(),
+            senderId: philsmsSenderIdParam.value().trim() || "PhilSMS",
+            alertPhones,
+            staffAlertPhones,
+            firmPhonesOnly: firmOnlyRaw !== "false" && firmOnlyRaw !== "0",
+          },
+          semaphore: {
+            apiKey: semaphoreApiKeyParam.value().trim(),
+            senderName:
+              semaphoreSenderNameParam.value().trim() || "LAWCONNECT",
+          },
+        });
+      } catch (smsErr) {
+        logger.warn("n8n hearing ingest SMS skipped", {
+          hearingId: hearingRef.id,
+          err: smsErr instanceof Error ? smsErr.message : String(smsErr),
+        });
+      }
     } catch (e) {
       logger.warn("n8n hearing ingest inbox write skipped", {
         err: e instanceof Error ? e.message : String(e),
@@ -657,9 +904,9 @@ async function fanOutHearingInbox(params: {
 export const courtEmailIngest = onRequest(
   {
     region: "us-central1",
-    memory: "256MiB",
+    memory: "512MiB",
     timeoutSeconds: 60,
-    secrets: [ingestSecret],
+    secrets: [ingestSecret, philsmsApiTokenParam],
     cors: true,
     invoker: "public",
   },
@@ -783,21 +1030,21 @@ export const courtEmailIngest = onRequest(
     ]);
     caseNo = extractCaseNo(orderText, caseNo);
     if (isPlaceholderCaseNo(caseNo)) caseNo = "";
-    if (!isCourtOrderText(orderText) && isProductOrDevEmailBlob(orderText)) {
-      await skipIngest("not_court_hearing");
-      return;
+    if (!caseNo && orderText) {
+      caseNo = extractCaseNo(orderText, "") || pickString(raw, ["caseNo", "caseNumber", "case_no"]) || "Court Notice";
     }
-    if (!caseNo && !isCourtOrderText(orderText)) {
-      await skipIngest("not_court_hearing");
-      return;
-    }
-    if (!caseNo && !orderText) {
-      await skipIngest("missing_case_or_text");
+    if (!orderText && !caseNo) {
+      await skipIngest("empty_payload");
       return;
     }
 
     let caseTitle = pickString(raw, ["caseTitle", "case_title"]);
-    if (!caseTitle) caseTitle = extractCaseTitle(orderText);
+    if (!caseTitle || !caseTitle.includes(" vs.")) {
+      const resolved = extractCaseTitle(orderText);
+      if (resolved && resolved.includes(" vs.")) {
+        caseTitle = resolved;
+      }
+    }
 
     const parties = pickString(raw, [
       "clientName",
@@ -810,7 +1057,18 @@ export const courtEmailIngest = onRequest(
     const clientName = extractClient(orderText, caseTitle, parties);
 
     let courtBranch = pickString(raw, ["courtBranch", "court", "branch"]);
-    const location = extractLocation(orderText, courtBranch);
+    let location = extractLocation(orderText, courtBranch);
+    if (location && location.includes(" - ")) {
+      const parts = location.split(/\s*[-–—]\s*/);
+      if (parts.length > 1 && /branch/i.test(parts[0])) {
+        if (!courtBranch) courtBranch = parts[0].trim();
+        location = parts[1].trim();
+        location = location
+          .split(" ")
+          .map((w) => (w ? w[0].toUpperCase() + w.slice(1).toLowerCase() : ""))
+          .join(" ");
+      }
+    }
     if (!courtBranch && location) courtBranch = location;
 
     let hearingDate = pickString(raw, [

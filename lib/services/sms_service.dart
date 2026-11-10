@@ -62,7 +62,10 @@ class SmsService {
   static bool _isSignupOtpMeta(Map<String, dynamic>? meta) =>
       meta != null && meta['type'] == 'otp';
 
-  String _normalizePhoneE164Ph(String input) {
+  String _normalizePhoneE164Ph(String input) => normalizePhoneE164Ph(input);
+
+  /// `09…` and `+63…` for the same SIM become one key.
+  static String normalizePhoneE164Ph(String input) {
     var s = input.trim();
     if (s.isEmpty) return s;
     s = s.replaceAll(RegExp(r'[\s\-\(\)]'), '');
@@ -191,11 +194,11 @@ class SmsService {
       );
     }
 
-    var philOk = false;
     // Browser calls to PhilSMS are blocked by CORS. Web queues the SMS so
     // Cloud Function onSmsRequestSend sends it (same path as push).
+    // One provider only. A second success was a duplicate text of the same body.
     if (!kIsWeb && PhilSmsConfig.isConfigured) {
-      philOk = await PhilSmsService.instance.sendSms(
+      final philOk = await PhilSmsService.instance.sendSms(
         to: cleanTo,
         message: cleanBody,
       );
@@ -203,29 +206,24 @@ class SmsService {
         if (kDebugMode) {
           debugPrint('✅ SMS sent via PhilSMS');
         }
-      } else if (kDebugMode) {
+        return (result: SmsQueueResult.sentViaPhilSms, requestId: null);
+      }
+      if (kDebugMode) {
         debugPrint('⚠️ PhilSMS failed — Semaphore / fallback still attempted');
       }
     }
 
-    var semOk = false;
     if (SemaphoreConfig.isConfigured) {
-      semOk = await SemaphoreService.instance.sendSms(
+      final semOk = await SemaphoreService.instance.sendSms(
         to: cleanTo,
         message: cleanBody,
       );
       if (kDebugMode) {
         debugPrint(semOk ? '✅ SMS sent via Semaphore' : '⚠️ Semaphore SMS failed');
       }
-    }
-
-    if (philOk || semOk) {
-      return (
-        result: philOk
-            ? SmsQueueResult.sentViaPhilSms
-            : SmsQueueResult.sentViaSemaphore,
-        requestId: null,
-      );
+      if (semOk) {
+        return (result: SmsQueueResult.sentViaSemaphore, requestId: null);
+      }
     }
 
     final supabase = SupabaseService.instance.clientOrNull;
@@ -405,4 +403,53 @@ class SmsService {
     }
     return result.id!;
   }
+
+  /// Sends a Notary Document Checklist to a client's phone via SMS.
+  Future<bool> sendNotaryChecklistSms({
+    required String to,
+    required String documentTitle,
+    required List<String> requirements,
+    String? officeHours,
+  }) async {
+    final cleanTo = _normalizePhoneE164Ph(to);
+    if (cleanTo.isEmpty || !cleanTo.startsWith('+')) return false;
+
+    final reqSummary = requirements.take(4).map((r) => '• $r').join('\n');
+    final message = '''
+LawConnect Notary Requirements
+$documentTitle:
+$reqSummary
+⚠️ Note: Bring 2 valid photo IDs. Do NOT sign before arrival!
+Walk-in: ${officeHours ?? 'Mon-Fri 8:00 AM - 5:00 PM'}
+'''.trim();
+
+    try {
+      if (!kIsWeb && PhilSmsConfig.isConfigured) {
+        final ok = await PhilSmsService.instance.sendSms(
+          to: cleanTo,
+          message: message,
+        );
+        if (ok) return true;
+      }
+
+      if (SemaphoreConfig.isConfigured) {
+        final ok = await SemaphoreService.instance.sendSms(
+          to: cleanTo,
+          message: message,
+        );
+        if (ok) return true;
+      }
+
+      if (_auth.currentUser != null) {
+        await queueSms(
+          to: cleanTo,
+          body: message,
+          meta: {'type': 'notary_checklist', 'doc': documentTitle},
+        );
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
 }
+

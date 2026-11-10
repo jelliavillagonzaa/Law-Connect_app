@@ -62,7 +62,7 @@ class NotificationService {
         'high_importance_channel',
         'High Priority Notifications',
         description: 'Important notifications from LawConnect',
-        importance: Importance.high,
+        importance: Importance.max,
         playSound: true,
         enableVibration: true,
         showBadge: true,
@@ -94,19 +94,22 @@ class NotificationService {
     required String title,
     required String body,
     String? payload,
+    String? tag,
   }) async {
     if (kIsWeb) return;
     if (!_isInitialized) await initialize();
 
     final NotificationDetails notificationDetails = NotificationDetails(
       android: AndroidNotificationDetails(
-        'law_connect_channel',
-        'LawConnect Notifications',
-        channelDescription: 'Notifications from LawConnect app',
-        importance: Importance.high,
-        priority: Priority.high,
+        'high_importance_channel',
+        'High Priority Notifications',
+        channelDescription: 'Important notifications from LawConnect',
+        importance: Importance.max,
+        priority: Priority.max,
         playSound: true,
         enableVibration: true,
+        visibility: NotificationVisibility.public,
+        tag: tag,
         styleInformation: BigTextStyleInformation(
           body,
           contentTitle: title,

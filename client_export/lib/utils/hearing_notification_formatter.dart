@@ -22,6 +22,8 @@ class HearingNotificationFormatter {
     'activityType': 'Activity',
     'senderName': 'From',
     'message': 'Message',
+    'remarks': 'Remarks',
+    'notes': 'Notes / Remarks',
     'fullText': 'Order / full text',
     'createdAt': 'Recorded',
     'updatedAt': 'Last updated',
@@ -67,8 +69,19 @@ class HearingNotificationFormatter {
   ) {
     final out = <String, dynamic>{};
     for (final key in calendarHearingKeys.keys) {
-      final text = _calendarFieldText(source, key);
-      if (text.isNotEmpty) out[key] = text;
+      if (key == 'location') {
+        var venue = HearingCalendarFields.resolveVenueForDisplay(source);
+        if (venue.isEmpty) {
+          venue = _calendarFieldText(source, 'location');
+        }
+        if (venue.isEmpty) {
+          venue = _calendarFieldText(source, 'courtBranch');
+        }
+        if (venue.isNotEmpty) out['location'] = venue;
+      } else {
+        final text = _calendarFieldText(source, key);
+        if (text.isNotEmpty) out[key] = text;
+      }
     }
     return out;
   }
@@ -79,7 +92,23 @@ class HearingNotificationFormatter {
   ) {
     final rows = <MapEntry<String, String>>[];
     for (final entry in calendarHearingKeys.entries) {
-      final text = _formatValue(entry.key, data[entry.key]);
+      String? text;
+      if (entry.key == 'location') {
+        var venue = HearingCalendarFields.resolveVenueForDisplay(data);
+        if (venue.isEmpty) {
+          final rawLoc = _formatValue('location', data['location']) ??
+              _formatValue('courtBranch', data['courtBranch']) ??
+              _formatValue('court', data['court']) ??
+              _formatValue('court_branch', data['court_branch']) ??
+              _formatValue('venue', data['venue']);
+          if (rawLoc != null && rawLoc.isNotEmpty) {
+            venue = rawLoc;
+          }
+        }
+        text = venue.isNotEmpty ? venue : null;
+      } else {
+        text = _formatValue(entry.key, data[entry.key]);
+      }
       if (text == null || text.isEmpty) continue;
       rows.add(MapEntry(entry.value, text));
     }
@@ -216,6 +245,8 @@ class HearingNotificationFormatter {
     add('summary', 'Summary');
     add('documentType', 'Document type');
     add('senderName', 'From');
+    add('remarks', 'Remarks');
+    add('notes', 'Notes / Remarks');
 
     final fullText = _formatValue('fullText', prepared['fullText'] ?? data['fullText']);
     if (fullText != null && fullText.isNotEmpty) {

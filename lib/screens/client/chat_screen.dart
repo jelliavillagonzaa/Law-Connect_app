@@ -6,16 +6,19 @@ import '../../theme/app_theme.dart';
 import '../../services/chat_service.dart';
 import '../../services/chat_session.dart';
 import '../../models/message_model.dart';
+import '../../models/user_model.dart';
 
 class ChatScreen extends StatefulWidget {
   final String otherUserId;
   final String otherUserName;
+  final String? otherUserRole;
   final String? conversationId; // Optional, if starting a new chat
 
   const ChatScreen({
     super.key,
     required this.otherUserId,
     required this.otherUserName,
+    this.otherUserRole,
     this.conversationId,
   });
 
@@ -33,6 +36,9 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _hasError = false;
   String? _errorMessage;
   String _displayName = '';
+  String? _otherUserRole;
+  String? _attorneyId;
+  String? _staffId;
   StreamSubscription<List<MessageModel>>? _messagesSub;
 
   // Color palette
@@ -43,6 +49,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void initState() {
     super.initState();
     _displayName = widget.otherUserName;
+    _otherUserRole = widget.otherUserRole;
     if (widget.conversationId != null && widget.conversationId!.isNotEmpty) {
       _conversationId = widget.conversationId;
       ChatSession.open(_conversationId);
@@ -132,55 +139,60 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     try {
-      // Get other user's role to determine display name
-      try {
-        final otherUserDoc = await _firestore
-            .collection('users')
-            .doc(widget.otherUserId)
-            .get(const GetOptions(source: Source.cache))
-            .timeout(const Duration(seconds: 1));
-        if (otherUserDoc.exists) {
-          final userData = otherUserDoc.data();
-          final otherUserRole = userData?['role'];
-          // If staff, display "Law Connect", otherwise use the provided name
-          _displayName = (otherUserRole == 'staff')
-              ? 'Law Connect'
-              : widget.otherUserName;
-        } else {
-          _displayName = widget.otherUserName;
+      final activeConvId = widget.conversationId ?? _conversationId;
+      if (activeConvId != null && activeConvId.isNotEmpty) {
+        Map<String, dynamic>? cdata;
+        try {
+          final convDoc = await _firestore
+              .collection('messages')
+              .doc(activeConvId)
+              .get();
+          if (convDoc.exists) {
+            cdata = convDoc.data() ?? {};
+            _attorneyId = (cdata['attorneyId'] as String?)?.trim();
+            _staffId = (cdata['staffId'] as String?)?.trim();
+          }
+        } catch (_) {}
+
+        final counterpart = await _chatService.chatCounterpartInfo(
+          chatId: activeConvId,
+          currentUserId: user.uid,
+          cachedChatData: cdata,
+        );
+
+        if (mounted) {
+          setState(() {
+            _displayName = (widget.otherUserName.isNotEmpty &&
+                    widget.otherUserName.toLowerCase() != 'user')
+                ? widget.otherUserName
+                : counterpart.name;
+            _otherUserRole = (widget.otherUserRole != null &&
+                    widget.otherUserRole!.isNotEmpty)
+                ? widget.otherUserRole
+                : counterpart.role;
+            _conversationId = activeConvId;
+            _isInitializing = false;
+            _hasError = false;
+          });
+          ChatSession.open(activeConvId);
+          _chatService.markMessagesAsSeen(activeConvId, user.uid);
+          _listenForSeenUpdates(activeConvId, user.uid);
         }
-      } catch (e) {
-        _displayName = widget.otherUserName;
+        return;
       }
 
-      String? conversationId;
-
-      // If conversationId is provided, use it
-      if (widget.conversationId != null && widget.conversationId!.isNotEmpty) {
-        conversationId = widget.conversationId;
-      } else {
-        // Otherwise, create or get conversation
-        conversationId = await _chatService
-            .getOrCreateChat(
-              user.uid,
-              widget.otherUserId,
-            )
-            .timeout(const Duration(seconds: 2));
-      }
-
+      final info = await _chatService.getOrCreateClientOfficeChatWithCounterpart(user.uid);
       if (mounted) {
         setState(() {
-          _conversationId = conversationId;
+          _displayName = info.counterpart.name;
+          _otherUserRole = info.counterpart.role;
+          _conversationId = info.chatId;
           _isInitializing = false;
           _hasError = false;
         });
-        ChatSession.open(conversationId);
-
-        // Mark messages as seen
-        if (conversationId != null) {
-          _chatService.markMessagesAsSeen(conversationId, user.uid);
-          _listenForSeenUpdates(conversationId, user.uid);
-        }
+        ChatSession.open(info.chatId);
+        _chatService.markMessagesAsSeen(info.chatId, user.uid);
+        _listenForSeenUpdates(info.chatId, user.uid);
       }
     } catch (e) {
       if (mounted) {
@@ -189,8 +201,6 @@ class _ChatScreenState extends State<ChatScreen> {
           _hasError = true;
           _errorMessage = 'Failed to initialize chat. Please try again.';
         });
-
-        // Show error dialog
         _showErrorDialog(context, _errorMessage!);
       }
     }
@@ -216,23 +226,13 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
-      // Get user role to identify if it's client, attorney, etc.
-      String? senderRole;
-      try {
-        final userDoc = await FirebaseFirestore.instance
-            .collection('users')
-            .doc(user.uid)
-            .get();
-        senderRole = userDoc.data()?['role'];
-      } catch (e) {
-        // If can't get role, continue without it
-      }
-
+      // Do not hardcode senderRole as 'client' — attorneys/staff also use this
+      // screen (e.g. attorney ↔ staff). ChatService resolves role from the
+      // signed-in user profile; claiming 'client' rejects non-client logins.
       await _chatService.sendMessage(
         chatId: _conversationId!,
         senderId: user.uid,
         text: _messageController.text.trim(),
-        senderRole: senderRole,
       );
 
       _messageController.clear();
@@ -247,9 +247,27 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     } catch (e) {
       if (mounted) {
-        _showErrorDialog(context, 'Failed to send message. Please try again.');
+        _showErrorDialog(context, _friendlySendError(e));
       }
     }
+  }
+
+  String _friendlySendError(Object e) {
+    var msg = e.toString();
+    while (msg.startsWith('Exception: ')) {
+      msg = msg.substring('Exception: '.length);
+    }
+    const prefix = 'Failed to send message: ';
+    if (msg.startsWith(prefix)) {
+      msg = msg.substring(prefix.length);
+      while (msg.startsWith('Exception: ')) {
+        msg = msg.substring('Exception: '.length);
+      }
+    }
+    if (msg.trim().isEmpty) {
+      return 'Failed to send message. Please try again.';
+    }
+    return msg.trim();
   }
 
   String _formatTime(DateTime dateTime) {
@@ -429,6 +447,64 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  String _cleanSenderName(MessageModel message) {
+    var name = (message.senderName ?? '').trim();
+    final role = (message.senderRole ?? '').toLowerCase();
+
+    final isStf = _otherUserRole == 'staff' ||
+        role == 'staff' ||
+        (_staffId != null &&
+            _staffId!.isNotEmpty &&
+            message.senderId == _staffId);
+
+    if (isStf) {
+      if (name.isEmpty ||
+          name.toLowerCase() == 'user' ||
+          name.toLowerCase() == 'attorney' ||
+          name.toLowerCase().startsWith('atty.')) {
+        return (_displayName.isNotEmpty &&
+                _displayName.toLowerCase() != 'attorney' &&
+                !_displayName.toLowerCase().startsWith('atty.'))
+            ? _displayName
+            : 'Legal Staff';
+      }
+      return name;
+    }
+
+    final isAtt = _otherUserRole == 'attorney' ||
+        role == 'attorney' ||
+        (_attorneyId != null &&
+            _attorneyId!.isNotEmpty &&
+            message.senderId == _attorneyId);
+
+    if (isAtt) {
+      if (name.isEmpty ||
+          name.toLowerCase() == 'user' ||
+          name.toLowerCase() == 'staff' ||
+          name.toLowerCase() == 'legal staff' ||
+          name.toLowerCase() == 'law connect') {
+        if (_displayName.isNotEmpty &&
+            _displayName.toLowerCase() != 'staff' &&
+            _displayName.toLowerCase() != 'legal staff') {
+          return _displayName;
+        }
+        return 'Attorney';
+      }
+      if (name.toLowerCase() == 'attorney') {
+        return 'Attorney';
+      }
+      if (!name.startsWith('Atty.')) {
+        name = 'Atty. $name';
+      }
+      return name;
+    }
+
+    if (name.isNotEmpty && name.toLowerCase() != 'user') {
+      return name;
+    }
+    return _displayName.isNotEmpty ? _displayName : widget.otherUserName;
+  }
+
   Widget _buildMessageBubble(MessageModel message, String currentUserId) {
     final isMe = message.senderId == currentUserId;
     final timeStr = _formatTime(message.timestamp);
@@ -443,26 +519,40 @@ class _ChatScreenState extends State<ChatScreen> {
         children: [
           if (!isMe) ...[
             // Avatar for other user messages (left side)
-            Container(
-              width: 36,
-              height: 36,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: const Color(0xFF17A2B8),
-                border: Border.all(color: Colors.white, width: 2),
-              ),
-              child: Center(
-                child: Text(
-                  widget.otherUserName.isNotEmpty
-                      ? widget.otherUserName[0].toUpperCase()
-                      : 'M',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.bold,
-                    fontSize: 14,
+            Builder(
+              builder: (context) {
+                final isAttorney = _otherUserRole == 'attorney';
+                final roleColor = isAttorney
+                    ? AppTheme.royalBlue
+                    : const Color(0xFF00897B);
+                final senderLabel = _cleanSenderName(message);
+                final cleanSender = isAttorney
+                    ? senderLabel.replaceAll('Atty. ', '').trim()
+                    : senderLabel.trim();
+                final letter = cleanSender.isNotEmpty
+                    ? cleanSender[0].toUpperCase()
+                    : (isAttorney ? 'A' : 'S');
+
+                return Container(
+                  width: 36,
+                  height: 36,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: roleColor,
+                    border: Border.all(color: Colors.white, width: 2),
                   ),
-                ),
-              ),
+                  child: Center(
+                    child: Text(
+                      letter,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 14,
+                      ),
+                    ),
+                  ),
+                );
+              },
             ),
             const SizedBox(width: 8),
           ],
@@ -512,75 +602,16 @@ class _ChatScreenState extends State<ChatScreen> {
                             ),
                           )
                         else
-                          Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(
-                                message.senderRole == 'attorney'
-                                    ? widget.otherUserName
-                                    : (message.senderRole == 'staff'
-                                          ? 'Staff'
-                                          : widget.otherUserName),
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.bold,
-                                  color: Colors.black87,
-                                ),
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 4),
+                            child: Text(
+                              _cleanSenderName(message),
+                              style: const TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.black87,
                               ),
-                              if (message.senderRole == 'attorney') ...[
-                                const SizedBox(width: 6),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 6,
-                                    vertical: 2,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: AppTheme.royalBlue.withOpacity(0.1),
-                                    borderRadius: BorderRadius.circular(10),
-                                    border: Border.all(
-                                      color: AppTheme.royalBlue.withOpacity(
-                                        0.3,
-                                      ),
-                                      width: 1,
-                                    ),
-                                  ),
-                                  child: Text(
-                                    'ATTORNEY',
-                                    style: TextStyle(
-                                      fontSize: 9,
-                                      fontWeight: FontWeight.bold,
-                                      color: AppTheme.royalBlue,
-                                    ),
-                                  ),
-                                ),
-                              ] else if (message.senderRole == 'staff') ...[
-                                const SizedBox(width: 6),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 6,
-                                    vertical: 2,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: AppTheme.royalBlue.withOpacity(0.1),
-                                    borderRadius: BorderRadius.circular(10),
-                                    border: Border.all(
-                                      color: AppTheme.royalBlue.withOpacity(
-                                        0.3,
-                                      ),
-                                      width: 1,
-                                    ),
-                                  ),
-                                  child: Text(
-                                    'STAFF',
-                                    style: TextStyle(
-                                      fontSize: 9,
-                                      fontWeight: FontWeight.bold,
-                                      color: AppTheme.royalBlue,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ],
+                            ),
                           ),
                         Text(
                           message.text,
@@ -799,21 +830,119 @@ class _ChatScreenState extends State<ChatScreen> {
       ), // Light gray background like in the image
       appBar: AppBar(
         backgroundColor: Colors.white,
-        elevation: 0,
+        elevation: 0.5,
+        shadowColor: Colors.black.withOpacity(0.08),
         leading: IconButton(
           icon: const Icon(Icons.arrow_back, color: Colors.black87),
           onPressed: () => Navigator.of(context).pop(),
         ),
-        title: Text(
-          'Message', // Changed from widget.otherUserName
-          style: const TextStyle(
-            color: Colors.black87,
-            fontWeight: FontWeight.bold,
-          ),
+        titleSpacing: 0,
+        title: Builder(
+          builder: (context) {
+            final isAttorney = _otherUserRole == 'attorney';
+            final roleColor =
+                isAttorney ? AppTheme.royalBlue : const Color(0xFF00897B);
+            final roleText = isAttorney ? 'ATTORNEY' : 'STAFF';
+
+            var cleanName = _displayName.trim();
+            if (cleanName.isEmpty) cleanName = widget.otherUserName.trim();
+
+            if (isAttorney) {
+              if (cleanName.isEmpty ||
+                  cleanName.toLowerCase() == 'user' ||
+                  cleanName.toLowerCase() == 'staff' ||
+                  cleanName.toLowerCase() == 'legal staff') {
+                cleanName = 'Attorney';
+              } else if (cleanName.toLowerCase() == 'attorney') {
+                cleanName = 'Attorney';
+              } else if (!cleanName.startsWith('Atty.')) {
+                cleanName = 'Atty. $cleanName';
+              }
+            } else {
+              if (cleanName.isEmpty ||
+                  cleanName.toLowerCase() == 'user' ||
+                  cleanName.toLowerCase() == 'attorney' ||
+                  cleanName.toLowerCase().startsWith('atty.')) {
+                cleanName = 'Legal Staff';
+              }
+            }
+
+            final letterSource = isAttorney
+                ? cleanName.replaceAll('Atty. ', '').trim()
+                : cleanName.trim();
+            final letter = letterSource.isNotEmpty
+                ? letterSource[0].toUpperCase()
+                : (isAttorney ? 'A' : 'S');
+
+            return Row(
+              children: [
+                CircleAvatar(
+                  radius: 18,
+                  backgroundColor: roleColor.withOpacity(0.12),
+                  child: Text(
+                    letter,
+                    style: TextStyle(
+                      color: roleColor,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 14,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        cleanName,
+                        style: const TextStyle(
+                          color: Colors.black87,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 15,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 2),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 1.5,
+                            ),
+                            decoration: BoxDecoration(
+                              color: roleColor.withOpacity(0.1),
+                              borderRadius: BorderRadius.circular(6),
+                              border: Border.all(
+                                color: roleColor.withOpacity(0.3),
+                                width: 0.8,
+                              ),
+                            ),
+                            child: Text(
+                              roleText,
+                              style: TextStyle(
+                                fontSize: 9,
+                                fontWeight: FontWeight.bold,
+                                color: roleColor,
+                                letterSpacing: 0.4,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            );
+          },
         ),
       ),
       body: Column(
         children: [
+          _signedInBanner(),
           Expanded(
             child: StreamBuilder<List<MessageModel>>(
               stream: _chatService.getMessagesWithNotifications(
@@ -859,6 +988,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 }
 
                 final messages = snapshot.data ?? [];
+
 
                 if (messages.isEmpty) {
                   return Center(
@@ -971,6 +1101,42 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _signedInBanner() {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return const SizedBox.shrink();
+    return Material(
+      color: const Color(0xFFE8F0FE),
+      child: FutureBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+        future: _firestore.collection('users').doc(user.uid).get(),
+        builder: (context, snap) {
+          var name = (user.displayName ?? '').trim();
+          if (snap.hasData && snap.data!.exists) {
+            name = UserModel.resolveDisplayName(snap.data!.data() ?? {});
+          }
+          final email = user.email ?? '';
+          final label = name.isNotEmpty && name != 'User'
+              ? name
+              : (email.isNotEmpty ? email : 'this client account');
+          final extra =
+              name.isNotEmpty && name != 'User' && email.isNotEmpty
+                  ? ' · $email'
+                  : '';
+          return Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            child: Text(
+              'Sending as $label$extra',
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: Color(0xFF1A3A6C),
+              ),
+            ),
+          );
+        },
       ),
     );
   }

@@ -125,14 +125,25 @@ class HearingAiSchedBadge extends StatelessWidget {
 
 /// Dialog / app bar title: case number, then client, then case caption.
 String hearingCalendarDisplayTitle(Map<String, dynamic> ev) {
-  final caseNo = (ev['caseNo'] as String?)?.trim();
-  if (caseNo != null && caseNo.isNotEmpty) return caseNo;
-  final client = (ev['clientName'] as String?)?.trim();
-  if (client != null && client.isNotEmpty) return client;
-  final caseTitle = (ev['caseTitle'] as String?)?.trim();
-  if (caseTitle != null && caseTitle.isNotEmpty) return caseTitle;
-  final t = (ev['title'] as String?)?.trim();
-  if (t != null && t.isNotEmpty) {
+  final rawCaseNo = HearingCalendarFields.asDisplayString(ev['caseNo']).isNotEmpty
+      ? HearingCalendarFields.asDisplayString(ev['caseNo'])
+      : HearingCalendarFields.asDisplayString(ev['caseNumber']);
+  final cleanNo = HearingCalendarFields.cleanCaseDocketNo(rawCaseNo);
+  if (cleanNo.isNotEmpty &&
+      !HearingCalendarFields.isPlaceholderCaseNo(cleanNo)) {
+    return cleanNo;
+  }
+  final client = HearingCalendarFields.resolveClientForDisplay(ev);
+  if (client.isNotEmpty) return client;
+  final caseTitle = HearingCalendarFields.asDisplayString(ev['caseTitle']);
+  if (caseTitle.isNotEmpty &&
+      !HearingCalendarFields.isLowQualityCaseTitle(caseTitle)) {
+    return caseTitle;
+  }
+  if (cleanNo.isNotEmpty) return cleanNo;
+  if (rawCaseNo.isNotEmpty) return rawCaseNo;
+  final t = HearingCalendarFields.asDisplayString(ev['title']);
+  if (t.isNotEmpty) {
     return t.replaceFirst(RegExp(r'^\[AI\]\s*'), '');
   }
   return 'Hearing';

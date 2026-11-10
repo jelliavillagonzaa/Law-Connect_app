@@ -1,10 +1,11 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import 'package:flutter/foundation.dart' show kDebugMode, debugPrint, kIsWeb;
 import 'package:intl/intl.dart';
 import 'dart:async';
 import '../models/case_model.dart';
 import '../utils/calendar_live_hearing_map.dart';
+import 'attorney_availability_service.dart';
 import 'fcm_service.dart';
 import 'firestore_mirror_helper.dart';
 import 'hearing_calendar_sync_service.dart';
@@ -24,22 +25,99 @@ class StaffService {
     );
   }
 
-  // Get cases assigned to staff
-  Stream<List<CaseModel>> getAssignedCases(String staffId) {
-    return _withEmptyOnError(
-      _firestore
-          .collection('cases')
-          .where('staffAssigned', arrayContains: staffId)
-          .snapshots()
-          .map((snapshot) {
-            final cases = snapshot.docs
-                .map((doc) => CaseModel.fromFirestore(doc))
-                .toList();
-            cases.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-            return cases;
-          }),
-      const <CaseModel>[],
-    );
+  // Get cases assigned to staff (checks both staffAssigned array and staffId field)
+  Stream<List<CaseModel>> getAssignedCases(String staffId, {String? staffEmail}) {
+    final cleanId = staffId.trim();
+    final cleanEmail = staffEmail?.trim() ?? '';
+    if (cleanId.isEmpty && cleanEmail.isEmpty) return Stream.value(const <CaseModel>[]);
+    final stream1 = cleanId.isNotEmpty
+        ? _firestore
+            .collection('cases')
+            .where('staffAssigned', arrayContains: cleanId)
+            .snapshots()
+        : null;
+    final stream2 = cleanId.isNotEmpty
+        ? _firestore
+            .collection('cases')
+            .where('staffId', isEqualTo: cleanId)
+            .snapshots()
+        : null;
+    final stream3 = cleanEmail.isNotEmpty
+        ? _firestore
+            .collection('cases')
+            .where('staffAssigned', arrayContains: cleanEmail)
+            .snapshots()
+        : null;
+    final stream4 = cleanEmail.isNotEmpty
+        ? _firestore
+            .collection('cases')
+            .where('staffId', isEqualTo: cleanEmail)
+            .snapshots()
+        : null;
+
+    final controller = StreamController<List<CaseModel>>.broadcast();
+    List<CaseModel> list1 = [];
+    List<CaseModel> list2 = [];
+    List<CaseModel> list3 = [];
+    List<CaseModel> list4 = [];
+
+    void emitMerged() {
+      if (controller.isClosed) return;
+      final map = <String, CaseModel>{};
+      for (final c in list1) map[c.id] = c;
+      for (final c in list2) map.putIfAbsent(c.id, () => c);
+      for (final c in list3) map.putIfAbsent(c.id, () => c);
+      for (final c in list4) map.putIfAbsent(c.id, () => c);
+      final merged = map.values.toList()
+        ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+      controller.add(merged);
+    }
+
+    StreamSubscription? sub1;
+    StreamSubscription? sub2;
+    StreamSubscription? sub3;
+    StreamSubscription? sub4;
+
+    controller.onListen = () {
+      sub1 = stream1?.listen(
+        (snap) {
+          list1 = snap.docs.map((doc) => CaseModel.fromFirestore(doc)).toList();
+          emitMerged();
+        },
+        onError: (_) => emitMerged(),
+      );
+      sub2 = stream2?.listen(
+        (snap) {
+          list2 = snap.docs.map((doc) => CaseModel.fromFirestore(doc)).toList();
+          emitMerged();
+        },
+        onError: (_) => emitMerged(),
+      );
+      sub3 = stream3?.listen(
+        (snap) {
+          list3 = snap.docs.map((doc) => CaseModel.fromFirestore(doc)).toList();
+          emitMerged();
+        },
+        onError: (_) => emitMerged(),
+      );
+      sub4 = stream4?.listen(
+        (snap) {
+          list4 = snap.docs.map((doc) => CaseModel.fromFirestore(doc)).toList();
+          emitMerged();
+        },
+        onError: (_) => emitMerged(),
+      );
+    };
+
+    controller.onCancel = () {
+      sub1?.cancel();
+      sub2?.cancel();
+      sub3?.cancel();
+      sub4?.cancel();
+      controller.close();
+    };
+
+    return controller.stream;
   }
 
   // Get all cases from assigned attorney (for staff to view and assist)
@@ -447,6 +525,16 @@ class StaffService {
       );
       if (!eventResult.isSuccess) throw Exception(eventResult.failureMessage);
       final eventRef = _firestore.collection('calendar_events').doc(eventResult.id!);
+
+      if (eventType == 'hearing' &&
+          assignedTo != null &&
+          assignedTo.trim().isNotEmpty) {
+        await AttorneyAvailabilityService().claimHolder(
+          attorneyId: assignedTo.trim(),
+          when: eventDate,
+          holderId: eventRef.id,
+        );
+      }
 
       // Send immediate reminders if requested.
       if (sendNow && !junkNotice) {
@@ -1054,25 +1142,41 @@ class StaffService {
         controller.add(List<Map<String, dynamic>>.from(rows));
       }
 
+      var hydrateQueued = false;
+
       Future<void> hydrateFromServer() async {
-        if (fetching) return;
+        if (fetching) {
+          hydrateQueued = true;
+          return;
+        }
         fetching = true;
         try {
           final overlay = await HearingCalendarSyncService.instance
-              .fetchAutomatedCalendarRows(aid);
+              .fetchAutomatedCalendarRows(
+            aid,
+            onRows: (partial) {
+              if (partial.isEmpty || controller.isClosed) return;
+              rows = CalendarLiveHearingMap.mergeHearingRows(rows, partial);
+              emit();
+            },
+          );
+          if (overlay.isNotEmpty && !controller.isClosed) {
+            rows = CalendarLiveHearingMap.mergeHearingRows(rows, overlay);
+            emit();
+          }
           final inbox = await HearingCalendarSyncService.instance
               .fetchRowsFromHearingNotifications(aid);
-          final fetched = CalendarLiveHearingMap.mergeHearingRows(
-            overlay,
-            inbox,
-          );
-          if (fetched.isEmpty || controller.isClosed) return;
-          rows = CalendarLiveHearingMap.mergeHearingRows(rows, fetched);
+          if (inbox.isEmpty || controller.isClosed) return;
+          rows = CalendarLiveHearingMap.mergeHearingRows(rows, inbox);
           emit();
         } catch (e) {
           debugPrint('[HearingCalendar] web/live overlay hydrate failed: $e');
         } finally {
           fetching = false;
+          if (hydrateQueued && !controller.isClosed) {
+            hydrateQueued = false;
+            unawaited(hydrateFromServer());
+          }
         }
       }
 
@@ -1112,11 +1216,23 @@ class StaffService {
             .snapshots()
             .listen(
               (snap) {
+                final prevIds = <String>{
+                  for (final r in rows)
+                    if ((r['hearingDocId'] as String?)?.trim().isNotEmpty ==
+                        true)
+                      (r['hearingDocId'] as String).trim(),
+                };
                 final live = CalendarLiveHearingMap.mapHearingDocs(
                   snap.docs,
                   aid,
                 );
                 if (live.isEmpty) return;
+                for (final r in live) {
+                  final hid = (r['hearingDocId'] as String?)?.trim() ?? '';
+                  if (hid.isNotEmpty && !prevIds.contains(hid)) {
+                    r['fromInbox'] = true;
+                  }
+                }
                 rows = CalendarLiveHearingMap.mergeHearingRows(rows, live);
                 HearingCalendarSyncService.instance.rememberOverlayRows(
                   aid,
@@ -1129,7 +1245,7 @@ class StaffService {
               },
             );
         unawaited(hydrateFromServer());
-        Future<void>.delayed(const Duration(seconds: 4), () {
+        Future<void>.delayed(const Duration(milliseconds: 1200), () {
           if (controller.isClosed) return;
           unawaited(hydrateFromServer());
         });
@@ -1143,7 +1259,19 @@ class StaffService {
         _liveHearingsStreamCache.remove(aid);
       };
 
-      return controller.stream;
+      // Broadcast streams drop events that fired before a listener attached.
+      // Staff opens this stream first; the visible calendar subscribes after.
+      return Stream<List<Map<String, dynamic>>>.multi((listener) {
+        if (rows.isNotEmpty) {
+          listener.add(List<Map<String, dynamic>>.from(rows));
+        }
+        final sub = controller.stream.listen(
+          listener.add,
+          onError: listener.addError,
+          onDone: listener.close,
+        );
+        listener.onCancel = sub.cancel;
+      });
     });
   }
 

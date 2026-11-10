@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import '../services/email_otp_service.dart';
 import '../services/admin_service.dart';
 import '../services/calendar_session_cleanup.dart';
+import '../widgets/common/login_error_dialog.dart';
 class AuthController extends GetxController {
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -116,10 +117,11 @@ class AuthController extends GetxController {
       };
       Get.snackbar("Error", msg, backgroundColor: Colors.red[200]);
     } on FirebaseException catch (e) {
-      if (kDebugMode)
+      if (kDebugMode) {
         debugPrint(
           '❌ Firestore error during registration: ${e.code} - ${e.message}',
         );
+      }
       final msg = switch (e.code) {
         'permission-denied' =>
           "Permission denied. Please check your Firestore rules or try again.",
@@ -229,14 +231,14 @@ class AuthController extends GetxController {
         'wrong-password' => "Incorrect password.",
         'invalid-credential' => "Invalid email or password.",
         'network-request-failed' => "Network error. Check your connection.",
-        _ => e.message ?? "Login failed",
+        _ => LoginErrorHelper.sanitize(e.message ?? e.code),
       };
       Get.snackbar("Login Failed", msg, backgroundColor: Colors.red[200]);
     } catch (e) {
       if (kDebugMode) debugPrint('❌ Unexpected login error: $e');
       Get.snackbar(
-        "Error",
-        "Unexpected error: $e",
+        "Login Failed",
+        LoginErrorHelper.sanitize(e),
         backgroundColor: Colors.red[200],
       );
     }

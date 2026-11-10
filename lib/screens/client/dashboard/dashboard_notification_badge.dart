@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/foundation.dart' show VoidCallback, ValueNotifier, kIsWeb;
 
 import '../../../services/hearing_notification_fanout_service.dart';
 import '../../../utils/screen_debug_probe.dart';
@@ -14,6 +15,8 @@ class DashboardNotificationBadgeController {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
   final List<StreamSubscription<QuerySnapshot<Map<String, dynamic>>>> _subs =
       [];
+  ValueNotifier<int>? _fanoutBellNotifier;
+  VoidCallback? _fanoutBellListener;
   Timer? _pollTimer;
   bool _stopped = false;
   String? _userId;
@@ -53,12 +56,50 @@ class DashboardNotificationBadgeController {
     _emit();
     debugProbe?.event('badge.start', detail: 'peek=$_cachedPeek');
 
-    // Poll only — dual live snapshots freeze the client isolate on Android.
-    _pollTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+    final notifier = fanout.inboxBellCountListenable(userId);
+    void onBellChange() {
+      if (_stopped) return;
+      _cachedPeek = notifier.value;
+      _emit();
+      unawaited(_refreshOnce());
+    }
+
+    _fanoutBellNotifier = notifier;
+    _fanoutBellListener = onBellChange;
+    notifier.addListener(onBellChange);
+
+    if (kIsWeb) {
+      try {
+        _subs.add(
+          _db
+              .collection('notifications')
+              .where('userId', isEqualTo: userId)
+              .limit(60)
+              .snapshots()
+              .listen(
+                (snap) {
+                  if (_stopped) return;
+                  _ingest(snap, isUserIdQuery: true);
+                },
+                onError: (_) {},
+              ),
+        );
+      } catch (_) {}
+    }
+
+    // Poll only on mobile — dual live snapshots freeze the client isolate on Android.
+    _pollTimer = Timer.periodic(const Duration(seconds: 20), (_) {
       if (_stopped) return;
       unawaited(_refreshOnce());
     });
     unawaited(_refreshOnce());
+    unawaited(
+      fanout.syncClientHearingNotifications().then((_) {
+        if (!_stopped) {
+          unawaited(_refreshOnce());
+        }
+      }).catchError((_) {}),
+    );
   }
 
   Future<void> refresh() => _refreshOnce();
@@ -86,12 +127,12 @@ class DashboardNotificationBadgeController {
       return await _unreadQuery(
         field,
         userId,
-      ).get().timeout(const Duration(seconds: 1));
+      ).get().timeout(const Duration(seconds: 4));
     } catch (_) {
       return _recentQuery(
         field,
         userId,
-      ).get().timeout(const Duration(seconds: 1));
+      ).get().timeout(const Duration(seconds: 4));
     }
   }
 
@@ -99,19 +140,25 @@ class DashboardNotificationBadgeController {
     final userId = _userId;
     if (userId == null || _stopped) return;
     try {
-      QuerySnapshot<Map<String, dynamic>> snap;
+      QuerySnapshot<Map<String, dynamic>> userSnap;
       try {
-        snap = await _unreadQuery('userId', userId)
+        userSnap = await _unreadQuery('userId', userId)
             .get(const GetOptions(source: Source.cache))
             .timeout(const Duration(seconds: 1));
-        if (snap.docs.isEmpty) {
-          snap = await _getUnreadOrRecent('userId', userId);
+        if (userSnap.docs.isEmpty) {
+          userSnap = await _getUnreadOrRecent('userId', userId);
         }
       } catch (_) {
-        snap = await _getUnreadOrRecent('userId', userId);
+        userSnap = await _getUnreadOrRecent('userId', userId);
       }
       if (_stopped) return;
-      _ingest(snap, isUserIdQuery: true);
+      _ingest(userSnap, isUserIdQuery: true);
+    } catch (_) {}
+
+    try {
+      final clientSnap = await _getUnreadOrRecent('clientId', userId);
+      if (_stopped) return;
+      _ingest(clientSnap, isUserIdQuery: false);
     } catch (_) {}
   }
 
@@ -122,11 +169,16 @@ class DashboardNotificationBadgeController {
     final next = <String, bool>{};
     for (final doc in snap.docs) {
       final data = doc.data();
+      if (HearingNotificationFanoutService.shouldRemoveClientNotification(
+        data,
+      )) {
+        continue;
+      }
       final type = (data['type'] as String? ?? '').toLowerCase();
       if (type == 'court_email_ingest') continue;
       if (type.startsWith('court_') && !type.contains('hearing')) continue;
       final queue =
-          ((data['queueDocId'] ?? data['queuedDocId']) as String? ?? '')
+          ((data['queueDocId'] ?? data['queuedDocId'])?.toString() ?? '')
               .toLowerCase();
       if (queue.contains('imap')) continue;
       next[doc.id] = data['isRead'] == true;
@@ -152,7 +204,7 @@ class DashboardNotificationBadgeController {
     final merged = <String, bool>{..._fromUserId, ..._fromClientId};
     final unread = merged.values.where((isRead) => !isRead).length;
     if (_gotUserSnap || _gotClientSnap) {
-      onCount(unread);
+      onCount(unread > _cachedPeek ? unread : (merged.isEmpty ? _cachedPeek : unread));
     } else {
       onCount(unread > 0 ? unread : _cachedPeek);
     }
@@ -162,6 +214,11 @@ class DashboardNotificationBadgeController {
     _stopped = true;
     _onCount = null;
     _userId = null;
+    if (_fanoutBellNotifier != null && _fanoutBellListener != null) {
+      _fanoutBellNotifier!.removeListener(_fanoutBellListener!);
+    }
+    _fanoutBellNotifier = null;
+    _fanoutBellListener = null;
     _pollTimer?.cancel();
     _pollTimer = null;
     for (final sub in _subs) {

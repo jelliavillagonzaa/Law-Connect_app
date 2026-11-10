@@ -6,6 +6,7 @@ import 'package:intl/intl.dart';
 
 import '../../theme/app_theme.dart';
 import '../../services/auth_service.dart';
+import '../../services/hearing_calendar_fields.dart';
 import '../../services/hearing_notification_fanout_service.dart';
 import '../../utils/hearing_notification_formatter.dart';
 import '../../utils/screen_debug_probe.dart';
@@ -31,6 +32,7 @@ class _WebNotificationsScreenState extends State<NotificationsScreen> {
   bool _inFlight = false;
   bool _pendingRefresh = false;
   bool _markingAllRead = false;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _liveSub;
 
   @override
   void initState() {
@@ -44,12 +46,28 @@ class _WebNotificationsScreenState extends State<NotificationsScreen> {
       final uid = _authService.currentUser?.uid;
       if (uid == null) return;
       _probe.event('postFrame');
-      unawaited(_refresh(uid, showSpinner: false));
+      unawaited(_refresh(uid, showSpinner: _flatRows.isEmpty));
+      try {
+        _liveSub = _firestore
+            .collection('notifications')
+            .where('userId', isEqualTo: uid)
+            .limit(60)
+            .snapshots()
+            .listen(
+              (_) {
+                if (!mounted) return;
+                unawaited(_refresh(uid, showSpinner: false, runSync: false));
+              },
+              onError: (_) {},
+            );
+      } catch (_) {}
     });
   }
 
   @override
   void dispose() {
+    _liveSub?.cancel();
+    _liveSub = null;
     _probe.event('dispose');
     _probe.detach();
     super.dispose();
@@ -68,10 +86,40 @@ class _WebNotificationsScreenState extends State<NotificationsScreen> {
       ..sort((a, b) => b.sortTime.compareTo(a.sortTime));
   }
 
+  Future<QuerySnapshot<Map<String, dynamic>>?> _queryAlertsByField(
+    String field,
+    String uid,
+  ) async {
+    final query = _firestore
+        .collection('notifications')
+        .where(field, isEqualTo: uid)
+        .orderBy('createdAt', descending: true)
+        .limit(40);
+    try {
+      final snap = await query
+          .get(const GetOptions(source: Source.cache))
+          .timeout(const Duration(seconds: 1));
+      if (snap.docs.isNotEmpty) return snap;
+      return await query.get().timeout(const Duration(seconds: 3));
+    } catch (_) {
+      try {
+        return await _firestore
+            .collection('notifications')
+            .where(field, isEqualTo: uid)
+            .limit(40)
+            .get()
+            .timeout(const Duration(seconds: 3));
+      } catch (_) {
+        return null;
+      }
+    }
+  }
+
   Future<void> _refresh(
     String uid, {
     bool showSpinner = false,
     bool forceSync = false,
+    bool runSync = true,
   }) => _probe.track('refresh', () async {
     if (_inFlight) {
       _pendingRefresh = true;
@@ -80,7 +128,7 @@ class _WebNotificationsScreenState extends State<NotificationsScreen> {
     _inFlight = true;
     if (showSpinner && mounted) {
       setState(() => _loading = true);
-      Timer(const Duration(seconds: 4), () {
+      Timer(const Duration(seconds: 5), () {
         if (!mounted || !_loading) return;
         setState(() => _loading = false);
       });
@@ -91,46 +139,28 @@ class _WebNotificationsScreenState extends State<NotificationsScreen> {
         'fetchHearings',
         () => fanout.fetchClientHearingInboxRowsOnce(
               uid,
-              runSync: false,
+              runSync: runSync,
               forceSync: forceSync,
             ),
       );
 
-      if (forceSync) {
-        unawaited(fanout.syncClientHearingNotifications(force: true));
+      if (runSync && !forceSync && hearings.isNotEmpty) {
+        unawaited(
+          fanout.syncClientHearingNotifications().then((_) {
+            if (mounted) {
+              unawaited(_refresh(uid, showSpinner: false, runSync: false));
+            }
+          }).catchError((_) {}),
+        );
       }
 
-      List<QuerySnapshot<Map<String, dynamic>>> snaps;
-      try {
-        final query = _firestore
-            .collection('notifications')
-            .where('userId', isEqualTo: uid)
-            .orderBy('createdAt', descending: true)
-            .limit(40);
-        QuerySnapshot<Map<String, dynamic>> snap;
-        try {
-          snap = await query
-              .get(const GetOptions(source: Source.cache))
-              .timeout(const Duration(seconds: 1));
-          if (snap.docs.isEmpty) {
-            snap = await query.get().timeout(const Duration(seconds: 2));
-          }
-        } catch (_) {
-          try {
-            snap = await _firestore
-                .collection('notifications')
-                .where('userId', isEqualTo: uid)
-                .limit(40)
-                .get()
-                .timeout(const Duration(seconds: 2));
-          } catch (_) {
-            snap = await query.get().timeout(const Duration(seconds: 1));
-          }
-        }
-        snaps = [snap];
-      } catch (_) {
-        snaps = const [];
-      }
+      final alertSnaps = await Future.wait([
+        _queryAlertsByField('userId', uid),
+        _queryAlertsByField('clientId', uid),
+      ]);
+      final snaps = alertSnaps
+          .whereType<QuerySnapshot<Map<String, dynamic>>>()
+          .toList();
 
       late final List<_FlatRow> rows;
       late final List<Map<String, dynamic>> others;
@@ -167,7 +197,7 @@ class _WebNotificationsScreenState extends State<NotificationsScreen> {
       if (mounted) setState(() => _loading = false);
       if (_pendingRefresh) {
         _pendingRefresh = false;
-        unawaited(_refresh(uid, showSpinner: false));
+        unawaited(_refresh(uid, showSpinner: false, runSync: false));
       }
     }
   });
@@ -179,29 +209,63 @@ class _WebNotificationsScreenState extends State<NotificationsScreen> {
   }
 
   static String _clipInboxText(dynamic value, int max) {
-    final s = (value as String?)?.trim() ?? '';
+    final s = HearingCalendarFields.asDisplayString(value);
     if (s.isEmpty) return '';
     if (s.length <= max) return s;
     return '${s.substring(0, max)}…';
   }
 
   HearingInboxRow _slimHearingRow(HearingInboxRow row) {
-    final d = row.data;
+    final raw = row.data;
+    final hasOrderText =
+        HearingCalendarFields.fieldAsDisplayString(raw, 'fullText').isNotEmpty;
+    final missingFields =
+        HearingCalendarFields.fieldAsDisplayString(raw, 'caseNo').isEmpty ||
+        HearingCalendarFields.fieldAsDisplayString(raw, 'caseTitle').isEmpty ||
+        HearingCalendarFields.fieldAsDisplayString(raw, 'location').isEmpty;
+    final d = (hasOrderText && missingFields)
+        ? HearingCalendarFields.enrichForAlerts(raw)
+        : raw;
+    final cleanNo = HearingCalendarFields.cleanCaseDocketNo(d['caseNo']);
+    var title = d['title'] as String? ?? 'Court Hearing Notice';
+    if (cleanNo.isNotEmpty &&
+        !HearingCalendarFields.isPlaceholderCaseNo(cleanNo) &&
+        title.trim() == 'Court Hearing Notice') {
+      title = 'Court Hearing Notice — $cleanNo';
+    }
     return HearingInboxRow(
       rowKey: row.rowKey,
       notificationDocId: row.notificationDocId,
       data: {
         'type': d['type'],
-        'title': d['title'],
+        'title': title,
         'summary': _clipInboxText(d['summary'], 240),
-        'message': _clipInboxText(d['message'], 160),
-        'caseNo': d['caseNo'],
+        'message': _clipInboxText(d['message'], 1200),
+        'caseNo': cleanNo.isNotEmpty
+            ? cleanNo
+            : HearingCalendarFields.fieldAsDisplayString(d, 'caseNo'),
+        'caseTitle': d['caseTitle'],
         'clientName': d['clientName'],
         'courtBranch': d['courtBranch'],
-        'hearingDate': d['hearingDate'],
-        'hearingTime': d['hearingTime'],
+        'hearingDate': HearingCalendarFields.fieldAsDisplayString(
+          d,
+          'hearingDate',
+        ),
+        'hearingTime': HearingCalendarFields.fieldAsDisplayString(
+          d,
+          'hearingTime',
+        ),
+        'hearingDateTime': d['hearingDateTime'],
+        'eventDate': d['eventDate'],
         'location': d['location'],
-        'hearingDocId': d['hearingDocId'],
+        'fullText': _clipInboxText(d['fullText'], 4000),
+        if (d['involvedPartyNames'] is List)
+          'involvedPartyNames': d['involvedPartyNames'],
+        if (d['caseId'] != null) 'caseId': d['caseId'],
+        'hearingDocId': HearingCalendarFields.fieldAsDisplayString(
+          d,
+          'hearingDocId',
+        ),
         'isRead': d['isRead'] == true,
         'createdAt': d['createdAt'],
       },
@@ -215,16 +279,26 @@ class _WebNotificationsScreenState extends State<NotificationsScreen> {
     final merged = <String, Map<String, dynamic>>{};
     for (final doc in docs) {
       final data = doc.data();
-      if (clientCourtEmailSpamNotification(data)) continue;
+      if (clientCourtEmailSpamNotification(data) ||
+          HearingNotificationFanoutService.shouldRemoveClientNotification(
+            data,
+          )) {
+        continue;
+      }
       final type = (data['type'] as String? ?? '').toLowerCase();
       if (clientHearingInboxType(type)) continue;
       final ts = (data['createdAt'] as Timestamp?)?.toDate();
       merged[doc.id] = {
         'id': doc.id,
         'title': data['title'] ?? 'Notification',
-        'message': _clipInboxText(data['message'], 160),
+        'message': _clipInboxText(data['message'], 500),
         'summary': _clipInboxText(data['summary'], 240),
-        'hearingDocId': data['hearingDocId'],
+        'hearingDocId': HearingCalendarFields.fieldAsDisplayString(
+          data,
+          'hearingDocId',
+        ),
+        'caseNo': HearingCalendarFields.fieldAsDisplayString(data, 'caseNo'),
+        'caseTitle': data['caseTitle'],
         'type': type,
         'isRead': data['isRead'] == true,
         'timestamp': ts,
@@ -240,13 +314,6 @@ class _WebNotificationsScreenState extends State<NotificationsScreen> {
       row.remove('sortKey');
     }
     return list;
-  }
-
-  List<Map<String, dynamic>> _mergeOtherAlerts(
-    QuerySnapshot<Map<String, dynamic>> a,
-    QuerySnapshot<Map<String, dynamic>> b,
-  ) {
-    return _mergeOtherAlertsFromDocs([...a.docs, ...b.docs]);
   }
 
   DateTime _inboxRowTime(_FlatRow row) {
@@ -562,12 +629,22 @@ class _WebHearingCard extends StatefulWidget {
 class _WebHearingCardState extends State<_WebHearingCard> {
   bool _expanded = false;
   bool _showDetail = false;
-  late final String _title;
-  late final String _subtitle;
+  late String _title;
+  late String _subtitle;
 
   @override
   void initState() {
     super.initState();
+    _syncLabels();
+  }
+
+  @override
+  void didUpdateWidget(covariant _WebHearingCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _syncLabels();
+  }
+
+  void _syncLabels() {
     final data = widget.row.data;
     _title = data['title'] as String? ?? 'Court hearing';
     _subtitle = HearingNotificationFormatter.buildSummary(data);
@@ -632,7 +709,15 @@ class _WebHearingCardState extends State<_WebHearingCard> {
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
               child: HearingNotificationDetailPanel(
                 data: widget.row.data,
-                hearingDocId: widget.row.data['hearingDocId'] as String?,
+                hearingDocId: HearingCalendarFields.fieldAsDisplayString(
+                          widget.row.data,
+                          'hearingDocId',
+                        ).isNotEmpty
+                    ? HearingCalendarFields.fieldAsDisplayString(
+                        widget.row.data,
+                        'hearingDocId',
+                      )
+                    : null,
                 enrichFromRelatedHearings: false,
               ),
             ),

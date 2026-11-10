@@ -37,70 +37,82 @@ abstract final class CalendarPerf {
 
   /// Background scoped/global hearing supplements (after grid is interactive).
   static const int hearingSupplementDeferMs = 8000;
-  /// Match legacy grid: up to three two-line chips per day cell.
+  /// Up to three single-line names when the day has three or fewer items.
   static const int maxEntriesInMonthCell = 3;
+
+  /// When more than three are scheduled, keep two names and a "+N" pill.
+  static const int maxChipsBeforeOverflowPill = 2;
 
   /// Space reserved for the day-of-month label row in each cell.
   static const double monthCellHeaderReserve = 30.0;
 
-  /// One two-line chip (time row + label row), including bottom margin.
-  static const double monthCellChipHeight = 26.0;
+  /// One single-line chip, including the gap under it.
+  static const double monthCellChipHeight = 16.0;
 
-  /// "+N more" row under the chips.
-  static const double monthCellMoreRowHeight = 12.0;
+  /// Gap between chips. Included in [monthCellChipHeight].
+  static const double monthCellChipGap = 2.0;
 
-  /// How many chips fit in the day-cell body (below the day-of-month header).
+  /// "+N" pill. Same height as a chip so it occupies the third slot.
+  static const double monthCellMoreRowHeight = 16.0;
+
+  /// How many single-line chips fit with no overflow pill.
   static int maxChipsForBodyHeight(double bodyHeight) {
-    if (bodyHeight < 18) return 0;
-    for (var cap = maxEntriesInMonthCell; cap >= 1; cap--) {
-      final chipsHeight = cap * monthCellChipHeight;
-      if (chipsHeight <= bodyHeight) return cap;
-      if (chipsHeight + monthCellMoreRowHeight <= bodyHeight) return cap;
-    }
-    return bodyHeight >= monthCellMoreRowHeight ? 1 : 0;
+    if (bodyHeight < monthCellChipHeight - monthCellChipGap) return 0;
+    var n = (bodyHeight / monthCellChipHeight).floor();
+    if (n > maxEntriesInMonthCell) n = maxEntriesInMonthCell;
+    return n;
   }
 
-  /// Chip height + shown count for a day cell body area (prevents bottom overflow).
+  static bool _dayCellFits(double bodyHeight, int chips, bool more) {
+    final height =
+        chips * monthCellChipHeight + (more ? monthCellMoreRowHeight : 0);
+    return height <= bodyHeight + 0.5;
+  }
+
+  /// Shown chips plus whether the last slot is a "+N" pill.
+  ///
+  /// One to three items show every name when they fit. Four or more always
+  /// leave the third slot for "+N" so a chip is never sliced by the cell border.
   static ({int shown, double chipHeight, bool showMore}) layoutDayCellEntries({
     required double bodyHeight,
     required int totalEntries,
   }) {
-    if (totalEntries <= 0 || bodyHeight < 12) {
-      return (shown: 0, chipHeight: 0, showMore: false);
-    }
-    final maxByHeight = maxChipsForBodyHeight(bodyHeight);
-    if (maxByHeight <= 0) {
-      return (shown: 0, chipHeight: 0, showMore: totalEntries > 0);
-    }
-
-    var shown = totalEntries;
-    if (shown > maxEntriesInMonthCell) shown = maxEntriesInMonthCell;
-    if (shown > maxByHeight) shown = maxByHeight;
-
-    var showMore = totalEntries > shown;
-    var moreReserve = showMore ? monthCellMoreRowHeight : 0.0;
-    var chipHeight = shown > 0
-        ? ((bodyHeight - moreReserve) / shown).clamp(20.0, monthCellChipHeight)
-        : 0.0;
-
-    while (shown > 0 &&
-        shown * chipHeight + moreReserve > bodyHeight + 0.5) {
-      shown--;
-      showMore = totalEntries > shown;
-      moreReserve = showMore ? monthCellMoreRowHeight : 0.0;
-      if (shown == 0) {
-        return (shown: 0, chipHeight: 0, showMore: totalEntries > 0);
-      }
-      chipHeight = ((bodyHeight - moreReserve) / shown).clamp(
-        20.0,
-        monthCellChipHeight,
+    if (totalEntries <= 0 || bodyHeight < 10) {
+      return (
+        shown: 0,
+        chipHeight: 0,
+        showMore:
+            totalEntries > 0 && bodyHeight + 0.5 >= monthCellMoreRowHeight,
       );
     }
 
-    return (shown: shown, chipHeight: chipHeight, showMore: showMore);
+    if (totalEntries <= maxEntriesInMonthCell &&
+        _dayCellFits(bodyHeight, totalEntries, false)) {
+      return (
+        shown: totalEntries,
+        chipHeight: monthCellChipHeight,
+        showMore: false,
+      );
+    }
+
+    var shown = totalEntries > maxEntriesInMonthCell
+        ? maxChipsBeforeOverflowPill
+        : totalEntries - 1;
+    if (shown < 0) shown = 0;
+    while (shown > 0 && !_dayCellFits(bodyHeight, shown, true)) {
+      shown--;
+    }
+    if (!_dayCellFits(bodyHeight, shown, true)) {
+      return (shown: 0, chipHeight: 0, showMore: false);
+    }
+    return (
+      shown: shown,
+      chipHeight: monthCellChipHeight,
+      showMore: totalEntries > shown,
+    );
   }
 
-  /// How many two-line chips fit in the remaining day-cell height.
+  /// How many single-line chips fit in the remaining day-cell height.
   static int maxChipsForHeight(double height) {
     return maxChipsForBodyHeight(height - monthCellHeaderReserve);
   }

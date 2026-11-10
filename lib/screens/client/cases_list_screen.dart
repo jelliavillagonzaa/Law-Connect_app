@@ -10,6 +10,7 @@ import '../../pages/case/case_detail_page.dart';
 import '../../utils/case_status_filter.dart';
 import '../../utils/case_result.dart';
 import '../../utils/quiet_console.dart';
+import 'send_request_screen.dart';
 
 /// Client cases list — one-shot Firestore load + pull to refresh (no live listener).
 class CasesListScreen extends StatefulWidget {
@@ -126,6 +127,18 @@ class _CasesListScreenState extends State<CasesListScreen> {
         elevation: 0,
         automaticallyImplyLeading: false,
         actions: [
+          IconButton(
+            icon: const Icon(Icons.add_comment_outlined, color: Colors.white),
+            tooltip: 'Send Case Request',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => const SendRequestScreen(),
+                ),
+              );
+            },
+          ),
           TextButton(
             onPressed: () => setState(() => _viewClosed = !_viewClosed),
             child: Text(
@@ -201,13 +214,38 @@ class _CasesListScreenState extends State<CasesListScreen> {
               child: Text(
                 _viewClosed
                     ? 'Completed cases will appear here.'
-                    : 'Your attorney will create cases for you.\nPull down to refresh.',
+                    : 'Your attorney will create cases for you based on your legal requests.\nTap below to send a request.',
                 style: AppTheme.bodyMedium.copyWith(
                   color: AppTheme.textSecondary,
                 ),
                 textAlign: TextAlign.center,
               ),
             ),
+            if (!_viewClosed) ...[
+              const SizedBox(height: 16),
+              Center(
+                child: ElevatedButton.icon(
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => const SendRequestScreen(),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.send, size: 16),
+                  label: const Text('Send Case Request'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppTheme.royalBlue,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 12,
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       );

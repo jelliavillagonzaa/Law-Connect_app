@@ -61,6 +61,8 @@ class ClientDirectoryService {
     final fullName =
         data['fullName'] as String? ?? data['full_name'] as String? ?? '';
     final email = data['email'] as String? ?? '';
+    final phone = (data['phoneNumber'] ?? data['phone'] ?? data['contactNumber'] ?? '').toString().trim();
+    final address = (data['address'] ?? data['location'] ?? '').toString().trim();
     final isVerified = data['isVerified'] as bool? ?? false;
 
     String displayName;
@@ -80,6 +82,8 @@ class ClientDirectoryService {
       'fullName': fullName,
       'displayName': displayName,
       'email': email,
+      'phone': phone,
+      'address': address,
       'isVerified': isVerified,
     };
   }

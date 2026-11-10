@@ -81,14 +81,41 @@ class UserSetupService {
     try {
       final userDoc = await _firestore.collection('users').doc(uid).get();
       
-      // If user document doesn't exist, create it based on email
+      // If user document doesn't exist, create it based on email or pending signup
       if (!userDoc.exists) {
         String role = 'client';
         bool isVerified = false;
+
+        String clientName = email.split('@')[0];
+        String? firstName;
+        String? middleName;
+        String? lastName;
+        String? phone;
+        String? address;
+
+        try {
+          final psDoc = await _firestore.collection('pending_signups').doc(email).get();
+          if (psDoc.exists && psDoc.data() != null) {
+            final ps = psDoc.data()!;
+            firstName = ps['firstName']?.toString().trim();
+            middleName = ps['middleName']?.toString().trim();
+            lastName = ps['lastName']?.toString().trim();
+            phone = ps['phoneNumber']?.toString().trim();
+            address = ps['address']?.toString().trim();
+            final composed = [firstName ?? '', middleName ?? '', lastName ?? ''].where((s) => s.isNotEmpty).join(' ').trim();
+            if (composed.isNotEmpty) clientName = composed;
+          }
+        } catch (_) {}
+
         Map<String, dynamic> userData = {
           'email': email,
-          'name': email.split('@')[0],
-          'fullName': email.split('@')[0],
+          'name': clientName,
+          'fullName': clientName,
+          if (firstName != null && firstName.isNotEmpty) 'firstName': firstName,
+          if (middleName != null && middleName.isNotEmpty) 'middleName': middleName,
+          if (lastName != null && lastName.isNotEmpty) 'lastName': lastName,
+          if (phone != null && phone.isNotEmpty) 'phoneNumber': phone,
+          if (address != null && address.isNotEmpty) 'address': address,
           'createdAt': FieldValue.serverTimestamp(),
         };
 

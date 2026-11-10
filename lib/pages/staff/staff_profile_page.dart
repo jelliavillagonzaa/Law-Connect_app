@@ -7,6 +7,7 @@ import '../../services/staff_auth_service.dart';
 import '../../services/calendar_session_cleanup.dart';
 import '../../widgets/common/profile_picture_widget.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/common/change_password_dialog.dart';
 import '../auth/login_page.dart';
 
 class StaffProfilePage extends StatefulWidget {
@@ -131,12 +132,12 @@ class _StaffProfilePageState extends State<StaffProfilePage> {
       try {
         final user = FirebaseAuth.instance.currentUser;
         if (user != null) {
+          final phone = phoneController.text.trim();
           final result = await _staffAuthService.updateStaffProfile(
             staffId: user.uid,
             name: nameController.text.trim(),
-            phoneNumber: phoneController.text.trim().isEmpty 
-                ? null 
-                : phoneController.text.trim(),
+            phone: phone,
+            phoneNumber: phone,
             address: addressController.text.trim().isEmpty 
                 ? null 
                 : addressController.text.trim(),
@@ -258,124 +259,156 @@ class _StaffProfilePageState extends State<StaffProfilePage> {
         ],
       ),
       body: SingleChildScrollView(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-        child: Column(
-          children: [
-            // Profile Picture
-            ProfilePictureWidget(
-              photoUrl: _currentStaff!.photoUrl,
-              userName: _currentStaff!.name,
-              size: 120,
-              isEditable: true,
-              onUpdated: _loadStaffData,
-            ),
-            const SizedBox(height: 16),
-            // User Info
-            Text(
-              _currentStaff!.name,
-              style: TextStyle(
-                fontSize: 24,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              user?.email ?? _currentStaff!.email,
-              style: TextStyle(fontSize: 14, color: Colors.grey[600]),
-            ),
-            const SizedBox(height: 20),
-            // Profile Details Card
-            ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 420),
-              child: Card(
-                elevation: 2,
-                margin: EdgeInsets.zero,
-                clipBehavior: Clip.antiAlias,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(14, 14, 14, 6),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Text(
-                        'Profile Information',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
-                          color: AppTheme.darkText,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      _buildInfoRow(
-                        Icons.person_outline,
-                        'Name',
-                        _currentStaff!.name,
-                      ),
-                      _buildInfoRow(
-                        Icons.email_outlined,
-                        'Email',
-                        _currentStaff!.email,
-                      ),
-                      _buildInfoRow(
-                        Icons.phone_outlined,
-                        'Phone',
-                        _currentStaff!.phoneNumber ?? 'Not set',
-                      ),
-                      _buildInfoRow(
-                        Icons.location_on_outlined,
-                        'Address',
-                        _currentStaff!.address ?? 'Not set',
-                      ),
-                      _buildInfoRow(
-                        Icons.work_outline,
-                        'Role',
-                        'Staff (Paralegal/Legal Assistant)',
-                      ),
-                      _buildInfoRow(
-                        Icons.calendar_today_outlined,
-                        'Member Since',
-                        DateFormat('MMM dd, yyyy')
-                            .format(_currentStaff!.createdAt),
-                        showDivider: false,
-                      ),
-                    ],
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+        child: Align(
+          alignment: Alignment.topCenter,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 520),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Profile Picture
+                Center(
+                  child: ProfilePictureWidget(
+                    photoUrl: _currentStaff!.photoUrl,
+                    userName: _currentStaff!.name,
+                    size: 130,
+                    isEditable: true,
+                    onUpdated: _loadStaffData,
                   ),
                 ),
-              ),
-            ),
-            const SizedBox(height: 24),
-            // Logout Button
-            Align(
-              alignment: Alignment.center,
-              child: ElevatedButton.icon(
-                onPressed: _handleLogout,
-                icon: const Icon(Icons.logout, size: 18),
-                label: const Text(
-                  'Logout',
-                  style: TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w600,
+                const SizedBox(height: 16),
+                // User Info
+                Center(
+                  child: Text(
+                    _currentStaff!.name,
+                    style: const TextStyle(
+                      fontSize: 24,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                 ),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: AppTheme.royalBlue,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 28,
-                    vertical: 12,
+                const SizedBox(height: 4),
+                Center(
+                  child: Text(
+                    user?.email ?? _currentStaff!.email,
+                    style: TextStyle(fontSize: 14, color: Colors.grey[600]),
                   ),
-                  minimumSize: const Size(140, 44),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
+                ),
+                const SizedBox(height: 24),
+                // Profile Details Card
+                Card(
                   elevation: 2,
+                  margin: EdgeInsets.zero,
+                  clipBehavior: Clip.antiAlias,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Text(
+                          'Profile Information',
+                          style: TextStyle(
+                            fontSize: 17,
+                            fontWeight: FontWeight.bold,
+                            color: AppTheme.darkText,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        _buildInfoRow(
+                          Icons.person_outline,
+                          'Name',
+                          _currentStaff!.name,
+                        ),
+                        _buildInfoRow(
+                          Icons.email_outlined,
+                          'Email',
+                          _currentStaff!.email,
+                        ),
+                        _buildInfoRow(
+                          Icons.phone_outlined,
+                          'Phone',
+                          _currentStaff!.phoneNumber ?? 'Not set',
+                        ),
+                        _buildInfoRow(
+                          Icons.location_on_outlined,
+                          'Address',
+                          _currentStaff!.address ?? 'Not set',
+                        ),
+                        _buildInfoRow(
+                          Icons.work_outline,
+                          'Role',
+                          'Staff (Paralegal/Legal Assistant)',
+                        ),
+                        _buildInfoRow(
+                          Icons.calendar_today_outlined,
+                          'Member Since',
+                          DateFormat('MMM dd, yyyy')
+                              .format(_currentStaff!.createdAt),
+                          showDivider: false,
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
-              ),
+                const SizedBox(height: 24),
+                // Actions: Change Password & Logout
+                SizedBox(
+                  width: double.infinity,
+                  height: 48,
+                  child: OutlinedButton.icon(
+                    onPressed: () => ChangePasswordDialog.show(context),
+                    icon: const Icon(Icons.lock_reset_rounded, size: 20),
+                    label: const Text(
+                      'Change Password',
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppTheme.royalBlue,
+                      side: const BorderSide(
+                        color: AppTheme.royalBlue,
+                        width: 1.5,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  height: 48,
+                  child: ElevatedButton.icon(
+                    onPressed: _handleLogout,
+                    icon: const Icon(Icons.logout, size: 18),
+                    label: const Text(
+                      'Logout',
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppTheme.royalBlue,
+                      foregroundColor: Colors.white,
+                      elevation: 1,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 32),
+              ],
             ),
-            const SizedBox(height: 24),
-          ],
+          ),
         ),
       ),
     );

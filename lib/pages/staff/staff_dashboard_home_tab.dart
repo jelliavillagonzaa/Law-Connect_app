@@ -4,25 +4,28 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show HapticFeedback;
 import 'package:get/get.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 
 import '../../models/case_model.dart';
 import '../../models/task_model.dart';
-import '../../screens/billing/billing_management_screen.dart';
 import '../../screens/client/chat_screen.dart';
 import '../../screens/staff/staff_cases_screen.dart';
 import '../../screens/staff/staff_tasks_screen.dart';
-import '../../screens/attorney/attorney_notary_requests_screen.dart';
 import '../../services/chat_service.dart';
 import '../../services/staff_service.dart';
 import '../../services/task_service.dart';
-import '../../theme/app_theme.dart';
-import '../../utils/case_status_filter.dart';
 import '../../utils/open_work_tasks.dart';
 import '../../widgets/staff/staff_overview_card.dart';
 import '../../widgets/staff/staff_ui_theme.dart';
+import '../../theme/app_theme.dart';
+import '../../screens/staff/staff_calendar_screen.dart';
+import '../../screens/staff/staff_pending_appointments_screen.dart';
+import '../../screens/staff/staff_notary_management_screen.dart';
+import '../../screens/billing/billing_management_screen.dart'
+    show openPaymentHistoryScreen;
+import '../../utils/case_status_filter.dart';
 
 /// Self-contained staff dashboard overview — updates via its own [setState]
 /// so the parent tab stack is not rebuilt on every Firestore tick.
@@ -30,6 +33,10 @@ class StaffDashboardHomeTab extends StatefulWidget {
   final String staffName;
   final String? assignedAttorneyId;
   final VoidCallback? onNavigateToCases;
+  final VoidCallback? onNavigateToCalendar;
+  final VoidCallback? onNavigateToPendingAppointments;
+  final VoidCallback? onNavigateToNotary;
+  final int pendingAppointmentsCount;
   final Widget? headerActions;
 
   const StaffDashboardHomeTab({
@@ -37,6 +44,10 @@ class StaffDashboardHomeTab extends StatefulWidget {
     required this.staffName,
     this.assignedAttorneyId,
     this.onNavigateToCases,
+    this.onNavigateToCalendar,
+    this.onNavigateToPendingAppointments,
+    this.onNavigateToNotary,
+    this.pendingAppointmentsCount = 0,
     this.headerActions,
   });
 
@@ -58,6 +69,10 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
   StreamSubscription<List<TaskModel>>? _tasksSub;
   StreamSubscription<List<CaseModel>>? _assignedCasesSub;
   StreamSubscription<List<CaseModel>>? _attorneyCasesSub;
+  StreamSubscription<List<Map<String, dynamic>>>? _calendarEventsSub;
+
+  List<CaseModel> _staffAssignedCases = [];
+  List<CaseModel> _attorneyCases = [];
 
   String? _assignedAttorneyId;
   Map<String, dynamic> _stats = {};
@@ -122,7 +137,9 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
     if (user == null) return;
     _streamsAttached = true;
 
-    _tasksSub = _taskService.getStaffTasks(user.uid).listen(
+    _tasksSub = _taskService
+        .getStaffTasks(user.uid, staffEmail: user.email)
+        .listen(
       (tasks) {
         if (!mounted) return;
         _myTasks = tasks;
@@ -134,15 +151,28 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
     _subscribeCaseStreams(user.uid);
   }
 
+  void _mergeAssignedCases() {
+    final map = <String, CaseModel>{};
+    for (final c in _staffAssignedCases) {
+      map[c.id] = c;
+    }
+    for (final c in _attorneyCases) {
+      map.putIfAbsent(c.id, () => c);
+    }
+    final merged = map.values.toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    _assignedCases = merged;
+    _scheduleUiUpdate();
+  }
+
   void _subscribeCaseStreams(String staffId) {
     _assignedCasesSub?.cancel();
-    _assignedCasesSub = _staffService.getAssignedCases(staffId).listen(
+    final staffEmail = FirebaseAuth.instance.currentUser?.email;
+    _assignedCasesSub = _staffService.getAssignedCases(staffId, staffEmail: staffEmail).listen(
       (cases) {
         if (!mounted) return;
-        if (cases.isNotEmpty) {
-          _assignedCases = cases;
-          _scheduleUiUpdate();
-        }
+        _staffAssignedCases = cases;
+        _mergeAssignedCases();
       },
       onError: (_) => unawaited(_refreshSnapshot()),
     );
@@ -150,13 +180,36 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
     final attorneyId = _assignedAttorneyId?.trim() ?? '';
     _attorneyCasesSub?.cancel();
     _attorneyCasesSub = null;
+    _calendarEventsSub?.cancel();
+    _calendarEventsSub = null;
     if (attorneyId.isEmpty) return;
 
     _attorneyCasesSub = _staffService.getAttorneyCases(attorneyId).listen(
       (cases) {
         if (!mounted) return;
-        _assignedCases = cases;
-        _scheduleUiUpdate();
+        _attorneyCases = cases;
+        _mergeAssignedCases();
+      },
+      onError: (_) {},
+    );
+
+    _calendarEventsSub = _staffService.getCalendarEvents(attorneyId).listen(
+      (events) {
+        if (!mounted) return;
+        final now = DateTime.now();
+        final upcoming = events.where((e) {
+          final dt = e['eventDate'] as DateTime?;
+          return dt != null && dt.isAfter(now);
+        }).toList()
+          ..sort((a, b) {
+            final da = a['eventDate'] as DateTime;
+            final db = b['eventDate'] as DateTime;
+            return da.compareTo(db);
+          });
+        setState(() {
+          _upcomingDeadlines = upcoming;
+          _stats = _computeStats();
+        });
       },
       onError: (_) {},
     );
@@ -183,7 +236,7 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
     try {
       if (!kIsWeb) {
         try {
-          await user.getIdToken(true);
+          await user.getIdToken();
         } catch (_) {}
       }
 
@@ -198,15 +251,50 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
             .where('assignedTo', isEqualTo: user.uid),
         60,
       );
+      final email = user.email?.trim() ?? '';
+      final taskEmailFuture = email.isNotEmpty
+          ? _firestoreGet(
+              FirebaseFirestore.instance
+                  .collection('tasks')
+                  .where('assignedTo', isEqualTo: email),
+              60,
+            )
+          : null;
       final assignedFuture = _firestoreGet(
         FirebaseFirestore.instance
             .collection('cases')
             .where('staffAssigned', arrayContains: user.uid),
         60,
       );
+      final staffIdFuture = _firestoreGet(
+        FirebaseFirestore.instance
+            .collection('cases')
+            .where('staffId', isEqualTo: user.uid),
+        60,
+      );
+      final assignedEmailFuture = email.isNotEmpty
+          ? _firestoreGet(
+              FirebaseFirestore.instance
+                  .collection('cases')
+                  .where('staffAssigned', arrayContains: email),
+              60,
+            )
+          : null;
+      final staffIdEmailFuture = email.isNotEmpty
+          ? _firestoreGet(
+              FirebaseFirestore.instance
+                  .collection('cases')
+                  .where('staffId', isEqualTo: email),
+              60,
+            )
+          : null;
 
       Object? taskResult;
+      Object? taskEmailResult;
       Object? assignedResult;
+      Object? staffIdResult;
+      Object? assignedEmailResult;
+      Object? staffIdEmailResult;
       Object? userDocResult;
       await Future.wait<void>([
         () async {
@@ -214,11 +302,34 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
             taskResult = await taskFuture;
           } catch (_) {}
         }(),
+        if (taskEmailFuture != null)
+          () async {
+            try {
+              taskEmailResult = await taskEmailFuture;
+            } catch (_) {}
+          }(),
         () async {
           try {
             assignedResult = await assignedFuture;
           } catch (_) {}
         }(),
+        () async {
+          try {
+            staffIdResult = await staffIdFuture;
+          } catch (_) {}
+        }(),
+        if (assignedEmailFuture != null)
+          () async {
+            try {
+              assignedEmailResult = await assignedEmailFuture;
+            } catch (_) {}
+          }(),
+        if (staffIdEmailFuture != null)
+          () async {
+            try {
+              staffIdEmailResult = await staffIdEmailFuture;
+            } catch (_) {}
+          }(),
         if (userDocFuture != null)
           () async {
             try {
@@ -229,22 +340,55 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
 
       try {
         final taskSnap = taskResult as QuerySnapshot<Map<String, dynamic>>?;
+        final taskEmailSnap =
+            taskEmailResult as QuerySnapshot<Map<String, dynamic>>?;
+        final taskMap = <String, TaskModel>{};
         if (taskSnap != null) {
-          tasks = taskSnap.docs
-              .map((doc) => TaskModel.fromFirestore(doc))
-              .toList()
-            ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+          for (final doc in taskSnap.docs) {
+            taskMap[doc.id] = TaskModel.fromFirestore(doc);
+          }
         }
+        if (taskEmailSnap != null) {
+          for (final doc in taskEmailSnap.docs) {
+            taskMap.putIfAbsent(doc.id, () => TaskModel.fromFirestore(doc));
+          }
+        }
+        tasks = taskMap.values.toList()
+          ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
       } catch (_) {}
 
       try {
         final assignedSnap =
             assignedResult as QuerySnapshot<Map<String, dynamic>>?;
+        final staffIdSnap =
+            staffIdResult as QuerySnapshot<Map<String, dynamic>>?;
+        final caseMap = <String, CaseModel>{};
         if (assignedSnap != null) {
-          cases = assignedSnap.docs
-              .map((doc) => CaseModel.fromFirestore(doc))
-              .toList();
+          for (final doc in assignedSnap.docs) {
+            caseMap[doc.id] = CaseModel.fromFirestore(doc);
+          }
         }
+        if (staffIdSnap != null) {
+          for (final doc in staffIdSnap.docs) {
+            caseMap.putIfAbsent(doc.id, () => CaseModel.fromFirestore(doc));
+          }
+        }
+        final assignedEmailSnap =
+            assignedEmailResult as QuerySnapshot<Map<String, dynamic>>?;
+        if (assignedEmailSnap != null) {
+          for (final doc in assignedEmailSnap.docs) {
+            caseMap.putIfAbsent(doc.id, () => CaseModel.fromFirestore(doc));
+          }
+        }
+        final staffIdEmailSnap =
+            staffIdEmailResult as QuerySnapshot<Map<String, dynamic>>?;
+        if (staffIdEmailSnap != null) {
+          for (final doc in staffIdEmailSnap.docs) {
+            caseMap.putIfAbsent(doc.id, () => CaseModel.fromFirestore(doc));
+          }
+        }
+        cases = caseMap.values.toList()
+          ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
       } catch (_) {}
 
       if (attorneyId.isEmpty && userDocResult != null) {
@@ -253,8 +397,37 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
               userDocResult as DocumentSnapshot<Map<String, dynamic>>;
           attorneyId =
               (userDoc.data()?['assignedAttorneyId'] as String?)?.trim() ?? '';
-          if (attorneyId.isNotEmpty) _assignedAttorneyId = attorneyId;
         } catch (_) {}
+      }
+
+      // If attorneyId is still empty, resolve from assigned cases
+      if (attorneyId.isEmpty && cases.isNotEmpty) {
+        for (final c in cases) {
+          final aid = c.attorneyId?.trim() ?? '';
+          if (aid.isNotEmpty) {
+            attorneyId = aid;
+            break;
+          }
+        }
+      }
+
+      // If still empty, resolve from active attorney in users collection
+      if (attorneyId.isEmpty) {
+        try {
+          final attSnap = await FirebaseFirestore.instance
+              .collection('users')
+              .where('role', isEqualTo: 'attorney')
+              .where('isActive', isEqualTo: true)
+              .limit(1)
+              .get();
+          if (attSnap.docs.isNotEmpty) {
+            attorneyId = attSnap.docs.first.id;
+          }
+        } catch (_) {}
+      }
+
+      if (attorneyId.isNotEmpty && attorneyId != _assignedAttorneyId) {
+        _assignedAttorneyId = attorneyId;
       }
 
       if (cases.isEmpty && attorneyId.isNotEmpty) {
@@ -265,22 +438,27 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
                 .where('attorneyId', isEqualTo: attorneyId),
             60,
           );
-          cases = attorneySnap.docs
+          final attCases = attorneySnap.docs
               .map((doc) => CaseModel.fromFirestore(doc))
               .toList();
+          if (attCases.isNotEmpty) {
+            _attorneyCases = attCases;
+          }
         } catch (_) {}
       }
 
       if (!mounted) return;
+      if (tasks.isNotEmpty) _myTasks = tasks;
+      if (cases.isNotEmpty) {
+        _staffAssignedCases = cases;
+      }
+      _mergeAssignedCases();
       setState(() {
-        if (tasks.isNotEmpty) _myTasks = tasks;
-        if (cases.isNotEmpty) {
-          _assignedCases = cases
-            ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
-        }
         _stats = _computeStats();
         _snapshotLoading = false;
       });
+
+      unawaited(_loadPreviewData());
 
       if (attorneyId.isNotEmpty && _attorneyCasesSub == null) {
         _subscribeCaseStreams(user.uid);
@@ -307,28 +485,53 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
   }
 
   Future<void> _loadPreviewData() async {
-    final attorneyId = _assignedAttorneyId;
-    if (attorneyId == null || !mounted) return;
+    final attorneyId = _assignedAttorneyId?.trim() ?? '';
+    final user = FirebaseAuth.instance.currentUser;
+    if (attorneyId.isEmpty && user == null) return;
+    if (!mounted) return;
 
     try {
       final now = DateTime.now();
-      final deadlinesSnap = await FirebaseFirestore.instance
-          .collection('calendar_events')
-          .where('assignedTo', isEqualTo: attorneyId)
-          .where('eventDate', isGreaterThan: Timestamp.fromDate(now))
-          .orderBy('eventDate')
-          .limit(5)
-          .get();
+      final targetAids = <String>{
+        if (attorneyId.isNotEmpty) attorneyId,
+        if (user != null) user.uid,
+      };
 
-      final hearingSnap = await FirebaseFirestore.instance
-          .collection('hearing_notifications')
-          .where('attorneyId', isEqualTo: attorneyId)
-          .where('status', isEqualTo: 'pending')
-          .limit(15)
-          .get();
+      final allEventDocs = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+      for (final aid in targetAids) {
+        QuerySnapshot<Map<String, dynamic>> deadlinesSnap;
+        try {
+          deadlinesSnap = await FirebaseFirestore.instance
+              .collection('calendar_events')
+              .where('assignedTo', isEqualTo: aid)
+              .where('eventDate', isGreaterThan: Timestamp.fromDate(now))
+              .orderBy('eventDate')
+              .limit(20)
+              .get();
+        } catch (_) {
+          deadlinesSnap = await FirebaseFirestore.instance
+              .collection('calendar_events')
+              .where('assignedTo', isEqualTo: aid)
+              .limit(50)
+              .get();
+        }
+        allEventDocs.addAll(deadlinesSnap.docs);
+      }
+
+      QuerySnapshot<Map<String, dynamic>>? hearingSnap;
+      if (attorneyId.isNotEmpty) {
+        try {
+          hearingSnap = await FirebaseFirestore.instance
+              .collection('hearing_notifications')
+              .where('attorneyId', isEqualTo: attorneyId)
+              .where('status', isEqualTo: 'pending')
+              .limit(15)
+              .get();
+        } catch (_) {}
+      }
 
       final twoDays = now.add(const Duration(days: 2));
-      final hearings = hearingSnap.docs
+      final hearings = (hearingSnap?.docs ?? [])
           .map((doc) {
             final data = doc.data();
             return <String, dynamic>{
@@ -347,16 +550,37 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
           })
           .toList();
 
+      final seenDocIds = <String>{};
+      final events = allEventDocs
+          .where((doc) => seenDocIds.add(doc.id))
+          .map((doc) {
+            final data = doc.data();
+            DateTime? dt;
+            if (data['eventDate'] is Timestamp) {
+              dt = (data['eventDate'] as Timestamp).toDate();
+            } else if (data['eventDate'] is String) {
+              dt = DateTime.tryParse(data['eventDate'] as String);
+            }
+            return <String, dynamic>{
+              'id': doc.id,
+              ...data,
+              'eventDate': dt,
+            };
+          })
+          .where((e) {
+            final dt = e['eventDate'] as DateTime?;
+            return dt != null && dt.isAfter(now);
+          })
+          .toList()
+        ..sort((a, b) {
+          final da = a['eventDate'] as DateTime;
+          final db = b['eventDate'] as DateTime;
+          return da.compareTo(db);
+        });
+
       if (!mounted) return;
       setState(() {
-        _upcomingDeadlines = deadlinesSnap.docs.map((doc) {
-          final data = doc.data();
-          return <String, dynamic>{
-            'id': doc.id,
-            ...data,
-            'eventDate': (data['eventDate'] as Timestamp?)?.toDate(),
-          };
-        }).toList();
+        _upcomingDeadlines = events;
         _hearingNotifications = hearings;
         _stats = _computeStats();
       });
@@ -368,23 +592,30 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
     int limit,
   ) async {
     final q = query.limit(limit);
-    if (kIsWeb) return q.get();
     try {
-      return await q.get(const GetOptions(source: Source.server));
+      return await q.get();
     } catch (_) {
-      return q.get();
+      return q.get(const GetOptions(source: Source.server));
     }
   }
 
   Future<DocumentSnapshot<Map<String, dynamic>>> _firestoreGetDoc(
     DocumentReference<Map<String, dynamic>> ref,
   ) async {
-    if (kIsWeb) return ref.get();
     try {
-      return await ref.get(const GetOptions(source: Source.server));
+      return await ref.get();
     } catch (_) {
-      return ref.get();
+      return ref.get(const GetOptions(source: Source.server));
     }
+  }
+
+  bool _isActiveCase(CaseModel c) {
+    if (c.isArchived) return false;
+    if (CaseStatusFilter.isCompleted(c.status)) return false;
+    if (OpenWorkTasks.isClosedCase(c)) return false;
+    final s = c.status.toLowerCase().trim();
+    if (s == 'declined' || s == 'cancelled' || s == 'canceled') return false;
+    return true;
   }
 
   Map<String, dynamic> _computeStats() {
@@ -398,22 +629,18 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
       final s = status.toLowerCase().trim();
       return s == 'completed' || s == 'done';
     }
-    bool isActiveCase(String status) {
-      final s = status.toLowerCase().trim();
-      return s == 'in_progress' ||
-          s == 'in progress' ||
-          s == 'accepted' ||
-          s == 'active';
-    }
-    final closedCaseIds = OpenWorkTasks.closedCaseIds(_assignedCases);
-    final liveTasks = OpenWorkTasks.live(_myTasks, closedCaseIds);
+
+    final nonCancelledTasks =
+        _myTasks.where((t) => !OpenWorkTasks.isCancelled(t.status)).toList();
 
     return {
-      'totalTasks': liveTasks.length,
-      'pendingTasks': liveTasks.where((t) => isPending(t.status)).length,
-      'inProgressTasks': liveTasks.where((t) => isInProgress(t.status)).length,
+      'totalTasks': nonCancelledTasks.length,
+      'pendingTasks':
+          nonCancelledTasks.where((t) => isPending(t.status)).length,
+      'inProgressTasks':
+          nonCancelledTasks.where((t) => isInProgress(t.status)).length,
       'completedTasks': _myTasks.where((t) => isCompleted(t.status)).length,
-      'activeCases': _assignedCases.where((c) => isActiveCase(c.status)).length,
+      'activeCases': _assignedCases.where(_isActiveCase).length,
       'upcomingDeadlines': _upcomingDeadlines.length,
     };
   }
@@ -491,49 +718,13 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
     }
   }
 
-  void _openBilling() {
-    final attorneyId = _assignedAttorneyId;
-    if (attorneyId == null || attorneyId.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('No assigned attorney to view billing for.'),
-        ),
-      );
-      return;
-    }
-    Get.to(
-      () => BillingManagementScreen(
-        attorneyId: attorneyId,
-        title: 'Billing & Payments',
-        recorderRole: 'staff',
-        recorderName: FirebaseAuth.instance.currentUser?.displayName,
-      ),
-    );
-  }
-
-  void _openNotary() {
-    final attorneyId = (_assignedAttorneyId ?? '').trim();
-    if (attorneyId.isEmpty) {
-      Get.snackbar(
-        'Notary',
-        'No assigned attorney. Ask admin to link your account.',
-        snackPosition: SnackPosition.BOTTOM,
-      );
-      return;
-    }
-    Get.to(
-      () => AttorneyNotaryRequestsScreen(
-        staffAssignedAttorneyId: attorneyId,
-      ),
-    );
-  }
-
   @override
   void dispose() {
     _uiDebounce?.cancel();
     _tasksSub?.cancel();
     _assignedCasesSub?.cancel();
     _attorneyCasesSub?.cancel();
+    _calendarEventsSub?.cancel();
     super.dispose();
   }
 
@@ -552,7 +743,7 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
         isDesktop ? 24 : 16,
         isDesktop ? 20 : 16,
         isDesktop ? 24 : 16,
-        28,
+        isDesktop ? 28 : 100,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -561,11 +752,14 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
             _HearingReminders(notifications: _hearingNotifications),
             const SizedBox(height: 20),
           ],
-          if (!isDesktop && _assignedAttorneyId != null) ...[
+          if (!isDesktop) ...[
             _MobileQuickActions(
-              onMessage: () => unawaited(_openChatWithAttorney()),
-              onBilling: _openBilling,
-              onNotary: _openNotary,
+              onMessage: _assignedAttorneyId != null
+                  ? () => unawaited(_openChatWithAttorney())
+                  : null,
+              onPendingAppointments: widget.onNavigateToPendingAppointments,
+              pendingCount: widget.pendingAppointmentsCount,
+              onNotary: widget.onNavigateToNotary,
             ),
             const SizedBox(height: 20),
           ],
@@ -574,58 +768,84 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
             physics: const NeverScrollableScrollPhysics(),
             gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
               crossAxisCount: overviewCount,
-              mainAxisSpacing: 12,
-              crossAxisSpacing: 12,
-              mainAxisExtent: isDesktop ? 118 : 122,
+              mainAxisSpacing: 14,
+              crossAxisSpacing: 14,
+              mainAxisExtent: isDesktop ? 132 : 128,
             ),
             children: [
               StaffOverviewCard(
                 title: 'Total Tasks',
                 value: '${_stats['totalTasks'] ?? 0}',
                 subtitle: 'All assigned tasks',
-                icon: Icons.description_outlined,
-                iconColor: AppTheme.inkBlue,
-                pastel: const Color(0xFFE8F0F8),
+                badgeText: 'All Work',
+                icon: Icons.task_alt_rounded,
+                iconColor: const Color(0xFF2563EB),
+                pastel: const Color(0xFFEFF6FF),
+                onTap: () => Get.to(
+                  () => const StaffTasksScreen(initialFilter: 'all'),
+                ),
               ),
               StaffOverviewCard(
                 title: 'Pending Tasks',
                 value: '${_stats['pendingTasks'] ?? 0}',
                 subtitle: 'Awaiting action',
-                icon: Icons.more_horiz,
-                iconColor: AppTheme.inkCoral,
-                pastel: const Color(0xFFF8E8E4),
+                badgeText: 'Action needed',
+                icon: Icons.hourglass_top_rounded,
+                iconColor: const Color(0xFFEA580C),
+                pastel: const Color(0xFFFFF7ED),
+                onTap: () => Get.to(
+                  () => const StaffTasksScreen(initialFilter: 'pending'),
+                ),
               ),
               StaffOverviewCard(
                 title: 'In Progress',
                 value: '${_stats['inProgressTasks'] ?? 0}',
                 subtitle: 'Currently working',
-                icon: Icons.work_outline,
-                iconColor: AppTheme.inkGreen,
-                pastel: const Color(0xFFE3F3E8),
+                badgeText: 'Working',
+                icon: Icons.work_outline_rounded,
+                iconColor: const Color(0xFF0D9488),
+                pastel: const Color(0xFFF0FDFA),
+                onTap: () => Get.to(
+                  () => const StaffTasksScreen(initialFilter: 'in_progress'),
+                ),
               ),
               StaffOverviewCard(
                 title: 'Active Cases',
                 value: '${_stats['activeCases'] ?? 0}',
                 subtitle: 'Assigned cases',
-                icon: Icons.folder_outlined,
-                iconColor: AppTheme.inkPurple,
-                pastel: const Color(0xFFEDE8F8),
+                badgeText: 'Active',
+                icon: Icons.folder_open_rounded,
+                iconColor: const Color(0xFF7C3AED),
+                pastel: const Color(0xFFF5F3FF),
+                onTap: widget.onNavigateToCases ??
+                    () => Get.to(() => const StaffCasesScreen()),
               ),
               StaffOverviewCard(
                 title: 'Completed Tasks',
                 value: '${_stats['completedTasks'] ?? 0}',
                 subtitle: 'Finished tasks',
-                icon: Icons.check_circle_outline,
-                iconColor: AppTheme.inkGreen,
-                pastel: const Color(0xFFE5F6EA),
+                badgeText: 'Done',
+                icon: Icons.check_circle_rounded,
+                iconColor: const Color(0xFF16A34A),
+                pastel: const Color(0xFFF0FDF4),
+                onTap: () => Get.to(
+                  () => const StaffTasksScreen(initialFilter: 'completed'),
+                ),
               ),
               StaffOverviewCard(
                 title: 'Upcoming Deadlines',
                 value: '${_stats['upcomingDeadlines'] ?? 0}',
                 subtitle: 'Hearings & deadlines',
-                icon: Icons.event_outlined,
-                iconColor: AppTheme.inkPurple,
-                pastel: const Color(0xFFE8E8F6),
+                badgeText: 'Hearings',
+                icon: Icons.event_note_rounded,
+                iconColor: const Color(0xFF0284C7),
+                pastel: const Color(0xFFF0F9FF),
+                onTap: widget.onNavigateToCalendar ??
+                    () => Get.to(
+                          () => StaffCalendarScreen(
+                            assignedAttorneyId: _assignedAttorneyId,
+                          ),
+                        ),
               ),
             ],
           ),
@@ -676,6 +896,11 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
               name: widget.staffName,
               compact: true,
               headerActions: widget.headerActions,
+              onPaymentHistory: () => openPaymentHistoryScreen(
+                context,
+                recorderRole: 'staff',
+                recorderName: widget.staffName,
+              ),
             ),
             Expanded(child: scroll),
           ],
@@ -691,7 +916,11 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
             name: widget.staffName,
             headerActions: widget.headerActions,
             onMessage: () => unawaited(_openChatWithAttorney()),
-            onBilling: _openBilling,
+            onPaymentHistory: () => openPaymentHistoryScreen(
+              context,
+              recorderRole: 'staff',
+              recorderName: widget.staffName,
+            ),
           ),
           Expanded(child: scroll),
         ],
@@ -701,7 +930,7 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
 
   Widget _buildCasesPanel() {
     final cases = _assignedCases
-        .where((c) => !OpenWorkTasks.isClosedCase(c))
+        .where(_isActiveCase)
         .take(6)
         .toList();
     return _Panel(
@@ -735,6 +964,13 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
   Widget _buildDeadlinesPanel() {
     return _Panel(
       title: 'Upcoming Deadlines',
+      actionLabel: 'View Calendar',
+      onAction: widget.onNavigateToCalendar ??
+          () => Get.to(
+                () => StaffCalendarScreen(
+                  assignedAttorneyId: _assignedAttorneyId,
+                ),
+              ),
       child: _upcomingDeadlines.isEmpty
           ? const _EmptyNote(
               icon: Icons.event_available_outlined,
@@ -747,21 +983,39 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
                     (deadline) => ListTile(
                       dense: true,
                       contentPadding: EdgeInsets.zero,
-                      leading: Icon(
-                        Icons.event,
-                        color: _getDeadlineColor(
-                          deadline['eventDate'] as DateTime,
+                      leading: Container(
+                        width: 36,
+                        height: 36,
+                        decoration: BoxDecoration(
+                          color: _getDeadlineColor(
+                            deadline['eventDate'] as DateTime,
+                          ).withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Icon(
+                          Icons.event_note_rounded,
+                          color: _getDeadlineColor(
+                            deadline['eventDate'] as DateTime,
+                          ),
+                          size: 18,
                         ),
                       ),
                       title: Text(
                         deadline['title'] ?? 'Event',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+                        style: StaffUi.style(
+                          fontWeight: FontWeight.w600,
+                          fontSize: 13,
+                        ),
                       ),
                       subtitle: Text(
                         DateFormat('MMM dd, yyyy • hh:mm a').format(
                           deadline['eventDate'] as DateTime,
+                        ),
+                        style: StaffUi.style(
+                          fontSize: 11.5,
+                          color: StaffUi.muted,
                         ),
                       ),
                     ),
@@ -772,39 +1026,43 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
   }
 
   Widget _buildActivityPanel() {
-    final liveTasks = OpenWorkTasks.live(
-      _myTasks,
-      OpenWorkTasks.closedCaseIds(_assignedCases),
-    );
-    final tasks = liveTasks.take(5).toList();
+    final nonCancelled = _myTasks
+        .where((t) => !OpenWorkTasks.isCancelled(t.status))
+        .toList();
+    final tasks = nonCancelled.take(5).toList();
     return _Panel(
       title: 'Recent Activity',
       actionLabel: tasks.isEmpty ? null : 'View All',
       onAction: tasks.isEmpty
           ? null
-          : () => Get.to(() => const StaffTasksScreen()),
+          : () => Get.to(() => const StaffTasksScreen(initialFilter: 'all')),
       child: tasks.isEmpty
           ? const _EmptyNote(
               icon: Icons.task_outlined,
-              text: 'No open tasks',
+              text: 'No tasks',
             )
           : Column(
               children: tasks
                   .map(
                     (task) => ListTile(
                       dense: true,
-                      contentPadding: EdgeInsets.zero,
-                      onTap: () => Get.to(() => const StaffTasksScreen()),
-                      leading: CircleAvatar(
-                        radius: 16,
-                        backgroundColor: _getTaskStatusColor(task.status),
+                      contentPadding: const EdgeInsets.symmetric(vertical: 2),
+                      onTap: () =>
+                          Get.to(() => const StaffTasksScreen(initialFilter: 'all')),
+                      leading: Container(
+                        width: 34,
+                        height: 34,
+                        decoration: BoxDecoration(
+                          color: _getTaskStatusColor(task.status),
+                          borderRadius: BorderRadius.circular(9),
+                        ),
                         child: _getTaskStatusIcon(task.status),
                       ),
                       title: Text(
                         task.title,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: GoogleFonts.inter(
+                        style: StaffUi.style(
                           fontWeight: FontWeight.w600,
                           fontSize: 13,
                         ),
@@ -813,14 +1071,14 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
                         task.description,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: GoogleFonts.inter(
-                          fontSize: 12,
+                        style: StaffUi.style(
+                          fontSize: 11.5,
                           color: StaffUi.muted,
                         ),
                       ),
                       trailing: Text(
                         _timeAgo(task.updatedAt ?? task.createdAt),
-                        style: GoogleFonts.inter(
+                        style: StaffUi.style(
                           fontSize: 11,
                           color: StaffUi.muted,
                         ),
@@ -887,29 +1145,29 @@ class StaffDashboardHomeTabState extends State<StaffDashboardHomeTab> {
   Color _getTaskStatusColor(String status) {
     switch (status) {
       case 'pending':
-        return Colors.orange.withOpacity(0.2);
+        return Colors.orange.withValues(alpha: 0.2);
       case 'in_progress':
-        return Colors.blue.withOpacity(0.2);
+        return Colors.blue.withValues(alpha: 0.2);
       case 'completed':
-        return Colors.green.withOpacity(0.2);
+        return Colors.green.withValues(alpha: 0.2);
       case 'cancelled':
       case 'canceled':
-        return Colors.grey.withOpacity(0.2);
+        return Colors.grey.withValues(alpha: 0.2);
       default:
-        return Colors.grey.withOpacity(0.2);
+        return Colors.grey.withValues(alpha: 0.2);
     }
   }
 
   Color _getCaseStatusColor(String status) {
     switch (status.toLowerCase()) {
       case 'pending':
-        return Colors.orange.withOpacity(0.2);
+        return Colors.orange.withValues(alpha: 0.2);
       case 'in_progress':
-        return Colors.blue.withOpacity(0.2);
+        return Colors.blue.withValues(alpha: 0.2);
       case 'completed':
-        return Colors.green.withOpacity(0.2);
+        return Colors.green.withValues(alpha: 0.2);
       default:
-        return Colors.grey.withOpacity(0.2);
+        return Colors.grey.withValues(alpha: 0.2);
     }
   }
 }
@@ -919,73 +1177,86 @@ class _StaffHero extends StatelessWidget {
     required this.name,
     this.headerActions,
     this.onMessage,
-    this.onBilling,
+    this.onPaymentHistory,
     this.compact = false,
   });
 
   final String name;
   final Widget? headerActions;
   final VoidCallback? onMessage;
-  final VoidCallback? onBilling;
+  final VoidCallback? onPaymentHistory;
   final bool compact;
 
   @override
   Widget build(BuildContext context) {
+    final todayStr = DateFormat('EEEE, MMMM d, y').format(DateTime.now());
+
     return Container(
       width: double.infinity,
-      decoration: const BoxDecoration(gradient: StaffUi.heroGradient),
+      decoration: BoxDecoration(
+        gradient: StaffUi.heroGradient,
+        boxShadow: StaffUi.heroShadow,
+      ),
       child: ClipRect(
         child: Stack(
           children: [
+            // Lightweight legal emblem watermark (Zero GPU memory overhead, freeze-proof)
             Positioned(
-              right: compact ? -30 : 8,
-              top: -28,
-              bottom: -28,
-              width: compact ? 160 : 280,
+              right: compact ? -15 : 20,
+              top: compact ? -15 : -30,
+              bottom: compact ? -15 : -30,
               child: IgnorePointer(
                 child: Opacity(
-                  opacity: 0.28,
-                  child: Image.asset(
-                    'assets/Landingpage.png',
-                    fit: BoxFit.cover,
-                    alignment: Alignment.centerRight,
-                    errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                  opacity: 0.05,
+                  child: Icon(
+                    Icons.balance_rounded,
+                    size: compact ? 180 : 250,
+                    color: Colors.white,
                   ),
                 ),
               ),
             ),
             Padding(
               padding: EdgeInsets.fromLTRB(
-                compact ? 16 : 28,
-                compact ? 16 : 22,
-                compact ? 16 : 28,
-                compact ? 16 : 22,
+                compact ? 18 : 28,
+                compact ? 16 : 24,
+                compact ? 18 : 28,
+                compact ? 18 : 24,
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  // Top bar row: Date badge pill on left, Action Icons on far right ("pa kilid")
                   Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(
+                            color: Colors.white.withValues(alpha: 0.15),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
                           children: [
-                            Text(
-                              'Welcome, $name!',
-                              style: GoogleFonts.inter(
-                                fontSize: compact ? 22 : 28,
-                                fontWeight: FontWeight.w800,
-                                color: Colors.white,
-                                height: 1.15,
-                              ),
+                            const Icon(
+                              Icons.calendar_today_rounded,
+                              size: 11,
+                              color: StaffUi.gold,
                             ),
-                            const SizedBox(height: 4),
+                            const SizedBox(width: 6),
                             Text(
-                              "Here's your overview for today",
-                              style: GoogleFonts.inter(
-                                fontSize: compact ? 13 : 15,
-                                fontWeight: FontWeight.w500,
-                                color: Colors.white.withValues(alpha: 0.78),
+                              todayStr,
+                              style: StaffUi.style(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: const Color(0xFFE2E8F0),
                               ),
                             ),
                           ],
@@ -994,54 +1265,121 @@ class _StaffHero extends StatelessWidget {
                       if (headerActions != null) headerActions!,
                     ],
                   ),
-                  if (onMessage != null || onBilling != null) ...[
-                    const SizedBox(height: 16),
+                  const SizedBox(height: 14),
+                  // Welcome greeting: Gets full width of screen, no truncation!
+                  Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          'Welcome, $name!',
+                          style: StaffUi.style(
+                            fontSize: compact ? 22 : 28,
+                            fontWeight: FontWeight.w800,
+                            color: Colors.white,
+                            height: 1.15,
+                            letterSpacing: -0.4,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      const Text('👋', style: TextStyle(fontSize: 20)),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    "Here's your operational overview for today",
+                    style: StaffUi.style(
+                      fontSize: compact ? 12.5 : 14,
+                      fontWeight: FontWeight.w500,
+                      color: Colors.white.withValues(alpha: 0.78),
+                    ),
+                  ),
+                  if (onMessage != null || onPaymentHistory != null) ...[
+                    SizedBox(height: compact ? 12 : 18),
                     Wrap(
-                      spacing: 10,
+                      spacing: 12,
                       runSpacing: 10,
                       children: [
                         if (onMessage != null)
-                          FilledButton.icon(
-                            onPressed: onMessage,
-                            icon: const Icon(Icons.chat_bubble_outline, size: 18),
-                            label: const Text('Message Attorney'),
-                            style: FilledButton.styleFrom(
-                              backgroundColor: StaffUi.gold,
-                              foregroundColor: StaffUi.navy,
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 16,
-                                vertical: 12,
-                              ),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(22),
-                              ),
-                              textStyle: GoogleFonts.inter(
-                                fontWeight: FontWeight.w700,
-                                fontSize: 13,
+                          Container(
+                            decoration: BoxDecoration(
+                              gradient: StaffUi.goldGradient,
+                              borderRadius: BorderRadius.circular(12),
+                              boxShadow: StaffUi.goldButtonShadow,
+                            ),
+                            child: Material(
+                              color: Colors.transparent,
+                              child: InkWell(
+                                onTap: onMessage,
+                                borderRadius: BorderRadius.circular(12),
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 16,
+                                    vertical: 10,
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const Icon(
+                                        Icons.chat_bubble_rounded,
+                                        size: 16,
+                                        color: StaffUi.navyDeep,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        'Message Attorney',
+                                        style: StaffUi.style(
+                                          fontWeight: FontWeight.w700,
+                                          fontSize: 13,
+                                          color: StaffUi.navyDeep,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
                               ),
                             ),
                           ),
-                        if (onBilling != null)
-                          OutlinedButton.icon(
-                            onPressed: onBilling,
-                            icon: const Icon(
-                              Icons.credit_card_outlined,
-                              size: 18,
+                        if (onPaymentHistory != null)
+                          Container(
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.14),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: Colors.white.withValues(alpha: 0.28),
+                                width: 1,
+                              ),
                             ),
-                            label: const Text('Billing & Payments'),
-                            style: OutlinedButton.styleFrom(
-                              foregroundColor: Colors.white,
-                              side: const BorderSide(color: Colors.white70),
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 16,
-                                vertical: 12,
-                              ),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(22),
-                              ),
-                              textStyle: GoogleFonts.inter(
-                                fontWeight: FontWeight.w600,
-                                fontSize: 13,
+                            child: Material(
+                              color: Colors.transparent,
+                              child: InkWell(
+                                onTap: onPaymentHistory,
+                                borderRadius: BorderRadius.circular(12),
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 16,
+                                    vertical: 10,
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const Icon(
+                                        Icons.receipt_long_rounded,
+                                        size: 16,
+                                        color: Colors.white,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        'Payment History',
+                                        style: StaffUi.style(
+                                          fontWeight: FontWeight.w700,
+                                          fontSize: 13,
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
                               ),
                             ),
                           ),
@@ -1077,8 +1415,9 @@ class _Panel extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(18, 16, 18, 14),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
+        color: StaffUi.card,
+        borderRadius: BorderRadius.circular(StaffUi.radius),
+        border: Border.all(color: StaffUi.line, width: 1),
         boxShadow: StaffUi.cardShadow,
       ),
       child: Column(
@@ -1090,19 +1429,43 @@ class _Panel extends StatelessWidget {
                 child: Text(title, style: StaffUi.title),
               ),
               if (actionLabel != null)
-                TextButton(
-                  onPressed: onAction,
-                  child: Text(
-                    '$actionLabel  >',
-                    style: GoogleFonts.inter(
-                      fontWeight: FontWeight.w600,
-                      color: StaffUi.navyMid,
+                InkWell(
+                  onTap: onAction,
+                  borderRadius: BorderRadius.circular(20),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: StaffUi.background,
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: StaffUi.line),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          actionLabel!,
+                          style: StaffUi.style(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.w700,
+                            color: StaffUi.navy,
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        const Icon(
+                          Icons.arrow_forward_ios_rounded,
+                          size: 10,
+                          color: StaffUi.navy,
+                        ),
+                      ],
                     ),
                   ),
                 ),
             ],
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 12),
           child,
         ],
       ),
@@ -1119,15 +1482,27 @@ class _EmptyNote extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 28),
+      padding: const EdgeInsets.symmetric(vertical: 24),
       child: Column(
         children: [
-          Icon(icon, size: 40, color: StaffUi.muted.withValues(alpha: 0.7)),
+          Container(
+            width: 48,
+            height: 48,
+            decoration: BoxDecoration(
+              color: StaffUi.background,
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Icon(
+              icon,
+              size: 24,
+              color: StaffUi.muted.withValues(alpha: 0.7),
+            ),
+          ),
           const SizedBox(height: 10),
           Text(
             text,
             textAlign: TextAlign.center,
-            style: GoogleFonts.inter(color: StaffUi.muted, fontSize: 13),
+            style: StaffUi.style(color: StaffUi.muted, fontSize: 12.5),
           ),
         ],
       ),
@@ -1140,14 +1515,14 @@ class _CasesHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final style = GoogleFonts.inter(
+    final style = StaffUi.style(
       fontSize: 11,
       fontWeight: FontWeight.w700,
       color: StaffUi.muted,
       letterSpacing: 0.4,
     );
     return Padding(
-      padding: const EdgeInsets.fromLTRB(0, 6, 0, 8),
+      padding: const EdgeInsets.fromLTRB(0, 4, 0, 8),
       child: Row(
         children: [
           Expanded(flex: 3, child: Text('CASE', style: style)),
@@ -1182,28 +1557,36 @@ class _CaseRow extends StatelessWidget {
         onTap: onView,
         borderRadius: BorderRadius.circular(8),
         child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 8),
+          padding: const EdgeInsets.symmetric(vertical: 9),
           child: Row(
             children: [
               Expanded(
                 flex: 3,
                 child: Row(
                   children: [
-                    Icon(
-                      Icons.description_outlined,
-                      size: 18,
-                      color: StaffUi.navyMid,
+                    Container(
+                      width: 32,
+                      height: 32,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFEFF6FF),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(
+                        Icons.description_outlined,
+                        size: 16,
+                        color: StaffUi.navy,
+                      ),
                     ),
-                    const SizedBox(width: 8),
+                    const SizedBox(width: 10),
                     Expanded(
                       child: Text(
                         caseModel.caseTitle,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: GoogleFonts.inter(
+                        style: StaffUi.style(
                           fontWeight: FontWeight.w700,
                           fontSize: 13,
-                          color: StaffUi.navyMid,
+                          color: StaffUi.navy,
                         ),
                       ),
                     ),
@@ -1216,7 +1599,7 @@ class _CaseRow extends StatelessWidget {
                   caseModel.caseType,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: GoogleFonts.inter(fontSize: 12, color: StaffUi.muted),
+                  style: StaffUi.style(fontSize: 12, color: StaffUi.muted),
                 ),
               ),
               Expanded(
@@ -1226,17 +1609,17 @@ class _CaseRow extends StatelessWidget {
                   child: Container(
                     padding: const EdgeInsets.symmetric(
                       horizontal: 8,
-                      vertical: 4,
+                      vertical: 3,
                     ),
                     decoration: BoxDecoration(
                       color: statusColor,
-                      borderRadius: BorderRadius.circular(99),
+                      borderRadius: BorderRadius.circular(20),
                     ),
                     child: Text(
                       statusLabel,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: GoogleFonts.inter(
+                      style: StaffUi.style(
                         fontSize: 11,
                         fontWeight: FontWeight.w700,
                         color: StaffUi.text,
@@ -1251,19 +1634,29 @@ class _CaseRow extends StatelessWidget {
                   DateFormat('MMM d, y').format(caseModel.updatedAt),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: GoogleFonts.inter(fontSize: 12, color: StaffUi.muted),
+                  style: StaffUi.style(fontSize: 12, color: StaffUi.muted),
                 ),
               ),
               SizedBox(
                 width: 72,
-                child: Text(
-                  'View',
-                  textAlign: TextAlign.right,
-                  style: GoogleFonts.inter(
-                    fontWeight: FontWeight.w700,
-                    fontSize: 12,
-                    color: StaffUi.navyMid,
-                  ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    Text(
+                      'View',
+                      style: StaffUi.style(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 12,
+                        color: StaffUi.navy,
+                      ),
+                    ),
+                    const SizedBox(width: 3),
+                    const Icon(
+                      Icons.arrow_forward_ios_rounded,
+                      size: 10,
+                      color: StaffUi.navy,
+                    ),
+                  ],
                 ),
               ),
             ],
@@ -1284,15 +1677,28 @@ class _HearingReminders extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFFEFF6FF),
-        borderRadius: BorderRadius.circular(16),
+        color: const Color(0xFFF0F7FF),
+        borderRadius: BorderRadius.circular(StaffUi.radius),
         border: Border.all(color: const Color(0xFFBFDBFE)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Hearing Reminders', style: StaffUi.title),
-          const SizedBox(height: 8),
+          Row(
+            children: [
+              const Icon(Icons.gavel_rounded, color: StaffUi.navy, size: 20),
+              const SizedBox(width: 8),
+              Text(
+                'Hearing Reminders',
+                style: StaffUi.style(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                  color: StaffUi.navyDeep,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
           ...notifications.map((notification) {
             final hearingDate = notification['hearingDate'] as DateTime?;
             final daysUntil = hearingDate != null
@@ -1300,13 +1706,26 @@ class _HearingReminders extends StatelessWidget {
                 : 0;
             return ListTile(
               contentPadding: EdgeInsets.zero,
-              leading: const CircleAvatar(
-                backgroundColor: Color(0xFFDBEAFE),
-                child: Icon(Icons.gavel, color: StaffUi.navyMid, size: 18),
+              leading: Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFDBEAFE),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Icon(
+                  Icons.calendar_month_rounded,
+                  color: StaffUi.navy,
+                  size: 18,
+                ),
               ),
               title: Text(
                 notification['caseTitle'] as String? ?? 'Hearing',
-                style: GoogleFonts.inter(fontWeight: FontWeight.w700),
+                style: StaffUi.style(
+                  fontWeight: FontWeight.w700,
+                  fontSize: 13,
+                  color: StaffUi.navyDeep,
+                ),
               ),
               subtitle: hearingDate == null
                   ? null
@@ -1316,6 +1735,7 @@ class _HearingReminders extends StatelessWidget {
                           : daysUntil == 1
                               ? 'Tomorrow at ${DateFormat('hh:mm a').format(hearingDate)}'
                               : 'In $daysUntil days • ${DateFormat('MMM dd, yyyy').format(hearingDate)}',
+                      style: StaffUi.style(fontSize: 11.5, color: StaffUi.muted),
                     ),
             );
           }),
@@ -1327,54 +1747,287 @@ class _HearingReminders extends StatelessWidget {
 
 class _MobileQuickActions extends StatelessWidget {
   const _MobileQuickActions({
-    required this.onMessage,
-    required this.onBilling,
-    required this.onNotary,
+    this.onMessage,
+    this.onPendingAppointments,
+    this.onNotary,
+    this.pendingCount = 0,
   });
 
-  final VoidCallback onMessage;
-  final VoidCallback onBilling;
-  final VoidCallback onNotary;
+  final VoidCallback? onMessage;
+  final VoidCallback? onPendingAppointments;
+  final VoidCallback? onNotary;
+  final int pendingCount;
+
+  Widget _buildButton({
+    required String label,
+    required IconData icon,
+    required bool isGold,
+    required VoidCallback onTap,
+  }) {
+    return Container(
+      height: 48,
+      decoration: BoxDecoration(
+        gradient: isGold ? StaffUi.goldGradient : null,
+        color: isGold ? null : Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: isGold ? null : Border.all(color: StaffUi.line, width: 1.2),
+        boxShadow: isGold ? StaffUi.goldButtonShadow : StaffUi.cardShadow,
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: () {
+            HapticFeedback.lightImpact();
+            onTap();
+          },
+          borderRadius: BorderRadius.circular(14),
+          splashColor: isGold
+              ? StaffUi.navyDeep.withValues(alpha: 0.15)
+              : StaffUi.gold.withValues(alpha: 0.15),
+          highlightColor: isGold
+              ? StaffUi.navyDeep.withValues(alpha: 0.08)
+              : StaffUi.gold.withValues(alpha: 0.08),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  icon,
+                  color: isGold ? StaffUi.navyDeep : StaffUi.navy,
+                  size: 18,
+                ),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: StaffUi.style(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: isGold ? StaffUi.navyDeep : StaffUi.navyMid,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPendingAppointmentsCard(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: pendingCount > 0
+              ? const Color(0xFFF97316).withValues(alpha: 0.35)
+              : StaffUi.line,
+          width: 1.2,
+        ),
+        boxShadow: StaffUi.cardShadow,
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: () {
+            HapticFeedback.lightImpact();
+            if (onPendingAppointments != null) {
+              onPendingAppointments!();
+            } else {
+              Get.to(() => const StaffPendingAppointmentsScreen());
+            }
+          },
+          borderRadius: BorderRadius.circular(14),
+          splashColor: const Color(0xFF1E6BFF).withValues(alpha: 0.1),
+          highlightColor: const Color(0xFF1E6BFF).withValues(alpha: 0.05),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            child: Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E6BFF).withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Icon(
+                    Icons.pending_actions_rounded,
+                    color: Color(0xFF1E6BFF),
+                    size: 20,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Flexible(
+                            child: Text(
+                              'Pending Appointments',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: StaffUi.style(
+                                fontSize: 13.5,
+                                fontWeight: FontWeight.w700,
+                                color: StaffUi.navyDeep,
+                              ),
+                            ),
+                          ),
+                          if (pendingCount > 0) ...[
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6.5,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFEF4444),
+                                borderRadius: BorderRadius.circular(10),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: const Color(0xFFEF4444).withValues(alpha: 0.4),
+                                    blurRadius: 4,
+                                    offset: const Offset(0, 1),
+                                  ),
+                                ],
+                              ),
+                              child: Text(
+                                pendingCount > 99 ? '99+' : '$pendingCount',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w800,
+                                  height: 1,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'Review client requests & schedule consultations',
+                        style: StaffUi.style(
+                          fontSize: 11.5,
+                          color: StaffUi.muted,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Icon(
+                  Icons.arrow_forward_ios_rounded,
+                  size: 14,
+                  color: StaffUi.muted,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildNotaryCard(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: StaffUi.line, width: 1.2),
+        boxShadow: StaffUi.cardShadow,
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: () {
+            HapticFeedback.lightImpact();
+            if (onNotary != null) {
+              onNotary!();
+            } else {
+              Get.to(() => const StaffNotaryManagementScreen());
+            }
+          },
+          borderRadius: BorderRadius.circular(14),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            child: Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: StaffUi.navyDeep.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Icon(
+                    Icons.draw_outlined,
+                    color: StaffUi.navyDeep,
+                    size: 20,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Notary Services',
+                        style: StaffUi.style(
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w700,
+                          color: StaffUi.navyDeep,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'Manage document guidelines, requirements & templates',
+                        style: StaffUi.style(
+                          fontSize: 11.5,
+                          color: StaffUi.muted,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Icon(
+                  Icons.arrow_forward_ios_rounded,
+                  size: 14,
+                  color: StaffUi.muted,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return Column(
       children: [
-        SizedBox(
-          width: double.infinity,
-          child: FilledButton.icon(
-            onPressed: onNotary,
-            icon: const Icon(Icons.draw_outlined),
-            label: const Text('Notary'),
-            style: FilledButton.styleFrom(
-              backgroundColor: StaffUi.navy,
-              foregroundColor: Colors.white,
-            ),
+        if (onMessage != null) ...[
+          _buildButton(
+            label: 'Message Attorney',
+            icon: Icons.chat_bubble_rounded,
+            isGold: true,
+            onTap: onMessage!,
           ),
-        ),
-        const SizedBox(height: 8),
-        SizedBox(
-          width: double.infinity,
-          child: FilledButton.icon(
-            onPressed: onMessage,
-            icon: const Icon(Icons.chat_bubble_outline),
-            label: const Text('Message Attorney'),
-            style: FilledButton.styleFrom(
-              backgroundColor: StaffUi.gold,
-              foregroundColor: StaffUi.navy,
-            ),
-          ),
-        ),
-        const SizedBox(height: 8),
-        SizedBox(
-          width: double.infinity,
-          child: OutlinedButton.icon(
-            onPressed: onBilling,
-            icon: const Icon(Icons.credit_card_outlined),
-            label: const Text('Billing & Payments'),
-          ),
-        ),
+          const SizedBox(height: 10),
+        ],
+        _buildPendingAppointmentsCard(context),
+        const SizedBox(height: 10),
+        _buildNotaryCard(context),
       ],
     );
   }
 }
+

@@ -31,6 +31,7 @@ class FCMService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   String? _fcmToken;
   bool _isInitialized = false;
+  static final Map<String, int> _recentForegroundPushes = <String, int>{};
 
   /// Initialize FCM and request permissions
   /// Compatible with all Android and iOS versions
@@ -109,6 +110,7 @@ class FCMService {
 
       // Set up message handlers (works on all platforms)
       _setupMessageHandlers();
+      _hookAuthTokenSave();
 
       final signedInUid = FirebaseAuth.instance.currentUser?.uid;
       if (signedInUid != null &&
@@ -252,11 +254,53 @@ class FCMService {
       }
       final isHearingPush = type.contains('hearing') ||
           (message.data['caseNo'] ?? '').toString().trim().isNotEmpty;
-      final title = message.notification?.title ??
-          (isHearingPush
-              ? 'Court hearing / order — ${message.data['caseNo'] ?? ''}'.trim()
-              : 'Notification');
-      final rawBody = message.notification?.body ?? '';
+      final pushDedupeKey = (message.data['hearingDocId'] ??
+              message.data['caseNo'] ??
+              message.messageId ??
+              message.notification?.title ??
+              '')
+          .toString()
+          .trim();
+      if (pushDedupeKey.isNotEmpty) {
+        final now = DateTime.now().millisecondsSinceEpoch;
+        _recentForegroundPushes.removeWhere((_, time) => now - time > 30000);
+        if (_recentForegroundPushes.containsKey(pushDedupeKey)) {
+          if (kDebugMode) {
+            debugPrint(
+              '⏭️ Skipping duplicate foreground push card for $pushDedupeKey',
+            );
+          }
+          return;
+        }
+        _recentForegroundPushes[pushDedupeKey] = now;
+      }
+      // Browser already paints FCM webpush.notification — a second local card
+      // was the "duha ka card" bug for hearing orders.
+      if (kIsWeb &&
+          isHearingPush &&
+          message.notification != null &&
+          (message.notification!.title?.trim().isNotEmpty ?? false)) {
+        if (kDebugMode) {
+          debugPrint(
+            '⏭️ Skipping duplicate web local hearing push '
+            '(browser already showed FCM card)',
+          );
+        }
+        return;
+      }
+      final dataTitle = '${message.data['title'] ?? ''}'.trim();
+      final dataBody = '${message.data['body'] ?? ''}'.trim();
+      final rawTitle = (message.notification?.title ?? dataTitle).trim();
+      final rawBody = (message.notification?.body ?? dataBody).trim();
+      final title = isHearingPush
+          ? HearingNotificationFormatter.buildPopupTitle({
+              ...message.data,
+              'message': rawBody,
+            }, fallback: rawTitle.isNotEmpty
+                ? rawTitle
+                : 'Court hearing / order — ${message.data['caseNo'] ?? ''}'
+                    .trim())
+          : (rawTitle.isNotEmpty ? rawTitle : 'Notification');
       final body = isHearingPush
           ? HearingNotificationFormatter.buildPopupBody({
               ...message.data,
@@ -265,12 +309,22 @@ class FCMService {
           : rawBody;
 
       if (title.isNotEmpty && (body.isNotEmpty || isHearingPush)) {
+        final hearingTag = '${message.data['hearingDocId'] ?? ''}'.trim();
+        final requestId = '${message.data['requestId'] ?? ''}'.trim();
+        final notaryTag = type.startsWith('notary') && requestId.isNotEmpty
+            ? '$type:$requestId'
+            : '';
+        final trayTag = notaryTag.isNotEmpty ? notaryTag : hearingTag;
 
         try {
           await _showForegroundLocalNotification(
+            id: notaryTag.isNotEmpty
+                ? notaryTag.hashCode & 0x7fffffff
+                : _stablePushId(message),
             title: title,
             body: body,
             payload: message.data.toString(),
+            tag: trayTag,
           );
         } catch (e) {
           if (kDebugMode) {
@@ -280,7 +334,11 @@ class FCMService {
           }
         }
 
-        if (type != 'new_message') {
+        // Notary / hearing-order: Cloud Function (or prior writer) already
+        // created the stable bell row — do not add() a second random card.
+        if (type != 'new_message' &&
+            !type.startsWith('notary') &&
+            !isHearingPush) {
           try {
             await _saveNotificationToFirestore(message);
           } catch (e) {
@@ -316,22 +374,31 @@ class FCMService {
     });
   }
 
+  /// Same hearing keeps one tray row if a second copy arrives.
+  int _stablePushId(RemoteMessage message) {
+    final hid = '${message.data['hearingDocId'] ?? ''}'.trim();
+    if (hid.isEmpty) {
+      return DateTime.now().millisecondsSinceEpoch % 100000;
+    }
+    return hid.hashCode & 0x7fffffff;
+  }
+
   Future<void> _showForegroundLocalNotification({
+    required int id,
     required String title,
     required String body,
     String? payload,
+    String? tag,
   }) async {
-    if (kIsWeb) {
-      await showBrowserNotification(title: title, body: body);
-      return;
-    }
+    if (kIsWeb) return;
 
     final notificationService = NotificationService();
     await notificationService.showNotificationWithSound(
-      id: DateTime.now().millisecondsSinceEpoch % 100000,
+      id: id,
       title: title,
       body: body,
       payload: payload,
+      tag: (tag ?? '').isEmpty ? null : tag,
     );
   }
 
@@ -389,6 +456,17 @@ class FCMService {
     }
   }
 
+  bool _authHooked = false;
+
+  void _hookAuthTokenSave() {
+    if (_authHooked) return;
+    _authHooked = true;
+    FirebaseAuth.instance.authStateChanges().listen((user) {
+      if (user == null) return;
+      unawaited(saveTokenForUser(user.uid));
+    });
+  }
+
   /// Save FCM token to Firestore for a user
   Future<void> saveTokenForUser(String userId) async {
     try {
@@ -416,11 +494,40 @@ class FCMService {
           ? userId
           : FirebaseAuth.instance.currentUser?.uid;
       if (uid == null || uid.isEmpty) return;
+      final platform = _tokenPlatform;
+      final existing = await _firestore.collection('users').doc(uid).get();
+      final data = existing.data() ?? const <String, dynamic>{};
+      final previous = data['fcmToken'];
+      final map = data['fcmTokens'];
+      final android = map is Map ? map['android'] : null;
+      final ios = map is Map ? map['ios'] : null;
+      final hasPhone = (android is String && android.length > 20) ||
+          (ios is String && ios.length > 20);
       final patch = <String, dynamic>{
-        'fcmToken': token,
         'fcmTokenUpdatedAt': FieldValue.serverTimestamp(),
-        'fcmTokens.${_tokenPlatform}': token,
+        'fcmTokens.$platform': token,
       };
+      if (platform == 'web') {
+        // Opening the website must not erase the phone token.
+        if (!hasPhone &&
+            previous is String &&
+            previous.length > 20 &&
+            previous != token) {
+          patch['fcmTokens.android'] = previous;
+          patch['fcmToken'] = previous;
+        } else if (hasPhone) {
+          patch['fcmToken'] =
+              (android is String && android.length > 20) ? android : ios;
+        } else {
+          patch['fcmToken'] = token;
+        }
+      } else {
+        patch['fcmToken'] = token;
+      }
+      await _firestore.collection('users').doc(uid).set(
+        patch,
+        SetOptions(merge: true),
+      );
       final result = await HybridDatastore.update(
         collection: 'users',
         id: uid,
@@ -449,17 +556,51 @@ class FCMService {
         if (raw is String && raw.length > 20) out.add(raw);
       }
 
-      add(data['fcmToken']);
       final map = data['fcmTokens'];
+      String? web;
       if (map is Map) {
-        for (final value in map.values) {
-          add(value);
+        if (map['web'] is String) web = map['web'] as String;
+        for (final entry in map.entries) {
+          if (entry.key == 'web') continue;
+          add(entry.value);
         }
       }
+      final top = data['fcmToken'];
+      if (top is String && top != web) add(top);
       return out.toList();
     } catch (e) {
       if (kDebugMode) {
         debugPrint('❌ Error reading FCM tokens: $e');
+      }
+      return const [];
+    }
+  }
+
+  /// Android and iPhone tokens only. The website token is left out.
+  Future<List<String>> mobileTokensForUser(String userId) async {
+    try {
+      final userDoc = await _firestore.collection('users').doc(userId).get();
+      if (!userDoc.exists) return const [];
+      final data = userDoc.data();
+      if (data == null) return const [];
+      final out = <String>{};
+      void add(dynamic raw) {
+        if (raw is String && raw.length > 20) out.add(raw);
+      }
+
+      final map = data['fcmTokens'];
+      String? web;
+      if (map is Map) {
+        web = map['web'] is String ? map['web'] as String : null;
+        add(map['android']);
+        add(map['ios']);
+      }
+      final top = data['fcmToken'];
+      if (top is String && top.length > 20 && top != web) add(top);
+      return out.toList();
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('❌ Error reading mobile FCM tokens: $e');
       }
       return const [];
     }
@@ -586,6 +727,7 @@ class FCMService {
     required String title,
     required String body,
     Map<String, dynamic>? data,
+    Set<String>? alreadySentTokens,
   }) async {
     try {
       final settings = await SystemSettingsService.instance.load();
@@ -605,43 +747,31 @@ class FCMService {
         debugPrint('📝 Body: $body');
       }
 
-      // Get user's FCM token
-      final fcmToken = await getUserFCMToken(userId);
-
-      if (fcmToken == null) {
+      final tokens = await tokensForUser(userId);
+      if (tokens.isEmpty) {
         if (kDebugMode) {
           debugPrint('❌ No FCM token found for user: $userId');
         }
         return false;
       }
 
-      // For now, we'll use Firestore to trigger Cloud Function
-      // Or you can use HTTP API directly (requires server key)
-      // This is a simplified version - in production, use Cloud Functions
-
-      // Option 1: Store notification request in Firestore (Cloud Function will send it)
-      final reqData = <String, dynamic>{
-        'userId': userId,
-        'fcmToken': fcmToken,
-        'title': title,
-        'body': body,
-        'data': data ?? {},
-        'createdAt': FieldValue.serverTimestamp(),
-        'status': 'pending',
-      };
-      final result = await HybridDatastore.add(
-        collection: 'notification_requests',
-        data: reqData,
-      );
-      if (!result.isSuccess) throw Exception(result.failureMessage);
-
-      if (kDebugMode) {
-        debugPrint('✅ Notification request queued in Firestore');
-        debugPrint('   Cloud Function will process and send the notification');
-        debugPrint('═══════════════════════════════════════');
+      var queued = false;
+      for (final token in tokens) {
+        if (alreadySentTokens != null && alreadySentTokens.contains(token)) {
+          continue;
+        }
+        final ok = await sendNotificationToToken(
+          fcmToken: token,
+          title: title,
+          body: body,
+          data: data,
+        );
+        if (ok) {
+          queued = true;
+          alreadySentTokens?.add(token);
+        }
       }
-
-      return true;
+      return queued;
     } catch (e, stackTrace) {
       if (kDebugMode) {
         debugPrint('❌ ERROR SENDING FCM NOTIFICATION');
@@ -756,6 +886,12 @@ class FCMService {
   /// Save notification to Firestore when received
   Future<void> _saveNotificationToFirestore(RemoteMessage message) async {
     if (_isCourtEmailIngestMessage(message)) return;
+    // Hearing/order bell rows use stable IDs from Cloud Functions / fanout.
+    final type = '${message.data['type'] ?? ''}'.toLowerCase();
+    final hasHearingDoc =
+        '${message.data['hearingDocId'] ?? ''}'.trim().isNotEmpty;
+    final hasCaseNo = '${message.data['caseNo'] ?? ''}'.trim().isNotEmpty;
+    if (type.contains('hearing') || hasHearingDoc || hasCaseNo) return;
     try {
       // Get userId from message data or current user
       String? userId = message.data['userId'] as String?;

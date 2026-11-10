@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../models/user_model.dart';
@@ -595,10 +596,16 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
             AdminPageHeader(
               title: 'User Management',
               actions: [
-                IconButton(
-                  icon: const Icon(Icons.add_rounded, color: AdminUi.primary),
-                  onPressed: () => _showAddAttorneyDialog(),
-                  tooltip: 'Add Attorney',
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: AdminUi.primary,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                  icon: const Icon(Icons.person_add_rounded, size: 18),
+                  label: const Text('Add Member', style: TextStyle(fontWeight: FontWeight.w600)),
+                  onPressed: () => _showAddMemberDialog(),
                 ),
               ],
             ),
@@ -613,9 +620,9 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
         title: const Text('User Management'),
         actions: [
           IconButton(
-            icon: const Icon(Icons.add),
-            onPressed: () => _showAddAttorneyDialog(),
-            tooltip: 'Add Attorney',
+            icon: const Icon(Icons.person_add_rounded),
+            onPressed: () => _showAddMemberDialog(),
+            tooltip: 'Add Member (Attorney / Staff)',
           ),
         ],
       ),
@@ -623,92 +630,606 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
     );
   }
 
-  void _showAddAttorneyDialog() {
+  static const List<String> _defaultSpecializations = [
+    'Criminal Law',
+    'Family Law',
+    'Labor & Employment',
+    'Civil Litigation',
+    'Corporate & Commercial',
+    'Real Estate & Property',
+    'Immigration Law',
+    'Taxation Law',
+    'Intellectual Property',
+    'Agrarian Law',
+    'Human Rights',
+    'Environmental Law',
+  ];
+
+  void _showAddMemberDialog({String? initialRole}) {
+    String currentRole = initialRole ?? (_selectedRole == 'staff' ? 'staff' : 'attorney');
     final nameController = TextEditingController();
     final emailController = TextEditingController();
-    final specializationController = TextEditingController();
+    final phoneController = TextEditingController();
+    final passwordController = TextEditingController(text: 'LawConnect2026!');
+    final customSpecController = TextEditingController();
+
+    // Attorney state
+    final selectedSpecializations = <String>{'General Law', 'Criminal Law'};
+    bool isAvailable = true;
+
+    // Staff state
+    String selectedTitle = 'Paralegal';
+    String selectedAttorneyId = '';
+    List<Map<String, dynamic>> attorneysList = [];
+    bool isLoadingAttorneys = true;
+    bool obscurePassword = false;
+    bool isSubmitting = false;
+
+    // Preload attorneys for staff assignment
+    _adminService.getAllAttorneys().then((list) {
+      attorneysList = list;
+      isLoadingAttorneys = false;
+    }).catchError((_) {
+      isLoadingAttorneys = false;
+    });
 
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Add Attorney'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: nameController,
-                decoration: const InputDecoration(
-                  labelText: 'Name',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: emailController,
-                decoration: const InputDecoration(
-                  labelText: 'Email',
-                  border: OutlineInputBorder(),
-                ),
-                keyboardType: TextInputType.emailAddress,
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: specializationController,
-                decoration: const InputDecoration(
-                  labelText: 'Specializations (comma-separated)',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              if (nameController.text.trim().isEmpty ||
-                  emailController.text.trim().isEmpty) {
-                Get.snackbar(
-                  'Error',
-                  'Please fill in all required fields',
-                  backgroundColor: Colors.red,
-                  colorText: Colors.white,
-                );
-                return;
+      barrierDismissible: false,
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          if (isLoadingAttorneys && attorneysList.isEmpty) {
+            _adminService.getAllAttorneys().then((list) {
+              if (dialogCtx.mounted) {
+                setDialogState(() {
+                  attorneysList = list;
+                  isLoadingAttorneys = false;
+                });
               }
+            });
+          }
 
-              Navigator.pop(context);
+          return Dialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            backgroundColor: Colors.white,
+            surfaceTintColor: Colors.transparent,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 580),
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Header
+                      Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(10),
+                            decoration: BoxDecoration(
+                              color: AdminUi.primary.withOpacity(0.1),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: const Icon(Icons.person_add_rounded, color: AdminUi.primary, size: 22),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text(
+                                  'Add Organization Member',
+                                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                                ),
+                                Text(
+                                  'Create a new ${currentRole == 'attorney' ? 'Attorney' : 'Staff'} account with direct credentials',
+                                  style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                                ),
+                              ],
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.close),
+                            onPressed: isSubmitting ? null : () => Navigator.pop(dialogCtx),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 18),
 
-              // Show loading
-              Get.dialog(
-                const Center(child: CircularProgressIndicator()),
-                barrierDismissible: false,
-              );
+                      // Role Switcher Tabs
+                      Container(
+                        decoration: BoxDecoration(
+                          color: Colors.grey.shade100,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: Colors.grey.shade300),
+                        ),
+                        padding: const EdgeInsets.all(4),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(8),
+                                onTap: isSubmitting ? null : () => setDialogState(() => currentRole = 'attorney'),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(vertical: 9),
+                                  decoration: BoxDecoration(
+                                    color: currentRole == 'attorney' ? AdminUi.primary : Colors.transparent,
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Icon(
+                                        Icons.gavel_rounded,
+                                        size: 16,
+                                        color: currentRole == 'attorney' ? Colors.white : Colors.grey.shade700,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        'Attorney / Lawyer',
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w600,
+                                          color: currentRole == 'attorney' ? Colors.white : Colors.grey.shade700,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                            Expanded(
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(8),
+                                onTap: isSubmitting ? null : () => setDialogState(() => currentRole = 'staff'),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(vertical: 9),
+                                  decoration: BoxDecoration(
+                                    color: currentRole == 'staff' ? AdminUi.primary : Colors.transparent,
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Icon(
+                                        Icons.badge_outlined,
+                                        size: 16,
+                                        color: currentRole == 'staff' ? Colors.white : Colors.grey.shade700,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        'Staff / Assistant',
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w600,
+                                          color: currentRole == 'staff' ? Colors.white : Colors.grey.shade700,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 18),
 
-              final result = await _adminService.createAttorney(
-                name: nameController.text.trim(),
-                email: emailController.text.trim(),
-                specialization: specializationController.text.trim(),
-              );
+                      // Basic Details
+                      TextField(
+                        controller: nameController,
+                        decoration: InputDecoration(
+                          labelText: currentRole == 'attorney' ? 'Attorney Full Name *' : 'Staff Full Name *',
+                          hintText: currentRole == 'attorney' ? 'e.g. Atty. Juan Dela Cruz' : 'e.g. Maria Santos',
+                          prefixIcon: const Icon(Icons.person_outline_rounded, size: 20),
+                          border: const OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
 
-              Get.back(); // Close loading dialog
+                      TextField(
+                        controller: emailController,
+                        keyboardType: TextInputType.emailAddress,
+                        decoration: const InputDecoration(
+                          labelText: 'Email Address *',
+                          hintText: 'e.g. user@lawfirm.com',
+                          prefixIcon: Icon(Icons.email_outlined, size: 20),
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
 
-              Get.snackbar(
-                result['success'] == true ? 'Success' : 'Error',
-                result['message'] ?? 'Unknown error',
-                backgroundColor: result['success'] == true
-                    ? Colors.green
-                    : Colors.red,
-                colorText: Colors.white,
-              );
-            },
-            child: const Text('Add'),
-          ),
-        ],
+                      TextField(
+                        controller: phoneController,
+                        keyboardType: TextInputType.phone,
+                        decoration: const InputDecoration(
+                          labelText: 'Phone Number (Optional)',
+                          hintText: 'e.g. +63 912 345 6789',
+                          prefixIcon: Icon(Icons.phone_outlined, size: 20),
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+
+                      // Password Field
+                      TextField(
+                        controller: passwordController,
+                        obscureText: obscurePassword,
+                        decoration: InputDecoration(
+                          labelText: 'Initial Password *',
+                          helperText: 'User can log in with this initial password immediately.',
+                          prefixIcon: const Icon(Icons.lock_outline_rounded, size: 20),
+                          suffixIcon: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                icon: Icon(
+                                  obscurePassword ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+                                  size: 20,
+                                ),
+                                tooltip: obscurePassword ? 'Show password' : 'Hide password',
+                                onPressed: () => setDialogState(() => obscurePassword = !obscurePassword),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.copy_rounded, size: 18),
+                                tooltip: 'Copy password',
+                                onPressed: () {
+                                  Clipboard.setData(ClipboardData(text: passwordController.text));
+                                  Get.snackbar(
+                                    'Copied',
+                                    'Password copied to clipboard',
+                                    snackPosition: SnackPosition.BOTTOM,
+                                    duration: const Duration(seconds: 2),
+                                  );
+                                },
+                              ),
+                            ],
+                          ),
+                          border: const OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+
+                      // Role Specific Fields
+                      if (currentRole == 'attorney') ...[
+                        const Divider(),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: const [
+                            Icon(Icons.verified_outlined, size: 16, color: AdminUi.primary),
+                            SizedBox(width: 6),
+                            Text(
+                              'Specializations / Practice Areas',
+                              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Select the fields of law this attorney specializes in (used for client matching):',
+                          style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                        ),
+                        const SizedBox(height: 10),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 6,
+                          children: [
+                            ..._defaultSpecializations.map((spec) {
+                              final isSelected = selectedSpecializations.contains(spec);
+                              return FilterChip(
+                                label: Text(spec),
+                                selected: isSelected,
+                                selectedColor: AdminUi.primary.withOpacity(0.18),
+                                checkmarkColor: AdminUi.primary,
+                                labelStyle: TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                                  color: isSelected ? AdminUi.primary : Colors.grey.shade800,
+                                ),
+                                onSelected: (selected) {
+                                  setDialogState(() {
+                                    if (selected) {
+                                      selectedSpecializations.add(spec);
+                                    } else {
+                                      selectedSpecializations.remove(spec);
+                                    }
+                                  });
+                                },
+                              );
+                            }),
+                            ...selectedSpecializations
+                                .where((s) => !_defaultSpecializations.contains(s))
+                                .map((customSpec) {
+                              return Chip(
+                                label: Text(customSpec),
+                                backgroundColor: AdminUi.primary.withOpacity(0.18),
+                                deleteIcon: const Icon(Icons.close, size: 14),
+                                onDeleted: () {
+                                  setDialogState(() {
+                                    selectedSpecializations.remove(customSpec);
+                                  });
+                                },
+                              );
+                            }),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: customSpecController,
+                                decoration: const InputDecoration(
+                                  hintText: 'Add custom specialization...',
+                                  isDense: true,
+                                  border: OutlineInputBorder(),
+                                  contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                ),
+                                onSubmitted: (val) {
+                                  final t = val.trim();
+                                  if (t.isNotEmpty) {
+                                    setDialogState(() {
+                                      selectedSpecializations.add(t);
+                                      customSpecController.clear();
+                                    });
+                                  }
+                                },
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            OutlinedButton.icon(
+                              icon: const Icon(Icons.add, size: 16),
+                              label: const Text('Add Tag'),
+                              onPressed: () {
+                                final t = customSpecController.text.trim();
+                                if (t.isNotEmpty) {
+                                  setDialogState(() {
+                                    selectedSpecializations.add(t);
+                                    customSpecController.clear();
+                                  });
+                                }
+                              },
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Available for New Consultations', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                          subtitle: const Text('Clients can book consultations and assign new cases immediately', style: TextStyle(fontSize: 11)),
+                          value: isAvailable,
+                          onChanged: (val) => setDialogState(() => isAvailable = val),
+                        ),
+                      ] else ...[
+                        const Divider(),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: const [
+                            Icon(Icons.assignment_ind_outlined, size: 16, color: AdminUi.primary),
+                            SizedBox(width: 6),
+                            Text(
+                              'Staff Role & Assignment',
+                              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        DropdownButtonFormField<String>(
+                          value: selectedTitle,
+                          decoration: const InputDecoration(
+                            labelText: 'Staff Position / Title',
+                            prefixIcon: Icon(Icons.work_outline_rounded, size: 20),
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                          ),
+                          items: const [
+                            DropdownMenuItem(value: 'Paralegal', child: Text('Paralegal')),
+                            DropdownMenuItem(value: 'Legal Secretary', child: Text('Legal Secretary')),
+                            DropdownMenuItem(value: 'Legal Assistant', child: Text('Legal Assistant')),
+                            DropdownMenuItem(value: 'Administrative Officer', child: Text('Administrative Officer')),
+                            DropdownMenuItem(value: 'Case Coordinator', child: Text('Case Coordinator')),
+                          ],
+                          onChanged: (val) {
+                            if (val != null) setDialogState(() => selectedTitle = val);
+                          },
+                        ),
+                        const SizedBox(height: 12),
+                        DropdownButtonFormField<String>(
+                          value: selectedAttorneyId,
+                          decoration: const InputDecoration(
+                            labelText: 'Assigned Attorney',
+                            prefixIcon: Icon(Icons.gavel_outlined, size: 20),
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                            helperText: 'Staff will have access to cases and calendar for this attorney.',
+                          ),
+                          items: [
+                            const DropdownMenuItem(
+                              value: '',
+                              child: Text('(None / General Firm Support)'),
+                            ),
+                            ...attorneysList.map((attorney) {
+                              final attyId = attorney['id'] as String? ?? '';
+                              final attyName = attorney['name'] as String? ?? 'Attorney';
+                              return DropdownMenuItem(
+                                value: attyId,
+                                child: Text('Atty. $attyName'),
+                              );
+                            }),
+                          ],
+                          onChanged: (val) {
+                            if (val != null) setDialogState(() => selectedAttorneyId = val);
+                          },
+                        ),
+                      ],
+
+                      const SizedBox(height: 24),
+
+                      // Action Buttons
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          TextButton(
+                            onPressed: isSubmitting ? null : () => Navigator.pop(dialogCtx),
+                            child: const Text('Cancel'),
+                          ),
+                          const SizedBox(width: 12),
+                          ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AdminUi.primary,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                            ),
+                            onPressed: isSubmitting
+                                ? null
+                                : () async {
+                                    final name = nameController.text.trim();
+                                    final email = emailController.text.trim();
+                                    final password = passwordController.text.trim();
+                                    final phone = phoneController.text.trim();
+
+                                    if (name.isEmpty || email.isEmpty) {
+                                      Get.snackbar(
+                                        'Required Fields',
+                                        'Please provide both name and email address.',
+                                        backgroundColor: Colors.red,
+                                        colorText: Colors.white,
+                                      );
+                                      return;
+                                    }
+
+                                    if (password.length < 6) {
+                                      Get.snackbar(
+                                        'Weak Password',
+                                        'Password must be at least 6 characters.',
+                                        backgroundColor: Colors.red,
+                                        colorText: Colors.white,
+                                      );
+                                      return;
+                                    }
+
+                                    setDialogState(() => isSubmitting = true);
+
+                                    Map<String, dynamic> result;
+                                    if (currentRole == 'attorney') {
+                                      result = await _adminService.createAttorney(
+                                        name: name,
+                                        email: email,
+                                        password: password,
+                                        phone: phone.isNotEmpty ? phone : null,
+                                        specializations: selectedSpecializations.toList(),
+                                        isAvailable: isAvailable,
+                                      );
+                                    } else {
+                                      result = await _adminService.createStaffUser(
+                                        email: email,
+                                        name: name,
+                                        password: password,
+                                        assignedAttorneyId: selectedAttorneyId.isNotEmpty ? selectedAttorneyId : null,
+                                        staffTitle: selectedTitle,
+                                        phone: phone.isNotEmpty ? phone : null,
+                                      );
+                                    }
+
+                                    if (!dialogCtx.mounted) return;
+
+                                    if (result['success'] == true) {
+                                      Navigator.pop(dialogCtx);
+                                      setState(() {});
+
+                                      // Show credentials confirmation dialog
+                                      Get.dialog(
+                                        AlertDialog(
+                                          title: Row(
+                                            children: const [
+                                              Icon(Icons.check_circle, color: Colors.green),
+                                              SizedBox(width: 8),
+                                              Text('Account Created!'),
+                                            ],
+                                          ),
+                                          content: Column(
+                                            mainAxisSize: MainAxisSize.min,
+                                            crossAxisAlignment: CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                'The ${currentRole == 'attorney' ? 'Attorney' : 'Staff'} account for "$name" was successfully registered.',
+                                              ),
+                                              const SizedBox(height: 12),
+                                              Container(
+                                                padding: const EdgeInsets.all(12),
+                                                decoration: BoxDecoration(
+                                                  color: Colors.grey.shade100,
+                                                  borderRadius: BorderRadius.circular(8),
+                                                  border: Border.all(color: Colors.grey.shade300),
+                                                ),
+                                                child: Column(
+                                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                                  children: [
+                                                    Text('Email: $email', style: const TextStyle(fontWeight: FontWeight.bold)),
+                                                    const SizedBox(height: 4),
+                                                    Text('Password: $password', style: const TextStyle(fontWeight: FontWeight.bold)),
+                                                  ],
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                          actions: [
+                                            OutlinedButton.icon(
+                                              icon: const Icon(Icons.copy, size: 16),
+                                              label: const Text('Copy Login Info'),
+                                              onPressed: () {
+                                                Clipboard.setData(ClipboardData(
+                                                  text: 'LawConnect Account Credentials:\nEmail: $email\nPassword: $password',
+                                                ));
+                                                Get.snackbar('Copied', 'Login details copied to clipboard');
+                                              },
+                                            ),
+                                            ElevatedButton(
+                                              onPressed: () => Get.back(),
+                                              child: const Text('Done'),
+                                            ),
+                                          ],
+                                        ),
+                                      );
+                                    } else {
+                                      setDialogState(() => isSubmitting = false);
+                                      Get.snackbar(
+                                        'Error',
+                                        result['message'] ?? 'Failed to create account',
+                                        backgroundColor: Colors.red,
+                                        colorText: Colors.white,
+                                      );
+                                    }
+                                  },
+                            icon: isSubmitting
+                                ? const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                                  )
+                                : const Icon(Icons.check_circle_outline, size: 18),
+                            label: Text(
+                              isSubmitting
+                                  ? 'Creating...'
+                                  : (currentRole == 'attorney' ? 'Add Attorney' : 'Add Staff'),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
       ),
     );
   }
@@ -727,6 +1248,7 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
     bool currentIsActive = isActive as bool;
     bool isAvailable = user.isAvailable ?? true;
 
+    if (!mounted) return;
     showDialog(
       context: context,
       builder: (context) => StatefulBuilder(

@@ -418,10 +418,60 @@ class HearingCalendarFields {
     return best ?? '';
   }
 
+  /// Strips prefixes like "Civil Case No.", "Criminal Case No.", "Case No." to return clean docket number.
+  static String cleanCaseDocketNo(dynamic raw) {
+    if (raw == null) return '';
+    var s = asDisplayString(raw).trim();
+    if (s.isEmpty) return '';
+    if (isPlaceholderCaseNo(s)) return s;
+    final stripped = s.replaceFirst(
+      RegExp(
+        r'^(?:civil|criminal|special(?:\s+proceedings)?|spec\.?\s*proc\.?|spec\.?)?\s*case\s*(?:no\.?|#)?\s*[:\-]?\s*',
+        caseSensitive: false,
+      ),
+      '',
+    ).trim();
+    if (stripped.isNotEmpty) {
+      return stripped;
+    }
+    return s;
+  }
+
+  /// Resolves the authentic client name for display.
+  static String resolveClientForDisplay(Map<String, dynamic> hd) {
+    final client = fieldAsDisplayString(hd, 'clientName').trim();
+    final title = resolveCaseTitleForDisplay(hd);
+    final vsParts = title.split(RegExp(r'\s+vs\.?\s+', caseSensitive: false));
+    final vsLeft = vsParts.isNotEmpty ? vsParts[0].trim() : '';
+    final vsRight = vsParts.length > 1 ? vsParts[1].trim() : '';
+
+    if (vsRight.isNotEmpty &&
+        (client.isEmpty ||
+            client.toLowerCase().startsWith('heirs of') ||
+            (vsLeft.isNotEmpty && client.toLowerCase() == vsLeft.toLowerCase()))) {
+      return sanitizePartyDisplayName(vsRight);
+    }
+
+    if (client.isNotEmpty && !client.toLowerCase().startsWith('heirs of')) {
+      return sanitizePartyDisplayName(client);
+    }
+
+    if (vsRight.isNotEmpty) return sanitizePartyDisplayName(vsRight);
+    return client;
+  }
+
   /// Full venue: court/branch + city (longest complete text wins).
   static String resolveVenueForDisplay(Map<String, dynamic> d) {
-    final loc = (d['location'] as String?)?.trim() ?? '';
-    final court = (d['courtBranch'] as String?)?.trim() ?? '';
+    var loc = (d['location'] as String?)?.trim() ?? '';
+    var court = (d['courtBranch'] as String?)?.trim() ?? '';
+    if (loc.isEmpty) {
+      loc = (d['venue'] as String?)?.trim() ?? '';
+    }
+    if (court.isEmpty) {
+      court = (d['court'] as String?)?.trim() ??
+          (d['court_branch'] as String?)?.trim() ??
+          '';
+    }
     if (loc.isEmpty) return court;
     if (court.isEmpty) return loc;
     final ll = loc.toLowerCase();

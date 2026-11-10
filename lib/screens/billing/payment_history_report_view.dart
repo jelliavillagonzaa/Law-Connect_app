@@ -25,40 +25,42 @@ class PaymentHistoryReportView extends StatelessWidget {
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: AppTheme.borderGray),
-        boxShadow: AppTheme.elevatedShadow,
+        border: Border.all(color: const Color(0xFFE2E8F0)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           _header(context, mobile),
-          SizedBox(height: mobile ? 12 : 16),
+          SizedBox(height: mobile ? 10 : 16),
           if (mobile)
             _mobileRows(report.rows)
           else
             _desktopTable(report.rows),
-          SizedBox(height: mobile ? 16 : 20),
+          SizedBox(height: mobile ? 12 : 20),
           Text(
             'SUMMARY',
-            style: AppTheme.bodyMedium.copyWith(fontWeight: FontWeight.bold),
+            style: AppTheme.bodyMedium.copyWith(
+              fontWeight: FontWeight.bold,
+              fontSize: mobile ? 12 : 14,
+            ),
           ),
-          SizedBox(height: mobile ? 8 : 10),
+          SizedBox(height: mobile ? 6 : 10),
           _summaryCards(report.summary, mobile),
-          SizedBox(height: mobile ? 12 : 16),
+          SizedBox(height: mobile ? 10 : 16),
           Container(
             width: double.infinity,
-            padding: const EdgeInsets.all(10),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
             decoration: BoxDecoration(
-              color: AppTheme.lightGray,
+              color: const Color(0xFFF8FAFC),
               borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xFFE2E8F0)),
             ),
             child: Text(
-              'NOTE: This report shows all clients and their payment status '
-              'as of the report date.',
-              style: AppTheme.bodySmall,
+              report.meta.periodNote,
+              style: const TextStyle(fontSize: 11, color: AppTheme.mutedText),
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
           Align(
             alignment: mobile ? Alignment.center : Alignment.centerRight,
             child: Column(
@@ -67,9 +69,16 @@ class PaymentHistoryReportView extends StatelessWidget {
               children: [
                 Text(
                   report.meta.preparedBy,
-                  style: AppTheme.bodySmall.copyWith(fontWeight: FontWeight.w600),
+                  style: const TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w600,
+                    color: AppTheme.darkText,
+                  ),
                 ),
-                Text('Attorney at Law', style: AppTheme.bodySmall),
+                Text(
+                  report.meta.preparedByTitle,
+                  style: const TextStyle(fontSize: 10.5, color: AppTheme.mutedText),
+                ),
               ],
             ),
           ),
@@ -84,9 +93,9 @@ class PaymentHistoryReportView extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              const BrandLogo(size: 56),
+              const BrandLogo(size: 38),
               const SizedBox(width: 10),
               Expanded(
                 child: Column(
@@ -94,12 +103,21 @@ class PaymentHistoryReportView extends StatelessWidget {
                   children: [
                     Text(
                       report.meta.firmName,
-                      style: AppTheme.bodyMedium
-                          .copyWith(fontWeight: FontWeight.bold),
+                      style: const TextStyle(
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.bold,
+                        color: AppTheme.darkText,
+                      ),
                     ),
                     if (report.meta.firmAddress.trim().isNotEmpty) ...[
-                      const SizedBox(height: 2),
-                      Text(report.meta.firmAddress, style: AppTheme.bodySmall),
+                      const SizedBox(height: 1),
+                      Text(
+                        report.meta.firmAddress,
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: AppTheme.mutedText,
+                        ),
+                      ),
                     ],
                   ],
                 ),
@@ -108,33 +126,45 @@ class PaymentHistoryReportView extends StatelessWidget {
           ),
           if (report.meta.firmPhone.trim().isNotEmpty ||
               report.meta.firmEmail.trim().isNotEmpty) ...[
-            const SizedBox(height: 6),
+            const SizedBox(height: 4),
             Wrap(
               spacing: 8,
-              runSpacing: 4,
+              runSpacing: 2,
               children: [
                 if (report.meta.firmPhone.trim().isNotEmpty)
-                  Text(report.meta.firmPhone, style: AppTheme.bodySmall),
+                  Text(
+                    report.meta.firmPhone,
+                    style: const TextStyle(fontSize: 10.5, color: AppTheme.mutedText),
+                  ),
                 if (report.meta.firmEmail.trim().isNotEmpty)
-                  Text(report.meta.firmEmail, style: AppTheme.bodySmall),
+                  Text(
+                    report.meta.firmEmail,
+                    style: const TextStyle(fontSize: 10.5, color: AppTheme.mutedText),
+                  ),
               ],
             ),
           ],
-          const SizedBox(height: 12),
-          const Divider(height: 1),
-          const SizedBox(height: 12),
-          Text(
+          const SizedBox(height: 8),
+          const Divider(height: 1, color: Color(0xFFE2E8F0)),
+          const SizedBox(height: 8),
+          const Text(
             'PAYMENT HISTORY REPORT',
-            style: AppTheme.heading4.copyWith(
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w800,
               color: AppTheme.deepNavy,
-              fontSize: 16,
+              letterSpacing: 0.2,
             ),
           ),
-          const SizedBox(height: 4),
-          Text('Report Date: ${report.meta.reportDate}',
-              style: AppTheme.bodySmall),
-          Text('Prepared By: ${report.meta.preparedBy}',
-              style: AppTheme.bodySmall),
+          const SizedBox(height: 2),
+          Text(
+            'Report Date: ${report.meta.reportDate}',
+            style: const TextStyle(fontSize: 11, color: AppTheme.mutedText),
+          ),
+          Text(
+            'Prepared By: ${report.meta.preparedBy}',
+            style: const TextStyle(fontSize: 11, color: AppTheme.mutedText),
+          ),
         ],
       );
     }
@@ -199,11 +229,11 @@ class PaymentHistoryReportView extends StatelessWidget {
   Widget _mobileRowCard(int no, PaymentReportRow row) {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: AppTheme.borderGray),
+        border: Border.all(color: const Color(0xFFE2E8F0)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -211,8 +241,8 @@ class PaymentHistoryReportView extends StatelessWidget {
           Row(
             children: [
               Container(
-                width: 28,
-                height: 28,
+                width: 22,
+                height: 22,
                 alignment: Alignment.center,
                 decoration: BoxDecoration(
                   color: AppTheme.deepNavy.withValues(alpha: 0.08),
@@ -222,71 +252,179 @@ class PaymentHistoryReportView extends StatelessWidget {
                   '$no',
                   style: const TextStyle(
                     fontWeight: FontWeight.bold,
-                    fontSize: 12,
+                    fontSize: 11,
                     color: AppTheme.deepNavy,
                   ),
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 8),
               Expanded(
-                child: Text(
-                  row.clientName,
-                  style: AppTheme.bodyMedium.copyWith(
-                    fontWeight: FontWeight.w600,
-                  ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      row.clientName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 13,
+                        color: AppTheme.darkText,
+                      ),
+                    ),
+                    if (row.caseNumber.trim().isNotEmpty) ...[
+                      const SizedBox(height: 1),
+                      Text(
+                        'Case: ${row.caseNumber}',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w500,
+                          color: AppTheme.mutedText,
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
               ),
               _statusChip(row.statusLabel),
             ],
           ),
-          const SizedBox(height: 10),
-          _mobileDetailRow('Case No.', row.caseNumber),
-          _mobileDetailRow('Total Fee', Currency.peso(row.totalFee)),
-          _mobileDetailRow('Total Paid', Currency.peso(row.totalPaid)),
-          _mobileDetailRow(
-            'Remaining Balance',
-            Currency.peso(row.remainingBalance),
-            valueColor: row.remainingBalance > 0
-                ? AppTheme.error
-                : AppTheme.success,
-          ),
-          _mobileDetailRow(
-            'Last Payment',
-            row.lastPaymentDate != null
-                ? DateFormat('MMM dd, yyyy').format(row.lastPaymentDate!)
-                : '—',
-          ),
-          _mobileDetailRow('Recorded By', row.lastRecordedBy ?? '—'),
-        ],
-      ),
-    );
-  }
-
-  Widget _mobileDetailRow(
-    String label,
-    String value, {
-    Color? valueColor,
-  }) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 118,
-            child: Text(
-              label,
-              style: AppTheme.bodySmall.copyWith(color: AppTheme.mutedText),
+          const SizedBox(height: 8),
+          // 3-Column Financial Micro-Strip
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF8FAFC),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xFFE2E8F0)),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Total Fee',
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w500,
+                          color: AppTheme.mutedText,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          Currency.peso(row.totalFee),
+                          style: const TextStyle(
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w700,
+                            color: AppTheme.darkText,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Container(
+                  height: 22,
+                  width: 1,
+                  color: const Color(0xFFCBD5E1),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Total Paid',
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w500,
+                          color: AppTheme.mutedText,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          Currency.peso(row.totalPaid),
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.green.shade700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Container(
+                  height: 22,
+                  width: 1,
+                  color: const Color(0xFFCBD5E1),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Remaining',
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w500,
+                          color: AppTheme.mutedText,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          Currency.peso(row.remainingBalance),
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w800,
+                            color: row.remainingBalance > 0
+                                ? const Color(0xFFD97706)
+                                : Colors.green.shade700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ),
           ),
-          Expanded(
-            child: Text(
-              value,
-              style: AppTheme.bodySmall.copyWith(
-                fontWeight: FontWeight.w600,
-                color: valueColor ?? AppTheme.darkText,
+          const SizedBox(height: 6),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                row.lastPaymentDate != null
+                    ? 'Last: ${DateFormat('MMM dd, yyyy').format(row.lastPaymentDate!)}'
+                    : 'Last: —',
+                style: const TextStyle(
+                  fontSize: 10.5,
+                  color: AppTheme.mutedText,
+                ),
               ),
-            ),
+              if (row.lastRecordedBy?.isNotEmpty == true)
+                Text(
+                  'By: ${row.lastRecordedBy}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 10.5,
+                    color: AppTheme.mutedText,
+                  ),
+                ),
+            ],
           ),
         ],
       ),
@@ -372,49 +510,33 @@ class PaymentHistoryReportView extends StatelessWidget {
   Widget _summaryCards(PaymentReportSummary s, bool mobile) {
     final cards = [
       _summaryCard(
-        'TOTAL UNPAID CASES',
+        'UNPAID',
         s.unpaidCount,
         Currency.peso(s.unpaidAmount),
         AppTheme.error,
       ),
       _summaryCard(
-        'TOTAL PARTIALLY PAID CASES',
+        'PARTIAL',
         s.partialCount,
         Currency.peso(s.partialAmount),
         AppTheme.warning,
       ),
       _summaryCard(
-        'TOTAL FULLY PAID CASES',
+        'PAID',
         s.paidCount,
         Currency.peso(s.paidAmount),
         AppTheme.success,
       ),
     ];
 
-    if (mobile) {
-      return Column(
-        children: cards
-            .map(
-              (c) => Padding(
-                padding: const EdgeInsets.only(bottom: 8),
-                child: SizedBox(width: double.infinity, child: c),
-              ),
-            )
-            .toList(),
-      );
-    }
-
     return Row(
-      children: cards
-          .map(
-            (c) => Expanded(
-              child: Padding(
-                padding: const EdgeInsets.only(right: 8),
-                child: c,
-              ),
-            ),
-          )
-          .toList(),
+      children: [
+        Expanded(child: cards[0]),
+        const SizedBox(width: 6),
+        Expanded(child: cards[1]),
+        const SizedBox(width: 6),
+        Expanded(child: cards[2]),
+      ],
     );
   }
 
@@ -425,39 +547,46 @@ class PaymentHistoryReportView extends StatelessWidget {
     Color color,
   ) {
     return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(8),
         border: Border.all(color: color.withValues(alpha: 0.25)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
         children: [
           Text(
             title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
             style: TextStyle(
-              fontSize: 10,
+              fontSize: 9.5,
               fontWeight: FontWeight.w700,
               color: color,
             ),
           ),
-          const SizedBox(height: 6),
+          const SizedBox(height: 3),
           Text(
             '$count',
             style: TextStyle(
-              fontSize: 28,
+              fontSize: 18,
               fontWeight: FontWeight.bold,
               color: color,
             ),
           ),
-          Text(
-            'Total Amount: $amount',
-            style: TextStyle(
-              fontSize: 11,
-              fontWeight: FontWeight.w600,
-              color: color,
+          const SizedBox(height: 2),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(
+              amount,
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                color: color,
+              ),
             ),
           ),
         ],

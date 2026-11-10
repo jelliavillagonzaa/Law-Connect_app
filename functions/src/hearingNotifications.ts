@@ -7,6 +7,13 @@ import {
   sendHearingReminderPhilSms,
   buildHearingSmsText,
   hearingFieldsForSms,
+  hearingLocation,
+  formatHearingSmsTime,
+  formatHearingSmsLocation,
+  formatHearingSmsCaseNumber,
+  hearingSmsCaptionLines,
+  extractHearingDateFromOrderText,
+  extractHearingTimeFromOrderText,
   type PhilSmsHearingCfg,
   type SemaphoreHearingCfg,
 } from "./hearingSmsAlerts";
@@ -31,8 +38,12 @@ export const OBSOLETE_HEARING_REMINDER_KINDS: readonly string[] = [
   "m5",
   "same_day",
 ];
-/** Jobs older than this are skipped instead of sending a late SMS. */
-export const HEARING_REMINDER_LATE_GRACE_MS = 15 * 60 * 1000;
+/**
+ * A reminder still sends if the scheduler picks it up within a day.
+ * 15 minutes was dropping the before-hearing text whenever the job ran late,
+ * so the next day had no SMS and no reminder notification.
+ */
+export const HEARING_REMINDER_LATE_GRACE_MS = 24 * 60 * 60 * 1000;
 
 /** App “activity” rows + imported court rows (caseNo / fullText). */
 export type HearingDoc = {
@@ -99,7 +110,7 @@ function parseHearingDateTimeFromFullText(
 ): Date | null {
   const t = fullText.replace(/\*+/g, " ").replace(/\s+/g, " ");
   const re =
-    /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s*(\d{4})\s+at\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(A\.?M\.?|P\.?M\.?)?/i;
+    /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s*(\d{4})\s+at\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(A\.?M\.?|P\.?M\.?)?/i;
   const m = t.match(re);
   if (!m) return null;
   const monKey = m[1].toLowerCase();
@@ -147,26 +158,28 @@ function extractTimeForParse(timeStr: string): string {
   return `${hour}:${min} ${ampm}`;
 }
 
-function hearingAtFromDoc(d: HearingDoc): Date | null {
+export function hearingAtFromDoc(d: HearingDoc): Date | null {
   const t = d.hearingDateTime;
   if (t && typeof (t as admin.firestore.Timestamp).toDate === "function") {
     const dt = (t as admin.firestore.Timestamp).toDate();
     if (!isNaN(dt.getTime())) return dt;
   }
   const row = d as Record<string, unknown>;
-  const hearingDate = asString(row.hearingDate);
-  const hearingTime = asString(row.hearingTime);
+  const ft = asString(d.fullText);
+  const hearingDate =
+    asString(row.hearingDate) || (ft ? extractHearingDateFromOrderText(ft) : "");
+  const hearingTime =
+    asString(row.hearingTime) || (ft ? extractHearingTimeFromOrderText(ft) : "");
   if (hearingDate) {
     const combined = hearingTime
       ? `${hearingDate} at ${extractTimeForParse(hearingTime)}`
-      : hearingDate;
+      : `${hearingDate} at 9:00 AM`;
     const parsed = parseHearingDateTimeFromFullText(
       combined,
       hearingTimeZoneOffset(d),
     );
     if (parsed) return parsed;
   }
-  const ft = asString(d.fullText);
   if (ft) {
     const parsed = parseHearingDateTimeFromFullText(ft, hearingTimeZoneOffset(d));
     if (parsed) return parsed;
@@ -198,10 +211,23 @@ async function laterDuplicateOfExistingHearing(
   hearingDocId: string,
   d: HearingDoc,
 ): Promise<boolean> {
+  const earlier = await findEarlierDuplicateHearing(db, hearingDocId, d);
+  return earlier != null;
+}
+
+/**
+ * Earlier same caseNo + hearing clock. Used to skip spam — but only when that
+ * earlier row already delivered SMS or FCM. Otherwise re-ingest stays silent.
+ */
+async function findEarlierDuplicateHearing(
+  db: admin.firestore.Firestore,
+  hearingDocId: string,
+  d: HearingDoc,
+): Promise<(HearingDoc & Record<string, unknown> & { id: string }) | null> {
   const caseNo = asString(d.caseNo).trim();
   const key = caseDigitKey(caseNo);
   const at = hearingAtFromDoc(d);
-  if (!key || !at || isPlaceholderCaseNo(caseNo)) return false;
+  if (!key || !at || isPlaceholderCaseNo(caseNo)) return null;
 
   let snap: QuerySnapshot;
   try {
@@ -211,10 +237,12 @@ async function laterDuplicateOfExistingHearing(
       hearingDocId,
       err: e instanceof Error ? e.message : String(e),
     });
-    return false;
+    return null;
   }
 
   const mine = docCreatedMs(d as Record<string, unknown>);
+  let best: (HearingDoc & Record<string, unknown> & { id: string }) | null = null;
+  let bestCreated = Number.POSITIVE_INFINITY;
   for (const doc of snap.docs) {
     if (doc.id === hearingDocId) continue;
     const other = doc.data() as HearingDoc & Record<string, unknown>;
@@ -222,10 +250,24 @@ async function laterDuplicateOfExistingHearing(
     const otherAt = hearingAtFromDoc(other);
     if (!otherAt || Math.abs(otherAt.getTime() - at.getTime()) > 60 * 1000) continue;
     const otherCreated = docCreatedMs(other);
-    if (otherCreated > 0 && (mine === 0 || otherCreated < mine)) return true;
-    if (otherCreated === mine && doc.id < hearingDocId) return true;
+    const isEarlier =
+      (otherCreated > 0 && (mine === 0 || otherCreated < mine)) ||
+      (otherCreated === mine && doc.id < hearingDocId);
+    if (!isEarlier) continue;
+    if (otherCreated < bestCreated || (otherCreated === bestCreated && (!best || doc.id < best.id))) {
+      bestCreated = otherCreated;
+      best = { ...other, id: doc.id };
+    }
   }
-  return false;
+  return best;
+}
+
+function hearingAlreadyNotified(data: Record<string, unknown>): boolean {
+  return (
+    data.philsmsLastSentAt != null ||
+    data.fcmDeliveredAt != null ||
+    data.fcmMobileDeliveredAt != null
+  );
 }
 
 /** One in-app notice + one SMS set per case number and hearing time. */
@@ -273,8 +315,7 @@ function isPlaceholderCaseNo(cn: string): boolean {
     s === "n/a" ||
     s === "na" ||
     s === "none" ||
-    s === "unknown" ||
-    s === "test"
+    s === "unknown"
   );
 }
 
@@ -303,8 +344,8 @@ function isProductOrDevEmailBlob(blob: string): boolean {
 
 export function isImportedCourtRow(d: HearingDoc): boolean {
   const cn = asString(d.caseNo);
-  if (isPlaceholderCaseNo(cn)) return false;
-  return cn.length > 0 && asString(d.fullText).length > 0;
+  const text = asString(d.fullText) || asString(d.message);
+  return text.length > 0 || cn.length > 0;
 }
 
 function isGibberishToken(raw: string): boolean {
@@ -370,11 +411,18 @@ export function isJunkHearingDoc(d: HearingDoc): boolean {
   ) {
     return true;
   }
+  // Any real or test court orders, n8n imports, or hearings with order text must NEVER be blocked
+  if (
+    isN8nOrCourtImport(d) ||
+    asString(d.fullText).length > 0 ||
+    hearingSource(d) === "n8n" ||
+    asString(d.caseTitle).length > 0
+  ) {
+    return false;
+  }
   if (isPlaceholderCaseNo(asString(d.caseNo)) && !isImportedCourtRow(d)) {
     return true;
   }
-  // Real n8n court imports still deliver.
-  if (isN8nOrCourtImport(d)) return false;
   const title = asString(d.caseTitle) || asString(d.message);
   const message = asString(d.message);
   if (isGibberishPhrase(title) || isGibberishPhrase(message)) return true;
@@ -602,9 +650,299 @@ export function splitHearingPartyNames(raw: string): string[] {
     if (out.some((e) => e.toLowerCase() === p.toLowerCase())) return;
     out.push(p);
   };
-  for (const p of s.split(/\s*(?:,|;|\/|\band\b|&)\s*/i)) add(p);
+  for (const p of s.split(/\s*(?:,|;|\/|\band\b|&|\bvs\.?(?=\s|$)|\bversus\b|\bv\.(?=\s))\s*/i)) add(p);
   for (const p of extras) add(p);
   return out;
+}
+
+function isPlaceholderDocketToken(raw: string): boolean {
+  const s = raw.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!s) return true;
+  const stripped = s
+    .replace(
+      /^(?:civil|criminal|special(?:\s+proceedings)?|spec\.?\s*(?:proc\.?)?)?\s*case\s*(?:no\.?|number|#)?\s*[:\-|]*\s*/i,
+      "",
+    )
+    .trim();
+  const placeholders = new Set([
+    "sample",
+    "test",
+    "court",
+    "court order",
+    "court hearing",
+    "hearing",
+    "order",
+    "n/a",
+    "na",
+    "none",
+    "unknown",
+    "pending",
+    "tbd",
+  ]);
+  return placeholders.has(s) || placeholders.has(stripped);
+}
+
+function cleanExtractedDocketNo(raw: string): string {
+  const s = raw.replace(/[|]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!s || isPlaceholderDocketToken(s)) return "";
+  const stripped = s
+    .replace(
+      /^(?:civil|criminal|special(?:\s+proceedings)?|spec\.?\s*(?:proc\.?)?)?\s*case\s*(?:no\.?|number|#)?\s*[:\-|]*\s*/i,
+      "",
+    )
+    .replace(/^[#:\-|]+\s*/, "")
+    .replace(/[.,;|]+$/, "")
+    .trim();
+  if (stripped && !isPlaceholderDocketToken(stripped)) return stripped;
+  return s;
+}
+
+function sanitizeCaptionText(raw: string): string {
+  return raw
+    .replace(/[\w.+-]+@,?\s*[\w.-]+\.\w{2,}/gi, " ")
+    .replace(/SAMPLE\s*[-–—]?\s*NOT AN OFFICIAL COURT DOCUMENT\.?/gi, " ")
+    .replace(/Sample document layout only\.?/gi, " ")
+    .replace(/^[|:\-\s]+/, "")
+    .replace(/[|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/[.,;|]+$/, "")
+    .trim();
+}
+
+function extractCaseNoFromOrderText(text: string): string {
+  const patterns: RegExp[] = [
+    /\b(?:spec(?:ial)?\.?\s*(?:proc(?:eedings)?\.?\s*)?|civil\s+|criminal\s+)case\s*(?:no\.?|number|#)\s*[:\-|]*\s*([A-Za-z0-9][A-Za-z0-9\-_/]*)/gi,
+    /\bcase\s*(?:no\.?|number|#)\s*[:\-|]+\s*([A-Za-z0-9][A-Za-z0-9\-_/]*)/gi,
+    /\bdocket\s*(?:no\.?|number|#)?\s*[:\-|]+\s*([A-Za-z0-9][A-Za-z0-9\-_/]*)/gi,
+    /\b(\d{2,4}-\d{3,}(?:-[A-Za-z0-9]+)?)\b/g,
+  ];
+  for (const re of patterns) {
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const cleaned = cleanExtractedDocketNo(m[1] || "");
+      if (cleaned) return cleaned;
+    }
+  }
+  return "";
+}
+
+function extractCaseTitleFromOrderText(text: string): string {
+  const capped = text.slice(0, 6000);
+  if (!capped.trim()) return "";
+
+  const explicit = capped.match(
+    /^\s*(?:case\s*title|caption|title\s+of\s+(?:the\s+)?case)\s*[:\-|]+\s*([^\r\n]+)/im,
+  );
+  if (explicit?.[1]) {
+    const cleaned = sanitizeCaptionText(explicit[1]);
+    if (cleaned.length >= 5 && !isPlaceholderDocketToken(cleaned)) {
+      return cleaned;
+    }
+  }
+
+  const lines = capped
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    if (line.length < 10 || line.length > 200) continue;
+    if (!/\b(?:vs\.?|versus)\b/i.test(line)) continue;
+    const stripped = sanitizeCaptionText(
+      line.replace(/^(?:case\s*(?:no\.?|number|title|caption)\s*[:\-|]?\s*)/i, ""),
+    );
+    if (stripped.length >= 10 && /\b(?:vs\.?|versus)\b/i.test(stripped)) {
+      return stripped;
+    }
+  }
+
+  const vsIdx = lines.findIndex(
+    (l) =>
+      /^[-–—]?\s*(?:versus|vs\.?)\s*[-–—]?$/i.test(l) ||
+      /[-–—]\s*versus\s*[-–—]/i.test(l),
+  );
+  if (vsIdx > 0) {
+    const plaintiffLines: string[] = [];
+    for (let i = vsIdx - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (
+        /^(?:Republic|REGIONAL|MUNICIPAL|METROPOLITAN|\d+(?:st|nd|rd|th)\s+Judicial|BRANCH|Email|Contact|COURT)/i.test(
+          line,
+        )
+      ) {
+        break;
+      }
+      if (/^(?:Plaintiffs?|Petitioners?|Complainants?),?$/i.test(line)) continue;
+      plaintiffLines.unshift(line);
+    }
+    const mainPlaintiff = sanitizeCaptionText(
+      plaintiffLines.join(" ").split(/,?\s*Namely:/i)[0] || "",
+    );
+
+    const defLines: string[] = [];
+    for (let i = vsIdx + 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (/^(?:Civil|Criminal|Special|Spec\.?)\s*Case/i.test(line)) continue;
+      if (/^(?:For\s*:|Recovery of|Ownership|Possession|Damages|Injunction)/i.test(line)) {
+        continue;
+      }
+      if (/^[xX]\s*[-–—]+\s*[xX]$/.test(line) || /^ORDER$/i.test(line)) break;
+      if (/(?:Defendants?|Respondents?|Accused),?\.?$/i.test(line)) {
+        const cleaned = line
+          .replace(/,?\s*(?:Defendants?|Respondents?|Accused),?\.?$/i, "")
+          .trim();
+        if (cleaned) defLines.push(cleaned);
+        break;
+      }
+      defLines.push(line);
+    }
+    const defendants = sanitizeCaptionText(defLines.join(" "));
+    if (mainPlaintiff.length >= 3 && defendants.length >= 3) {
+      return `${mainPlaintiff} vs. ${defendants}`;
+    }
+  }
+
+  return "";
+}
+
+function extractCleanVenueFromOrderText(text: string, fallback = ""): string {
+  const branchFull = text.match(
+    /branch\s*(?:no\.?\s*)?(\d+)(?:\s*[-–—]\s*([^\r\n]+)|,\s*([^\r\n]+))/i,
+  );
+  if (branchFull) {
+    const branchNum = branchFull[1];
+    const city = (branchFull[2] || branchFull[3] || "")
+      .replace(/[|]+/g, " ")
+      .replace(/[.,\s]+$/, "")
+      .trim();
+    if (city) return `Branch ${branchNum} - ${city}`;
+  }
+
+  const branchMatch = text.match(/\bbranch\s*[:\-|]*\s*(?:branch\s*)?(\d+)/i);
+  const rtcMatch = text.match(
+    /((?:regional|municipal|metropolitan)\s+trial\s+court[^\r\n,]{0,80})/i,
+  );
+  let city = "";
+  const cityLineMatch = text.match(
+    /^[ \t]*([A-Za-z][A-Za-z .,'\-]{1,60}?\bCity(?:\s*,\s*[A-Za-z .'\-]{2,40})?)[ \t]*$/im,
+  );
+  if (cityLineMatch?.[1]) {
+    city = cityLineMatch[1].replace(/\s+/g, " ").replace(/[.,\s]+$/, "").trim();
+  } else {
+    const inlineCity = text.match(/\b([A-Za-z][A-Za-z .]{1,35}?\bCity)\b/i);
+    if (inlineCity?.[1]) {
+      city = inlineCity[1].replace(/\s+/g, " ").trim();
+    }
+  }
+
+  const parts: string[] = [];
+  if (branchMatch?.[1]) parts.push(`Branch ${branchMatch[1]}`);
+  if (rtcMatch?.[1]) {
+    let court = rtcMatch[1].replace(/\s+/g, " ").trim();
+    if (city && !court.toLowerCase().includes(city.toLowerCase())) {
+      court = `${court}, ${city}`;
+    }
+    parts.push(court);
+  } else if (city) {
+    parts.push(city);
+  }
+
+  if (parts.length >= 2) return parts.join(" — ");
+  if (parts.length === 1) return parts[0];
+  return fallback;
+}
+
+export function extractOrderStructuredFields(raw: Record<string, unknown>): {
+  caseNo: string;
+  caseTitle: string;
+  clientName: string;
+  courtBranch: string;
+  location: string;
+  hearingDate: string;
+  hearingTime: string;
+  involvedPartyNames: string[];
+} {
+  const blob = [
+    asString(raw.fullText),
+    asString(raw.orderText),
+    asString(raw.message),
+    asString(raw.summary),
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+
+  let caseNo = cleanExtractedDocketNo(asString(raw.caseNo));
+  if (!caseNo && asString(raw.caseNo)) {
+    caseNo = asString(raw.caseNo);
+  }
+  if ((!caseNo || isPlaceholderDocketToken(caseNo)) && blob) {
+    const extractedNo = extractCaseNoFromOrderText(blob);
+    if (extractedNo) caseNo = extractedNo;
+  }
+
+  let caseTitle = sanitizeCaptionText(asString(raw.caseTitle));
+  if (
+    (!caseTitle ||
+      caseTitle.toLowerCase() === "hearing" ||
+      caseTitle.toLowerCase() === "court hearing" ||
+      caseTitle.toLowerCase() === "court order") &&
+    blob
+  ) {
+    const extractedTitle = extractCaseTitleFromOrderText(blob);
+    if (extractedTitle) caseTitle = extractedTitle;
+  }
+
+  const existingParties = Array.isArray(raw.involvedPartyNames)
+    ? raw.involvedPartyNames.map((p) => asString(p)).filter(Boolean)
+    : [];
+  const rawClient = sanitizeCaptionText(asString(raw.clientName));
+  const partyBlob = [rawClient, ...existingParties, caseTitle]
+    .filter(Boolean)
+    .join(", ");
+  const involvedPartyNames = splitHearingPartyNames(partyBlob);
+
+  let clientName = rawClient;
+  if (!clientName && involvedPartyNames.length) {
+    clientName = involvedPartyNames.join(", ");
+  }
+
+  let hearingDate = asString(raw.hearingDate);
+  if (!hearingDate && blob) {
+    hearingDate = extractHearingDateFromOrderText(blob);
+  }
+
+  let hearingTime = asString(raw.hearingTime);
+  if (!hearingTime && blob) {
+    hearingTime = extractHearingTimeFromOrderText(blob);
+  }
+
+  let courtBranch = asString(raw.courtBranch);
+  let location = asString(raw.location);
+  if ((!location || /^(?:branch\s*\d*|\d+)[\s,.]*$/i.test(location)) && blob) {
+    const cleanVenue = extractCleanVenueFromOrderText(blob, location || courtBranch);
+    if (cleanVenue) {
+      location = cleanVenue;
+      if (!courtBranch) courtBranch = cleanVenue;
+    }
+  }
+  if (!location) {
+    location = hearingLocation(raw as HearingDoc & Record<string, unknown>) || courtBranch;
+  }
+  if (!courtBranch && location) {
+    courtBranch = location;
+  }
+
+  return {
+    caseNo,
+    caseTitle,
+    clientName,
+    courtBranch,
+    location,
+    hearingDate,
+    hearingTime,
+    involvedPartyNames,
+  };
 }
 
 function significantNameWords(raw: string): string[] {
@@ -663,6 +1001,21 @@ function normNamePart(s: string): string {
   return normalizeWhitespace(s).toLowerCase();
 }
 
+export function stripPartyRolesAndTitles(raw: string): string {
+  let s = raw.trim();
+  s = s.replace(
+    /\b(?:accused|defendant|petitioner|respondent|complainant|plaintiff|appellant|appellee|witness|victim)\b/gi,
+    " ",
+  );
+  s = s.replace(
+    /\b(?:mr\.?|ms\.?|mrs\.?|atty\.?|atty|attorney|judge|hon\.?)\b/gi,
+    " ",
+  );
+  s = s.replace(/[()[\]{}]/g, " ");
+  s = s.replace(/[-–—]/g, " ");
+  return s.replace(/\s+/g, " ").trim();
+}
+
 /**
  * From court `clientName`: first word = first name, last word = last name (middle ignored).
  * "Jerome Castillo" or "Jerome L. Castillo" → { first: Jerome, last: Castillo }
@@ -670,7 +1023,10 @@ function normNamePart(s: string): string {
 export function parseFirstLastFromHearingName(
   hearingClientName: string,
 ): { first: string; last: string } | null {
-  const parts = normalizeWhitespace(hearingClientName).split(" ").filter(Boolean);
+  const cleaned = stripPartyRolesAndTitles(hearingClientName);
+  const parts = normalizeWhitespace(cleaned || hearingClientName)
+    .split(" ")
+    .filter(Boolean);
   if (parts.length < 2) return null;
   if (parts.length === 2) {
     return { first: parts[0], last: parts[1] };
@@ -684,8 +1040,12 @@ export function namesPartialMatchForClient(
   hearingClientName: string,
 ): boolean {
   if (partyMatchesStoredName(stored, hearingClientName)) return true;
+  const stripped = stripPartyRolesAndTitles(hearingClientName);
+  if (stripped && partyMatchesStoredName(stored, stripped)) return true;
   for (const party of splitHearingPartyNames(hearingClientName)) {
     if (partyMatchesStoredName(stored, party)) return true;
+    const strippedParty = stripPartyRolesAndTitles(party);
+    if (strippedParty && partyMatchesStoredName(stored, strippedParty)) return true;
   }
   return false;
 }
@@ -693,18 +1053,43 @@ export function namesPartialMatchForClient(
 export function clientProfileMatchesHearingClientName(
   data: Record<string, unknown> | undefined,
   hearingClientName: string,
+  opts?: { caseTitle?: string; fullText?: string },
 ): boolean {
-  if (!data || !hearingClientName.trim()) return false;
+  if (!data) return false;
+  const searchBlob = [
+    hearingClientName,
+    opts?.caseTitle ?? "",
+    opts?.fullText ?? "",
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  if (!searchBlob) return false;
+
   for (const field of ["fullName", "name", "displayName"] as const) {
     const stored = asString(data[field]);
-    if (stored && namesPartialMatchForClient(stored, hearingClientName)) {
+    if (stored && namesPartialMatchForClient(stored, searchBlob)) {
       return true;
     }
   }
-  const first = asString(data.firstName);
-  const last = asString(data.lastName);
-  if (first && last && namesPartialMatchForClient(`${first} ${last}`, hearingClientName)) {
-    return true;
+
+  const first = asString(data.firstName).trim();
+  const last = asString(data.lastName).trim();
+  if (first && last) {
+    if (namesPartialMatchForClient(`${first} ${last}`, searchBlob)) {
+      return true;
+    }
+    const lowerBlob = searchBlob.toLowerCase();
+    const fLower = first.toLowerCase();
+    const lLower = last.toLowerCase();
+    if (
+      fLower.length >= 3 &&
+      lLower.length >= 3 &&
+      lowerBlob.includes(fLower) &&
+      lowerBlob.includes(lLower)
+    ) {
+      return true;
+    }
   }
   return false;
 }
@@ -715,56 +1100,116 @@ export function clientProfileMatchesHearingClientName(
 export function clientSignUpMatchesHearingName(
   data: Record<string, unknown>,
   hearingClientName: string,
+  opts?: { caseTitle?: string; fullText?: string },
 ): boolean {
   const cn = hearingClientName.trim();
-  if (!cn) return false;
+  const blob = [cn, opts?.caseTitle ?? ""].filter(Boolean).join(", ").trim();
+  if (!blob) return false;
 
-  const parties = splitHearingPartyNames(cn);
-  const candidates = parties.length ? parties : [cn];
+  const parties = splitHearingPartyNames(blob);
+  const candidates = parties.length ? parties : [blob];
+
+  const signUpFirst = normNamePart(asString(data.firstName));
+  const signUpLast = normNamePart(asString(data.lastName));
 
   for (const party of candidates) {
+    const cleanedParty = stripPartyRolesAndTitles(party);
     for (const field of ["fullName", "name", "displayName"] as const) {
       const stored = asString(data[field]);
-      if (stored && clientNameExactMatch(stored, party)) return true;
+      if (stored && (clientNameExactMatch(stored, party) || (cleanedParty && clientNameExactMatch(stored, cleanedParty)))) {
+        return true;
+      }
     }
 
     const hearingParts = parseFirstLastFromHearingName(party);
-    if (!hearingParts) continue;
-
-    const signUpFirst = normNamePart(asString(data.firstName));
-    const signUpLast = normNamePart(asString(data.lastName));
-    if (!signUpFirst || !signUpLast) continue;
-
-    if (
-      signUpFirst === normNamePart(hearingParts.first) &&
-      signUpLast === normNamePart(hearingParts.last)
-    ) {
-      return true;
+    if (hearingParts && signUpFirst && signUpLast) {
+      if (
+        signUpFirst === normNamePart(hearingParts.first) &&
+        signUpLast === normNamePart(hearingParts.last)
+      ) {
+        return true;
+      }
     }
   }
+
+  if (opts?.fullText) {
+    const lowerText = opts.fullText.toLowerCase();
+    for (const field of ["fullName", "name", "displayName"] as const) {
+      const stored = asString(data[field]).trim().toLowerCase();
+      if (stored.length >= 4 && lowerText.includes(stored)) {
+        return true;
+      }
+    }
+    if (signUpFirst && signUpLast) {
+      if (
+        signUpFirst.length >= 3 &&
+        signUpLast.length >= 3 &&
+        lowerText.includes(signUpFirst) &&
+        lowerText.includes(signUpLast)
+      ) {
+        return true;
+      }
+    }
+  }
+
   return false;
 }
 
 export function clientInboxTitleFromHearing(d: HearingDoc, caseTitle: string): string {
   if (isImportedCourtRow(d)) {
     const cn = asString(d.caseNo);
-    return cn ? `New notice court hearings — ${cn}` : "New notice court hearings";
+    return cn ? `Court Hearing Notice — ${cn}` : "Court Hearing Notice";
   }
-  return `New notice court hearings — ${caseTitle}`;
+  return `Court Hearing Notice — ${caseTitle}`;
 }
 
-/** Resolve client user IDs from `hearings.clientName` (each named party). */
+/** Resolve client user IDs from `hearings.clientName` / caseTitle / fullText (each named party). */
 export async function resolveClientUidsByHearingName(
   db: admin.firestore.Firestore,
   clientName: string,
-  opts?: { scanAllClients?: boolean },
+  opts?: {
+    scanAllClients?: boolean;
+    caseTitle?: string;
+    fullText?: string;
+  },
 ): Promise<string[]> {
-  const cn = clientName.trim();
-  if (!cn) return [];
+  const rawCn = clientName.trim();
+  const rawCt = (opts?.caseTitle || "").trim();
+  const fullText = (opts?.fullText || "").trim();
+  if (!rawCn && !rawCt && !fullText) return [];
+
+  const extracted =
+    (!rawCn || !rawCt) && fullText
+      ? extractOrderStructuredFields({
+          clientName: rawCn,
+          caseTitle: rawCt,
+          fullText,
+        })
+      : null;
+  const cn = rawCn || extracted?.clientName || "";
+  const ct = rawCt || extracted?.caseTitle || "";
 
   const matched = new Set<string>();
-  const parties = splitHearingPartyNames(cn);
-  const queryNames = (parties.length ? parties : [cn]).slice(0, 12);
+  const partyBlob = [cn, ct].filter(Boolean).join(", ");
+  const parties = splitHearingPartyNames(partyBlob);
+  const candidateParties = new Set<string>(
+    (parties.length ? parties : [partyBlob]).filter(Boolean),
+  );
+  if (cn) {
+    const strippedCn = stripPartyRolesAndTitles(cn);
+    if (strippedCn) candidateParties.add(strippedCn);
+  }
+  if (ct) {
+    const vs = /\s+(?:vs\.?|versus)\s+/i;
+    for (const part of ct.split(vs)) {
+      const strippedPart = stripPartyRolesAndTitles(part);
+      if (strippedPart && !strippedPart.toLowerCase().includes("people")) {
+        candidateParties.add(strippedPart);
+      }
+    }
+  }
+
+  const queryNames = [...candidateParties].slice(0, 16);
   const fields = ["fullName", "name", "displayName"] as const;
 
   for (const party of queryNames) {
@@ -782,6 +1227,28 @@ export async function resolveClientUidsByHearingName(
         }
       }
     }
+
+    const hearingParts = parseFirstLastFromHearingName(party);
+    if (hearingParts) {
+      for (const first of clientNameQueryVariants(hearingParts.first).slice(0, 2)) {
+        for (const last of clientNameQueryVariants(hearingParts.last).slice(0, 2)) {
+          try {
+            const uq = await db
+              .collection("users")
+              .where("role", "==", "client")
+              .where("firstName", "==", first)
+              .where("lastName", "==", last)
+              .limit(10)
+              .get();
+            for (const u of uq.docs) {
+              matched.add(u.id);
+            }
+          } catch {
+            /* index may be missing */
+          }
+        }
+      }
+    }
   }
 
   if (opts?.scanAllClients === false) {
@@ -789,11 +1256,16 @@ export async function resolveClientUidsByHearingName(
   }
 
   try {
-    const cq = await db.collection("users").where("role", "==", "client").limit(250).get();
+    const cq = await db.collection("users").where("role", "==", "client").limit(300).get();
     for (const u of cq.docs) {
       if (matched.has(u.id)) continue;
       const data = u.data() as Record<string, unknown>;
-      if (clientProfileMatchesHearingClientName(data, cn)) {
+      if (
+        clientProfileMatchesHearingClientName(data, cn, {
+          caseTitle: ct,
+          fullText: opts?.fullText,
+        })
+      ) {
         matched.add(u.id);
       }
     }
@@ -812,18 +1284,57 @@ export async function resolveClientUidsByHearingName(
 export async function resolveClientUidsByExactHearingName(
   db: admin.firestore.Firestore,
   clientName: string,
+  opts?: { caseTitle?: string; fullText?: string },
 ): Promise<string[]> {
-  const cn = clientName.trim();
-  if (!cn) return [];
+  const rawCn = clientName.trim();
+  const rawCt = (opts?.caseTitle || "").trim();
+  const fullText = (opts?.fullText || "").trim();
+  if (!rawCn && !rawCt && !fullText) return [];
+
+  const extracted =
+    (!rawCn || !rawCt) && fullText
+      ? extractOrderStructuredFields({
+          clientName: rawCn,
+          caseTitle: rawCt,
+          fullText,
+        })
+      : null;
+  const cn = rawCn || extracted?.clientName || "";
+  const ct = rawCt || extracted?.caseTitle || "";
 
   const matched = new Set<string>();
-  const parties = splitHearingPartyNames(cn);
-  const queryNames = (parties.length ? parties : [cn]).slice(0, 12);
+  const partyBlob = [cn, ct].filter(Boolean).join(", ");
+  const parties = splitHearingPartyNames(partyBlob);
+  const candidateParties = new Set<string>(
+    (parties.length ? parties : [partyBlob]).filter(Boolean),
+  );
+  if (cn) {
+    const strippedCn = stripPartyRolesAndTitles(cn);
+    if (strippedCn) candidateParties.add(strippedCn);
+  }
+  if (ct) {
+    const vs = /\s+(?:vs\.?|versus)\s+/i;
+    for (const part of ct.split(vs)) {
+      const strippedPart = stripPartyRolesAndTitles(part);
+      if (strippedPart && !strippedPart.toLowerCase().includes("people")) {
+        candidateParties.add(strippedPart);
+      }
+    }
+  }
+
+  const queryNames = [...candidateParties].slice(0, 16);
   const fields = ["fullName", "name", "displayName"] as const;
 
   const tryAdd = (data: Record<string, unknown>, uid: string): void => {
     if (asString(data.role).toLowerCase() !== "client") return;
-    if (clientSignUpMatchesHearingName(data, cn)) matched.add(uid);
+    if (
+      clientSignUpMatchesHearingName(data, cn, {
+        caseTitle: ct,
+        fullText: opts?.fullText,
+      })
+    ) {
+      matched.add(uid);
+    }
   };
 
   for (const party of queryNames) {
@@ -872,13 +1383,14 @@ export async function resolveClientUidsByExactHearingName(
       tryAdd(u.data() as Record<string, unknown>, u.id);
     }
   } catch (e) {
-    logger.warn("hearingSms: exact client scan failed", {
+    logger.warn("hearingNotify: exact client scan failed", {
       err: e instanceof Error ? e.message : String(e),
     });
   }
 
   return [...matched];
 }
+
 
 /** Matched client + their assigned attorney/staff — not the whole firm. */
 async function addAssignedRecipientsForUnmatchedImport(
@@ -888,7 +1400,10 @@ async function addAssignedRecipientsForUnmatchedImport(
 ): Promise<void> {
   if (!isImportedCourtRow(d)) return;
 
-  for (const uid of await resolveClientUidsByHearingName(db, asString(d.clientName))) {
+  for (const uid of await resolveClientUidsByHearingName(db, asString(d.clientName), {
+    caseTitle: asString(d.caseTitle),
+    fullText: asString(d.fullText),
+  })) {
     recipients.add(uid);
     try {
       const u = await db.collection("users").doc(uid).get();
@@ -947,7 +1462,23 @@ async function collectCoreHearingRecipients(
     for (const u of uids) recipients.add(u);
   }
   for (const u of extractExtraUids(d)) recipients.add(u);
-  for (const uid of await resolveClientUidsByHearingName(db, asString(d.clientName))) {
+
+  const rawRec = d as Record<string, unknown>;
+  for (const key of ["involvedClientIds", "matchedClientIds"]) {
+    const arr = rawRec[key];
+    if (Array.isArray(arr)) {
+      for (const uid of arr) {
+        if (typeof uid === "string" && uid) recipients.add(uid);
+      }
+    }
+  }
+  const owner = asString(rawRec.ownerClientId);
+  if (owner) recipients.add(owner);
+
+  for (const uid of await resolveClientUidsByHearingName(db, asString(d.clientName), {
+    caseTitle: asString(d.caseTitle),
+    fullText: asString(d.fullText),
+  })) {
     recipients.add(uid);
   }
   if (!recipients.size) {
@@ -1274,80 +1805,117 @@ export function buildNotificationBody(
   return body;
 }
 
-const HEARING_MONTH =
-  "(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)";
-
-/** Date the order sets ("reset the pre-trial on October 28"), not the signing date. */
-function nextSetHearingLabel(d: HearingDoc): string {
-  const blobs = [asString(d.fullText), asString(d.message), asString(d.hearingTime)];
-  const re = new RegExp(
-    `(?:reset|set|schedul\\w*|next hearing)\\b[^\\n.]{0,80}?\\bon\\s+${HEARING_MONTH}\\.?\\s+(\\d{1,2}),?\\s+(\\d{4})`,
-    "i",
-  );
-  for (const blob of blobs) {
-    if (!blob) continue;
-    const m = re.exec(blob);
-    if (!m) continue;
-    const window = blob.slice(m.index + m[0].length, Math.min(blob.length, m.index + m[0].length + 48));
-    const clock = /(\d{1,2})(?::(\d{2}))?/.exec(window);
-    let time = "";
-    if (clock) {
-      let hour = Number(clock[1]);
-      const minute = clock[2] ?? "00";
-      const lower = window.toLowerCase();
-      const afternoon = lower.includes("pm") || lower.includes("afternoon") || lower.includes("evening");
-      const morning = lower.includes("am") || lower.includes("morning");
-      if (afternoon && hour < 12) hour += 12;
-      if (morning && hour === 12) hour = 0;
-      const h12 = hour % 12 === 0 ? 12 : hour % 12;
-      const ap = hour >= 12 ? "PM" : "AM";
-      time = `${h12}:${minute.padStart(2, "0")} ${ap}`;
-    }
-    const kind = /pre-?\s*trial/i.test(blob)
-      ? "Pre-trial"
-      : /arraignment/i.test(blob)
-        ? "Arraignment"
-        : /mediation/i.test(blob)
-          ? "Mediation"
-          : "Hearing";
-    return [kind, `${m[1]} ${m[2]}, ${m[3]}`, time].filter(Boolean).join(" ");
-  }
-  const date = asString(d.hearingDate);
-  const time = asString(d.hearingTime);
-  return [date, time].filter(Boolean).join(", ");
+/**
+ * Phone push tray body. Date is the first line so collapsed Android/iOS
+ * notifications always show the hearing date (SMS keeps the branded layout).
+ */
+function buildHearingPushBody(
+  d: HearingDoc,
+  fallback: string,
+  reminderKind?: string | null,
+): string {
+  const trimmedFallback = fallback.trim();
+  const fields = hearingFieldsForSms(d as HearingDoc & Record<string, unknown>);
+  const hasFacts = [
+    fields.caseNo,
+    fields.caseTitle,
+    fields.clientName,
+    fields.hearingDate,
+    fields.hearingTime,
+    fields.location,
+  ].some((value) => value.trim().length > 0);
+  if (!hasFacts) return trimmedFallback;
+  return buildHearingPushTrayText({
+    ...fields,
+    reminderKind: reminderKind ?? null,
+  });
 }
 
-/**
- * Locked hearing push body. Do not shorten or reorder:
- * Case No. / Client / Court / Branch, then Order / notice with the case
- * title and "{branch} · Hearing {Month D, YYYY}".
- */
-function buildHearingPushBody(d: HearingDoc, fallback: string): string {
-  const caseNo = asString(d.caseNo);
-  const client = asString(d.clientName);
-  const branch = asString(d.courtBranch);
-  const caseTitle = asString(d.caseTitle);
-  let when = nextSetHearingLabel(d).replace(
-    /\s+\d{1,2}:\d{2}\s*(?:AM|PM)\b/i,
-    "",
-  ).trim();
-  if (when && !/^(hearing|pre-trial|arraignment|mediation)\b/i.test(when)) {
-    when = `Hearing ${when}`;
-  }
-  const whenLine = [branch, when].filter(Boolean).join(" · ");
-
+function buildHearingPushTrayText(params: {
+  caseNo?: string;
+  caseTitle?: string;
+  clientName?: string;
+  hearingDate?: string;
+  hearingTime?: string;
+  location?: string;
+  reminderKind?: string | null;
+}): string {
+  const kind = (params.reminderKind ?? "").trim().toLowerCase();
   const lines: string[] = [];
-  if (caseNo) lines.push(`Case No.: ${caseNo}`);
-  if (client) lines.push(`Client: ${client}`);
-  if (branch) lines.push(`Court / Branch: ${branch}`);
-  if (caseTitle || whenLine) {
-    lines.push("", "Order / notice:");
-    if (caseTitle) lines.push(caseTitle);
-    if (whenLine) lines.push(whenLine);
+  const date = (params.hearingDate ?? "").trim();
+  const time = formatHearingSmsTime(params.hearingTime ?? "");
+  const loc = formatHearingSmsLocation(params.location ?? "");
+  const caseLine = formatHearingSmsCaseNumber(params.caseNo ?? "");
+
+  if (date) lines.push(`Date: ${date}`);
+  if (time) lines.push(`Time: ${time}`);
+  if (loc) lines.push(`Location: ${loc}`);
+  if (caseLine) lines.push(caseLine);
+
+  if (kind === "d5") lines.push("Your hearing is in 5 days.");
+  else if (kind === "d2") lines.push("Your hearing is in 2 days.");
+  else if (kind === "hearing_day" || kind === "day_noon") {
+    lines.push("Your hearing is today.");
   }
-  const out = lines.join("\n").trim();
-  if (out) return out.length > 900 ? `${out.slice(0, 897)}...` : out;
-  return fallback.trim();
+
+  const caption = hearingSmsCaptionLines(
+    params.caseTitle ?? "",
+    params.clientName ?? "",
+  );
+  if (caption.length) {
+    lines.push("");
+    lines.push(...caption);
+  }
+
+  lines.push("");
+  if (kind === "d5") lines.push("Please prepare for your scheduled hearing.");
+  else if (kind === "d2") {
+    lines.push("Please be reminded of your upcoming hearing.");
+  } else if (kind === "hearing_day" || kind === "day_noon") {
+    lines.push("Please be reminded of your hearing today.");
+  } else {
+    lines.push("Please be reminded of your scheduled hearing.");
+  }
+
+  return lines.join("\n").trim();
+}
+
+function hearingPushTitle(base: string, hearingDate: string): string {
+  const date = hearingDate.trim();
+  if (!date) return base;
+  if (base.includes(date)) return base;
+  return `${base} · ${date}`;
+}
+
+/** Phone tokens only. The website browser token is not a push target. */
+function fcmTokensFromUser(data: Record<string, unknown> | undefined): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (raw: unknown) => {
+    if (typeof raw !== "string" || raw.length <= 20 || seen.has(raw)) return;
+    seen.add(raw);
+    out.push(raw);
+  };
+  if (!data) return out;
+  const map = data.fcmTokens;
+  let web = "";
+  let platformToken = false;
+  if (map && typeof map === "object") {
+    const record = map as Record<string, unknown>;
+    if (typeof record.web === "string") web = record.web;
+    for (const key of ["android", "ios"]) {
+      const value = record[key];
+      if (typeof value === "string" && value.length > 20) {
+        add(value);
+        platformToken = true;
+      }
+    }
+  }
+  // A second stored token on the same phone was sending a second push.
+  if (!platformToken && typeof data.fcmToken === "string" && data.fcmToken !== web) {
+    add(data.fcmToken);
+  }
+  return out.filter((token) => token !== web);
 }
 
 function stringifyData(raw: Record<string, unknown>): Record<string, string> {
@@ -1455,25 +2023,53 @@ export async function deliverHearingNotification(params: {
     );
   }
 
+  const smsFields = hearingDoc
+    ? hearingFieldsForSms(hearingDoc as HearingDoc & Record<string, unknown>)
+    : {
+        caseNo: asString(data["caseNo"]),
+        caseTitle: asString(data["caseTitle"]),
+        clientName: asString(data["clientName"]),
+        hearingDate: asString(data["hearingDate"]),
+        hearingTime: asString(data["hearingTime"]),
+        location:
+          hearingLocation({ ...(hearingDoc ?? {}), ...data }) ||
+          asString(data["location"]) ||
+          asString(data["courtBranch"]),
+      };
+  const pushBody =
+    buildHearingSmsText({
+      ...smsFields,
+      reminderKind: reminderKind ?? "",
+    }).trim() ||
+    buildHearingPushBody(hearingDoc ?? {}, body, reminderKind);
   if (!inAppOnly) {
     const messaging = admin.messaging();
     const seenTokens = new Set<string>();
-    const pushBody = buildHearingPushBody(hearingDoc ?? {}, body);
-    const { fullText: _omitFullText, ...pushData } = data;
     const dataStrings = stringifyData({
-      ...pushData,
       type: notificationType,
       caseId,
       hearingDocId,
+      title,
+      body: pushBody,
+      caseNo: asString(data["caseNo"]),
+      clientName: asString(data["clientName"]),
+      courtBranch: asString(data["courtBranch"]),
+      caseTitle: asString(data["caseTitle"]),
+      hearingDate: asString(data["hearingDate"]),
+      hearingTime: asString(data["hearingTime"]),
+      location:
+        hearingLocation({ ...(hearingDoc ?? {}), ...data }) ||
+        asString(data["location"]) ||
+        asString(data["courtBranch"]),
+      reminderKind: reminderKind ?? "",
     });
     const tokens: string[] = [];
     for (const uid of recipients) {
-      const token = userByUid.get(uid)?.fcmToken;
-      if (typeof token !== "string" || token.length <= 20 || seenTokens.has(token)) {
-        continue;
+      for (const token of fcmTokensFromUser(userByUid.get(uid))) {
+        if (seenTokens.has(token)) continue;
+        seenTokens.add(token);
+        tokens.push(token);
       }
-      seenTokens.add(token);
-      tokens.push(token);
     }
     if (tokens.length) {
       try {
@@ -1483,13 +2079,18 @@ export async function deliverHearingNotification(params: {
           data: dataStrings,
           android: {
             priority: "high" as const,
+            // Unique per hearing so rapid successive notices do not replace
+            // each other on the tray (collapseKey/tag must differ).
+            collapseKey: hearingDocId || `hearing_${Date.now()}`,
             notification: {
               title,
               body: pushBody,
-              sound: "default",
               channelId: "high_importance_channel",
+              sound: "default",
               defaultSound: true,
               visibility: "public",
+              tag: hearingDocId || `hearing_${Date.now()}`,
+              ticker: title,
             },
           },
           apns: {
@@ -1511,6 +2112,44 @@ export async function deliverHearingNotification(params: {
             successCount: result.successCount,
           });
         }
+        if (result.successCount > 0 && hearingDocId) {
+          try {
+            const mobileTokens = new Set<string>();
+            for (const uid of recipients) {
+              const map = userByUid.get(uid)?.fcmTokens;
+              if (!map || typeof map !== "object") continue;
+              const record = map as Record<string, unknown>;
+              for (const key of ["android", "ios"]) {
+                const value = record[key];
+                if (typeof value === "string" && value.length > 20) {
+                  mobileTokens.add(value);
+                }
+              }
+            }
+            let mobileSuccess = 0;
+            result.responses.forEach((response, index) => {
+              if (response.success && mobileTokens.has(tokens[index] ?? "")) {
+                mobileSuccess += 1;
+              }
+            });
+            const stamp: Record<string, unknown> = {
+              fcmDeliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+              fcmSuccessCount: result.successCount,
+            };
+            if (mobileSuccess > 0) {
+              stamp.fcmMobileDeliveredAt =
+                admin.firestore.FieldValue.serverTimestamp();
+            }
+            await db.collection("hearings").doc(hearingDocId).set(stamp, {
+              merge: true,
+            });
+          } catch (stampErr) {
+            logger.warn("hearingNotify: fcm stamp failed", {
+              hearingDocId,
+              err: stampErr instanceof Error ? stampErr.message : String(stampErr),
+            });
+          }
+        }
       } catch (e) {
         logger.warn("hearingNotify: FCM failed", {
           err: e instanceof Error ? e.message : String(e),
@@ -1520,31 +2159,45 @@ export async function deliverHearingNotification(params: {
   }
 
   const batch = db.batch();
-  const existingByUid = new Map<string, { exists: boolean; wasRead: boolean }>();
-  if (!inAppOnly) {
-    await Promise.all(
-      recipients.map(async (uid) => {
-        const nid = hearingNotificationDocId({
-          notificationType,
-          hearingDocId,
-          uid,
-          reminderKind: reminderKind ?? undefined,
-          updateNonce,
+  const existingByUid = new Map<
+    string,
+    { exists: boolean; wasRead: boolean; hasCreatedAt: boolean }
+  >();
+  await Promise.all(
+    recipients.map(async (uid) => {
+      const nid = hearingNotificationDocId({
+        notificationType,
+        hearingDocId,
+        uid,
+        reminderKind: reminderKind ?? undefined,
+        updateNonce,
+      });
+      try {
+        const existing = await db.collection("notifications").doc(nid).get();
+        existingByUid.set(uid, {
+          exists: existing.exists,
+          wasRead:
+            existing.exists &&
+            (existing.data()?.isRead === true || existing.data()?.readAt != null),
+          hasCreatedAt: existing.exists && existing.data()?.createdAt != null,
         });
-        try {
-          const existing = await db.collection("notifications").doc(nid).get();
-          existingByUid.set(uid, {
-            exists: existing.exists,
-            wasRead:
-              existing.exists &&
-              (existing.data()?.isRead === true || existing.data()?.readAt != null),
-          });
-        } catch {
-          existingByUid.set(uid, { exists: false, wasRead: false });
-        }
-      }),
-    );
-  }
+      } catch {
+        existingByUid.set(uid, {
+          exists: false,
+          wasRead: false,
+          hasCreatedAt: false,
+        });
+      }
+    }),
+  );
+
+  const clientExtracted = recipients.some((u) => roleByUid.get(u) === "client")
+    ? extractOrderStructuredFields({
+        ...((hearingDoc ?? {}) as Record<string, unknown>),
+        ...data,
+      })
+    : null;
+
   for (const uid of recipients) {
     const nid = hearingNotificationDocId({
       notificationType,
@@ -1559,31 +2212,104 @@ export async function deliverHearingNotification(params: {
     const existingExists = prior?.exists === true;
 
     const isClient = roleByUid.get(uid) === "client";
-    const rowTitle =
-      isClient && notificationType === "hearing_activity"
-        ? hearingDoc
-          ? clientInboxTitleFromHearing(hearingDoc, caseTitle)
-          : asString(data["caseNo"])
-            ? `New notice court hearings — ${asString(data["caseNo"])}`
-            : `New notice court hearings — ${caseTitle}`
-        : title;
+    const effCaseNo = isClient
+      ? clientExtracted?.caseNo || asString(data["caseNo"])
+      : asString(data["caseNo"]);
+    const rawDataTitle = asString(data["caseTitle"]);
+    const effCaseTitle = isClient
+      ? (rawDataTitle && rawDataTitle.toLowerCase() !== "hearing"
+          ? rawDataTitle
+          : "") ||
+        clientExtracted?.caseTitle ||
+        rawDataTitle
+      : rawDataTitle;
+    const effClientName = isClient
+      ? asString(data["clientName"]) || clientExtracted?.clientName || ""
+      : asString(data["clientName"]);
+    const effCourtBranch = isClient
+      ? asString(data["courtBranch"]) || clientExtracted?.courtBranch || ""
+      : asString(data["courtBranch"]);
+    const effLocation = isClient
+      ? clientExtracted?.location ||
+        asString(data["location"]) ||
+        effCourtBranch
+      : asString(data["location"]) || asString(data["courtBranch"]);
+    const effHearingDate = isClient
+      ? asString(data["hearingDate"]) || clientExtracted?.hearingDate || ""
+      : asString(data["hearingDate"]);
+    const effHearingTime = isClient
+      ? asString(data["hearingTime"]) || clientExtracted?.hearingTime || ""
+      : asString(data["hearingTime"]);
+
+    let rowTitle = title;
+    if (isClient && notificationType === "hearing_activity") {
+      if (effCaseNo && !isPlaceholderDocketToken(effCaseNo)) {
+        rowTitle = `Court Hearing Notice — ${effCaseNo}`;
+      } else if (
+        effCaseTitle &&
+        effCaseTitle.toLowerCase() !== "hearing" &&
+        !isImportedCourtRow(hearingDoc ?? {})
+      ) {
+        rowTitle = `Court Hearing Notice — ${effCaseTitle}`;
+      } else if (effCaseTitle && effCaseTitle.toLowerCase() !== "hearing") {
+        rowTitle = `Court Hearing Notice — ${effCaseTitle}`;
+      } else {
+        rowTitle = "Court Hearing Notice";
+      }
+    }
+
+    let rowMessage = pushBody || body;
+    let rowSummary: string | undefined;
+    if (isClient) {
+      const clientSmsBody = buildHearingSmsText({
+        caseNo: effCaseNo,
+        caseTitle: effCaseTitle,
+        clientName: effClientName,
+        hearingDate: effHearingDate,
+        hearingTime: effHearingTime,
+        location: effLocation,
+        reminderKind: reminderKind ?? "",
+      }).trim();
+      if (clientSmsBody) {
+        rowMessage = clientSmsBody;
+      }
+      const summaryParts = [
+        effCaseTitle && effCaseTitle.toLowerCase() !== "hearing"
+          ? effCaseTitle
+          : effClientName,
+        effHearingDate
+          ? effHearingTime
+            ? `${effHearingDate} • ${effHearingTime}`
+            : effHearingDate
+          : "",
+        effLocation,
+      ].filter(Boolean);
+      if (summaryParts.length) {
+        rowSummary = summaryParts.join(" • ");
+      }
+    }
+
     const row: Record<string, unknown> = {
       userId: uid,
       type: notificationType,
       title: rowTitle,
-      message: body,
+      message: rowMessage,
       caseId: caseId || null,
-      caseNo: asString(data["caseNo"]) || null,
-      clientName: asString(data["clientName"]) || null,
-      courtBranch: asString(data["courtBranch"]) || null,
-      caseTitle: asString(data["caseTitle"]) || null,
+      caseNo: effCaseNo || null,
+      clientName: effClientName || null,
+      courtBranch: effCourtBranch || null,
+      caseTitle: effCaseTitle || null,
       fullText: asString(data["fullText"]) || asString(hearingDoc?.fullText) || null,
-      location: asString(data["location"]) || asString(data["courtBranch"]) || null,
-      hearingDate: asString(data["hearingDate"]) || null,
-      hearingTime: asString(data["hearingTime"]) || null,
+      location: effLocation || null,
+      hearingDate: effHearingDate || null,
+      hearingTime: effHearingTime || null,
       hearingDocId,
       hearingReminderKind: reminderKind ?? null,
     };
+    if (rowSummary) row.summary = rowSummary;
+    if (isClient && clientExtracted?.involvedPartyNames.length) {
+      row.involvedPartyNames = clientExtracted.involvedPartyNames;
+    }
     const src = asString(data["source"]);
     if (src) row.source = src;
     if (isClient) row.clientId = uid;
@@ -1592,6 +2318,14 @@ export async function deliverHearingNotification(params: {
       row.isRead = true;
     } else if (!existingExists) {
       row.isRead = false;
+      const hearingCreated =
+        isClient && inAppOnly
+          ? timestampFromUnknown(
+              (hearingDoc as Record<string, unknown> | null | undefined)?.createdAt,
+            )
+          : null;
+      row.createdAt = hearingCreated ?? now;
+    } else if (!prior?.hasCreatedAt) {
       row.createdAt = now;
     }
     batch.set(nref, row, { merge: true });
@@ -1619,7 +2353,7 @@ export async function deliverHearingNotification(params: {
   );
 }
 
-async function upsertReminderJobs(params: {
+export async function upsertReminderJobs(params: {
   db: admin.firestore.Firestore;
   hearingDocId: string;
   caseId: string;
@@ -1889,9 +2623,28 @@ async function stampHearingInboxFields(
     if (!asString(raw.updatedAt)) {
       patch.updatedAt = admin.firestore.FieldValue.serverTimestamp();
     }
-    if (!hearingSource(d) && isImportedCourtRow(d)) patch.source = "n8n";
-    if (!asString(d.activityType) && isImportedCourtRow(d)) {
+    const textBlob = asString(raw.fullText) || asString(raw.message);
+    if (!asString(raw.hearingDate) && textBlob) {
+      const extractedDate = extractHearingDateFromOrderText(textBlob);
+      if (extractedDate) {
+        patch.hearingDate = extractedDate;
+        d.hearingDate = extractedDate;
+      }
+    }
+    if (!asString(raw.hearingTime) && textBlob) {
+      const extractedTime = extractHearingTimeFromOrderText(textBlob);
+      if (extractedTime) {
+        patch.hearingTime = extractedTime;
+        d.hearingTime = extractedTime;
+      }
+    }
+    if (!hearingSource(d)) {
+      patch.source = "n8n";
+      (d as Record<string, unknown>).source = "n8n";
+    }
+    if (!asString(d.activityType)) {
       patch.activityType = "court_import";
+      (d as Record<string, unknown>).activityType = "court_import";
     }
     if (Object.keys(patch).length) {
       await snap.ref.set(patch, { merge: true });
@@ -1919,17 +2672,61 @@ export async function handleHearingDocumentCreated(
     return;
   }
   const db = admin.firestore();
-
-  // Stamp after the push is queued so createdAt / source writes do not delay FCM.
-  const stampTask = stampHearingInboxFields(snap, d, hearingDocId);
-
-  const duplicateCase =
-    (await laterDuplicateOfExistingHearing(db, hearingDocId, d)) ||
-    !(await claimPrimaryHearingNotice(db, hearingDocId, d));
-  if (duplicateCase) {
-    logger.info("hearingNotify duplicate case still sends notice", {
+  // One winner with the Flutter client fan-out (same fcmPushClaimedAt field).
+  let pushClaimed = false;
+  try {
+    pushClaimed = await db.runTransaction(async (tx) => {
+      const ref = db.collection("hearings").doc(hearingDocId);
+      const cur = await tx.get(ref);
+      const data = (cur.data() ?? {}) as Record<string, unknown>;
+      if (
+        data.fcmPushClaimedAt != null ||
+        data.fcmDeliveredAt != null ||
+        data.fcmMobileDeliveredAt != null ||
+        data.devicePushClaimedAt != null
+      ) {
+        return false;
+      }
+      tx.set(
+        ref,
+        { fcmPushClaimedAt: admin.firestore.FieldValue.serverTimestamp() },
+        { merge: true },
+      );
+      return true;
+    });
+  } catch (e) {
+    logger.warn("hearingNotify: push claim failed", {
       hearingDocId,
+      err: e instanceof Error ? e.message : String(e),
+    });
+    pushClaimed = true; // still attempt deliver if the claim race errors
+  }
+  if (!pushClaimed) {
+    logger.info("hearingNotify skipped push — already claimed", { hearingDocId });
+    await stampHearingInboxFields(snap, d, hearingDocId);
+    // Reminders / SMS may still run below via existing paths when needed.
+  }
+
+  // Ensure fields (like auto-extracted dates and source) are stamped before notification payload is constructed.
+  await stampHearingInboxFields(snap, d, hearingDocId);
+
+  // Push + SMS: every new hearing doc notifies — even many back-to-back with
+  // the same caseNo / clock. Cross-doc skips were silencing re-ingests.
+  // Dedupe for delivery is per hearingDocId only (fcmPushClaimedAt / SMS claim).
+  // Reminder jobs still use duplicateCase so one case+time does not spawn N
+  // timed reminder sets.
+  const earlierDup = await findEarlierDuplicateHearing(db, hearingDocId, d);
+  const lockIsMine = await claimPrimaryHearingNotice(db, hearingDocId, d).catch(
+    () => true,
+  );
+  const duplicateCase =
+    (earlierDup != null && hearingAlreadyNotified(earlierDup)) || !lockIsMine;
+  if (earlierDup) {
+    logger.info("hearingNotify same case/time as earlier doc — still notifying", {
+      hearingDocId,
+      earlierId: earlierDup.id,
       caseNo: asString(d.caseNo),
+      skipRemindersOnly: duplicateCase,
     });
   }
 
@@ -1958,13 +2755,17 @@ export async function handleHearingDocumentCreated(
   const caseId = resolved?.caseId || "";
 
   const activity = asString(d.activityType) || (isImportedCourtRow(d) ? "court_notice" : "message");
-  const title = isImportedCourtRow(d)
-    ? `Court hearing / order — ${asString(d.caseNo) || caseTitle}`
+  const smsFields = hearingFieldsForSms(d as HearingDoc & Record<string, unknown>);
+  const rawCn = asString(d.caseNo);
+  const validCn = rawCn && !isPlaceholderCaseNo(rawCn) ? rawCn : "";
+  const titleBase = isImportedCourtRow(d)
+    ? `Court hearing / order — ${validCn || caseTitle}`
     : activity === "schedule"
       ? `Hearing scheduled — ${caseTitle}`
       : activity === "update"
         ? `Hearing updated — ${caseTitle}`
         : `Hearing message — ${caseTitle}`;
+  const title = hearingPushTitle(titleBase, smsFields.hearingDate);
 
   const body = buildNotificationBody(d, {
     caseId: caseId || hearingDocId,
@@ -1973,18 +2774,38 @@ export async function handleHearingDocumentCreated(
 
   const noticeData = {
     activityType: activity,
-    caseNo: asString(d.caseNo),
-    clientName: asString(d.clientName),
+    caseNo: smsFields.caseNo || asString(d.caseNo),
+    clientName: smsFields.clientName || asString(d.clientName),
     courtBranch: asString(d.courtBranch),
-    caseTitle,
+    caseTitle: smsFields.caseTitle || caseTitle,
     fullText: asString(d.fullText),
-    location: asString(d.location) || asString(d.courtBranch),
-    hearingDate: asString(d.hearingDate),
-    hearingTime: asString(d.hearingTime),
+    location: smsFields.location || asString(d.location) || asString(d.courtBranch),
+    hearingDate: smsFields.hearingDate || asString(d.hearingDate),
+    hearingTime: smsFields.hearingTime || asString(d.hearingTime),
   };
 
   const sent = new Set<string>();
+  let deliverPushAndInApp = pushClaimed;
+  if (!deliverPushAndInApp) {
+    try {
+      const flagSnap = await db.collection("hearings").doc(hearingDocId).get();
+      const flags = flagSnap.data() ?? {};
+      const delivered =
+        flags.fcmDeliveredAt != null || flags.fcmMobileDeliveredAt != null;
+      // e.g. mobile dashboard claimed push but never stamped delivery — finish here.
+      if (!delivered && flags.fcmPushClaimedAt != null) {
+        deliverPushAndInApp = true;
+      }
+    } catch (e) {
+      logger.warn("hearingNotify: delivery flag read failed", {
+        hearingDocId,
+        err: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
   const pushTo = async (recipients: string[]) => {
+    if (!deliverPushAndInApp) return;
     const pending = recipients.filter((uid) => uid && !sent.has(uid));
     if (!pending.length) return;
     for (const uid of pending) sent.add(uid);
@@ -2002,66 +2823,19 @@ export async function handleHearingDocumentCreated(
     });
   };
 
-  // Attorney, client, and uploader first — do not wait for the firm-wide scan.
-  if (coreRecipients.size) {
-    await pushTo([...coreRecipients]);
-  }
-
-  const [firmRecipients, firmWideRecipients] = await Promise.all([
-    firmPromise,
-    firmWidePromise,
-  ]);
-  const extras = new Set<string>();
-  if (!coreRecipients.size) {
-    for (const uid of firmRecipients) extras.add(uid);
-  }
-  for (const uid of firmWideRecipients) {
-    if (!coreRecipients.has(uid)) extras.add(uid);
-  }
-  if (extras.size) {
-    await pushTo([...extras]);
-  }
-
-  const list = [...sent];
-  await stampTask;
-
-  if (!list.length) {
-    logger.warn("hearingNotify: no recipients (case, clientName, or firm fallback)", {
-      hearingDocId,
-      caseNo: asString(d.caseNo),
-      clientName: asString(d.clientName),
-    });
-    return;
-  }
-
-  if (philSms?.apiToken.trim() || semaphore?.apiKey.trim()) {
-    try {
-      await sendHearingSmsAlerts({
-        db,
-        hearingDocId,
-        hearingData: snap.data() as HearingDoc & Record<string, unknown>,
-        recipientUserIds: list,
-        title,
-        body,
-        cfg: philSms ?? {
-          apiToken: "",
-          senderId: "PhilSMS",
-          alertPhones: [],
-          staffAlertPhones: [],
-        },
-        semaphore,
-      });
-    } catch (e) {
-      logger.warn("hearingSms: create handler failed", {
-        hearingDocId,
-        err: e instanceof Error ? e.message : String(e),
-      });
-    }
-  }
-
-  const clientUids = await resolveClientUidsByHearingName(db, asString(d.clientName));
+  const clientUids = await resolveClientUidsByHearingName(
+    db,
+    asString(d.clientName),
+    {
+      caseTitle: asString(d.caseTitle),
+      fullText: asString(d.fullText),
+    },
+  );
   if (clientUids.length) {
     try {
+      const extractedParties = extractOrderStructuredFields(
+        d as Record<string, unknown>,
+      ).involvedPartyNames;
       await db
         .collection("hearings")
         .doc(hearingDocId)
@@ -2069,10 +2843,10 @@ export async function handleHearingDocumentCreated(
           {
             involvedClientIds: admin.firestore.FieldValue.arrayUnion(...clientUids),
             matchedClientIds: admin.firestore.FieldValue.arrayUnion(...clientUids),
-            ...(splitHearingPartyNames(asString(d.clientName)).length
+            ...(extractedParties.length
               ? {
                   involvedPartyNames: admin.firestore.FieldValue.arrayUnion(
-                    ...splitHearingPartyNames(asString(d.clientName)),
+                    ...extractedParties,
                   ),
                 }
               : {}),
@@ -2086,6 +2860,55 @@ export async function handleHearingDocumentCreated(
       });
     }
   }
+
+  const [firmRecipients, firmWideRecipients] = await Promise.all([
+    firmPromise,
+    firmWidePromise,
+  ]);
+  const everyone = new Set<string>(coreRecipients);
+  for (const uid of clientUids) everyone.add(uid);
+  if (!coreRecipients.size) {
+    for (const uid of firmRecipients) everyone.add(uid);
+  }
+  for (const uid of firmWideRecipients) everyone.add(uid);
+
+  const list = [...everyone];
+  if (!list.length) {
+    logger.warn("hearingNotify: no recipients (case, clientName, or firm fallback)", {
+      hearingDocId,
+      caseNo: asString(d.caseNo),
+      clientName: asString(d.clientName),
+    });
+    return;
+  }
+
+  // If Flutter already claimed the push, it also sends SMS — skip both here.
+  const smsTask =
+    philSms?.apiToken.trim() || semaphore?.apiKey.trim()
+      ? sendHearingSmsAlerts({
+          db,
+          hearingDocId,
+          hearingData: d as HearingDoc & Record<string, unknown>,
+          recipientUserIds: list,
+          title,
+          body,
+          cfg: philSms ?? {
+            apiToken: "",
+            senderId: "PhilSMS",
+            alertPhones: [],
+            staffAlertPhones: [],
+          },
+          semaphore,
+        }).catch((e: unknown) => {
+          logger.warn("hearingSms: create handler failed", {
+            hearingDocId,
+            err: e instanceof Error ? e.message : String(e),
+          });
+        })
+      : Promise.resolve();
+
+  // One push wave and the SMS leave together. A second wave was a second card.
+  await Promise.all([pushTo(list), smsTask]);
 
   const ht = hearingAtFromDoc(d);
   if (
@@ -2178,10 +3001,15 @@ export async function handleHearingDocumentUpdated(
     });
   }
 
-  const clientUids = await resolveClientUidsByHearingName(db, asString(d1.clientName));
+  const clientUids = await resolveClientUidsByHearingName(db, asString(d1.clientName), {
+    caseTitle: asString(d1.caseTitle),
+    fullText: asString(d1.fullText),
+  });
   if (clientUids.length) {
     try {
-      const parties = splitHearingPartyNames(asString(d1.clientName));
+      const parties = splitHearingPartyNames(
+        [asString(d1.clientName), asString(d1.caseTitle)].filter(Boolean).join(", "),
+      );
       await db.collection("hearings").doc(hearingDocId).set(
         {
           involvedClientIds: admin.firestore.FieldValue.arrayUnion(...clientUids),
@@ -2465,6 +3293,7 @@ export async function processDueHearingReminderJobs(
       ...smsFields,
       reminderKind: kind,
     });
+    const pushTitle = hearingPushTitle(title, smsFields.hearingDate);
 
     try {
       await deliverHearingNotification({
@@ -2472,10 +3301,11 @@ export async function processDueHearingReminderJobs(
         caseId,
         hearingDocId,
         recipients: [uid],
-        title,
+        title: pushTitle,
         body,
         notificationType: `hearing_reminder_${kind}`,
         reminderKind: kind,
+        hearingDoc: hd,
         data: {
           reminderKind: kind,
           senderName: asString(snap.senderName),

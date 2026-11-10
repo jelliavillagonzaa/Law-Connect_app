@@ -47,9 +47,6 @@ class StaffModel {
 
   /// Create StaffModel from UserModel (for users collection with role='staff')
   factory StaffModel.fromUserModel(UserModel user) {
-    if (user.assignedAttorneyId == null || user.assignedAttorneyId!.isEmpty) {
-      throw ArgumentError('User must have assignedAttorneyId to be staff');
-    }
     return StaffModel(
       id: user.id,
       name: user.name,
@@ -58,7 +55,7 @@ class StaffModel {
       phone: user.phone,
       phoneNumber: user.phoneNumber,
       address: user.address,
-      assignedAttorneyId: user.assignedAttorneyId!,
+      assignedAttorneyId: user.assignedAttorneyId ?? '',
       isVerified: user.isVerified,
       createdAt: user.createdAt,
     );

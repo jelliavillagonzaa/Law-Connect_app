@@ -1,6 +1,8 @@
 import 'dart:async' show StreamSubscription, Timer, unawaited;
+import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show HapticFeedback;
 import 'package:flutter/foundation.dart'
     show debugPrint, kDebugMode, kIsWeb, ValueListenable;
 import 'package:get/get.dart';
@@ -22,18 +24,24 @@ import '../../widgets/common/nav_unread_dot.dart';
 import '../../widgets/attorney/attorney_thin_nav_rail.dart';
 import '../../widgets/attorney/attorney_ui_theme.dart';
 import '../../widgets/attorney/attorney_top_bar.dart';
-import '../../widgets/admin/stat_card.dart';
 import '../../theme/app_theme.dart';
 import '../case/case_detail_page.dart';
 import '../chat/chat_list_page.dart';
 import '../auth/login_page.dart';
+import '../../screens/client/help_center_screen.dart';
+import '../../help/attorney_help_catalog.dart';
 import '../../screens/attorney/appointment_calendar_view.dart';
+import '../../screens/billing/billing_management_screen.dart'
+    show openPaymentHistoryScreen;
 
 import '../../widgets/attorney/reminders_bell_button.dart';
 import '../../pages/attorney/attorney_profile_page.dart';
-import '../../pages/attorney/confirm_appointment_schedule_page.dart';
 import '../../services/chat_service.dart';
 import '../../services/hearing_calendar_sync_service.dart';
+import '../../services/hearing_notification_fanout_service.dart';
+import '../../services/hearing_calendar_fields.dart';
+import '../../services/staff_service.dart';
+import '../../services/attorney_inbox_read_store.dart';
 import '../../services/fcm_service.dart';
 import '../../services/calendar_session_cleanup.dart';
 import '../../screens/attorney/attorney_case_requests_screen.dart';
@@ -41,8 +49,8 @@ import '../../screens/attorney/attorney_create_case_screen.dart';
 import '../../screens/attorney/attorney_client_chat_screen.dart';
 import '../../screens/attorney/attorney_tasks_screen.dart';
 import '../../screens/attorney/attorney_create_task_screen.dart';
-import '../../screens/billing/billing_management_screen.dart';
 import '../../widgets/attorney/upcoming_appointment_tile.dart';
+import '../../widgets/attorney/attorney_modern_dashboard_view.dart';
 
 class AttorneyDashboard extends StatefulWidget {
   const AttorneyDashboard({super.key});
@@ -68,9 +76,10 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
   String _activeItem = 'dashboard';
   int _selectedBottomNavIndex = 0;
   bool _isAvailable = true;
+  final TextEditingController _desktopSearchController = TextEditingController();
   final ValueNotifier<String> _headerSearchQuery = ValueNotifier('');
   final ValueNotifier<String> _casesStatusFilter =
-      ValueNotifier(CaseStatusFilter.active);
+      ValueNotifier(CaseStatusFilter.all);
   final ValueNotifier<bool> _closedCasesFolder = ValueNotifier(false);
 
   StreamSubscription<List<CaseModel>>? _casesSub;
@@ -89,6 +98,8 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
   List<AppointmentModel> _pendingRequests = [];
   // Upcoming confirmed/scheduled appointments
   List<AppointmentModel> _upcomingAppointments = [];
+  List<Map<String, dynamic>> _liveHearingRows = [];
+  StreamSubscription<List<Map<String, dynamic>>>? _liveHearingsSub;
   final Map<String, String> _upcomingClientNames = {};
   final Map<String, String> _upcomingClientEmails = {};
   int _unreadCount = 0;
@@ -101,7 +112,6 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
         _stats['completedCases'],
         _stats['pendingCases'],
         _stats['upcomingAppointments'],
-        _pendingRequests.length,
       );
     } catch (_) {
       return 'dashboard';
@@ -132,17 +142,15 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       final uid = FirebaseAuth.instance.currentUser?.uid;
       if (uid == null || uid.isEmpty) return;
 
+      unawaited(AttorneyInboxReadStore.instance.ensureLoaded(uid));
+      unawaited(HearingNotificationFanoutService.instance
+          .refreshAttorneyBellFromNotifications(uid));
       unawaited(FCMService().initialize().catchError((_) {}));
       unawaited(FCMService().saveTokenForUser(uid).catchError((_) {}));
       if (kIsWeb) {
         Timer(const Duration(milliseconds: 400), () {
           if (!mounted) return;
           _attachUnreadWatcher();
-        });
-        _calendarPrewarmTimer = Timer(const Duration(seconds: 25), () {
-          if (!mounted) return;
-          _mobileTabStackKey.currentState?.prewarm(4);
-          _desktopTabStackKey.currentState?.prewarm(6);
         });
       } else {
         Timer(const Duration(seconds: 6), () {
@@ -155,7 +163,8 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
 
   /// Schedules a late calendar_events backfill. Display uses live hearings.
   void _ensureHearingCalendarSync() {
-    final uid = FirebaseAuth.instance.currentUser?.uid?.trim();
+    final user = FirebaseAuth.instance.currentUser;
+    final uid = user?.uid.trim();
     if (uid == null || uid.isEmpty || _hearingSyncAttached) return;
     _hearingSyncAttached = true;
     HearingCalendarSyncService.instance.attachForAttorney(uid);
@@ -163,11 +172,13 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
 
   @override
   void dispose() {
+    _desktopSearchController.dispose();
     _headerSearchQuery.dispose();
     _casesStatusFilter.dispose();
     _closedCasesFolder.dispose();
     _casesSub?.cancel();
     _appointmentsSub?.cancel();
+    _liveHearingsSub?.cancel();
     _unreadCountSub?.cancel();
     _dashboardDebounce?.cancel();
     _calendarPrewarmTimer?.cancel();
@@ -300,20 +311,6 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     );
   }
 
-  Widget _navIconWithBadge(
-    IconData icon, {
-    int badge = 0,
-    Color? color,
-    double size = 24,
-  }) {
-    return navIconWithBadge(
-      icon,
-      badge: badge,
-      color: color,
-      iconSize: size,
-    );
-  }
-
   void _attachUnreadWatcher() {
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null) return;
@@ -375,11 +372,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       return;
     }
     _dashboardStreamsAttached = true;
-
-    Timer(const Duration(milliseconds: 700), () {
-      if (!mounted) return;
-      _attachDashboardStreams(user.uid);
-    });
+    _attachDashboardStreams(user.uid);
   }
 
   void _attachDashboardStreams(String uid) {
@@ -423,9 +416,31 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
         },
         onError: (_) {},
       );
+
+      _subscribeLiveHearingsForDashboard(uid);
     } catch (_) {
       // Streams will retry via Firestore; keep UI responsive.
     }
+  }
+
+  void _subscribeLiveHearingsForDashboard(String uid) {
+    final aid = HearingCalendarSyncService.overlayKey(uid);
+    final cached = HearingCalendarSyncService.instance.peekHearingNavRows(aid);
+    if (cached != null && cached.isNotEmpty) {
+      _liveHearingRows = List<Map<String, dynamic>>.from(cached);
+      _upcomingAppointments = _selectUpcomingAppointments(_allAppointments);
+    }
+    _liveHearingsSub?.cancel();
+    _liveHearingsSub = StaffService().watchLiveHearingsForGrid(aid).listen(
+      (rows) {
+        if (!mounted) return;
+        _liveHearingRows = rows;
+        _upcomingAppointments = _selectUpcomingAppointments(_allAppointments);
+        _stats = _computeStats();
+        _scheduleDashboardRebuild();
+      },
+      onError: (_) {},
+    );
   }
 
   /// One accepted/scheduled booking per date+time. Pending requests and
@@ -462,24 +477,94 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
         visible.add(apt);
       }
 
+      for (final h in _liveHearingRows) {
+        final dt = h['eventDate'];
+        DateTime? when;
+        if (dt is DateTime) {
+          when = dt;
+        } else if (dt is Timestamp) {
+          when = dt.toDate();
+        }
+        if (when == null || !when.isAfter(now)) continue;
+
+        final hid = HearingCalendarFields.asDisplayString(h['hearingDocId']).isNotEmpty
+            ? HearingCalendarFields.asDisplayString(h['hearingDocId'])
+            : HearingCalendarFields.asDisplayString(h['id']);
+        final caseNo = HearingCalendarFields.asDisplayString(h['caseNo']);
+        final clientName = HearingCalendarFields.asDisplayString(h['clientName']);
+        final caseTitle = HearingCalendarFields.asDisplayString(h['caseTitle']);
+        final title = HearingCalendarFields.asDisplayString(h['title']);
+        final courtBranch = HearingCalendarFields.asDisplayString(h['courtBranch']);
+        final location = HearingCalendarFields.asDisplayString(h['location']);
+        final venue = courtBranch.isNotEmpty ? courtBranch : location;
+
+        String displayName = clientName;
+        if (displayName.isEmpty) {
+          if (caseNo.isNotEmpty && !HearingCalendarFields.isPlaceholderCaseNo(caseNo)) {
+            displayName = caseNo;
+          } else if (caseTitle.isNotEmpty) {
+            displayName = caseTitle;
+          } else {
+            displayName = title.isNotEmpty ? title : 'Court Hearing';
+          }
+        }
+
+        visible.add(
+          AppointmentModel(
+            id: hid.isNotEmpty ? 'hearing_$hid' : 'hearing_${h.hashCode}',
+            clientId: HearingCalendarFields.asDisplayString(h['clientId']),
+            clientName: displayName,
+            caseId: HearingCalendarFields.asDisplayString(h['caseId']),
+            caseTitle: caseTitle.isNotEmpty
+                ? caseTitle
+                : (caseNo.isNotEmpty ? caseNo : (title.isNotEmpty ? title : 'Court Hearing')),
+            appointmentDateTime: when,
+            appointmentType: 'hearing_court',
+            notes: venue.isNotEmpty ? 'Location: $venue' : null,
+            status: 'confirmed',
+            createdAt: h['createdAt'] is DateTime
+                ? h['createdAt'] as DateTime
+                : (h['createdAt'] is Timestamp
+                    ? (h['createdAt'] as Timestamp).toDate()
+                    : when),
+            updatedAt: h['updatedAt'] is DateTime
+                ? h['updatedAt'] as DateTime
+                : (h['updatedAt'] is Timestamp
+                    ? (h['updatedAt'] as Timestamp).toDate()
+                    : when),
+          ),
+        );
+      }
+
       visible.sort((a, b) {
         final rank = _upcomingKeepRank(b) - _upcomingKeepRank(a);
         if (rank != 0) return rank;
-        return a.appointmentDateTime.compareTo(b.appointmentDateTime);
+        final dateCmp = a.appointmentDateTime.compareTo(b.appointmentDateTime);
+        if (dateCmp != 0) return dateCmp;
+        final aCreated = a.updatedAt ?? a.createdAt;
+        final bCreated = b.updatedAt ?? b.createdAt;
+        return bCreated.compareTo(aCreated);
       });
 
-      // Same clock time = same booking. Keep the accepted/confirmed row only.
+      // Deduplicate identical bookings without dropping distinct cases/hearings.
       final byMinute = <String, AppointmentModel>{};
       for (final apt in visible) {
         final t = apt.appointmentDateTime;
-        final key = '${t.year}-${t.month}-${t.day}-${t.hour}-${t.minute}';
+        final cid = apt.caseId?.trim() ?? '';
+        final ctitle = apt.caseTitle?.trim() ?? '';
+        final caseKey = cid.isNotEmpty ? cid : (ctitle.isNotEmpty ? ctitle : apt.id);
+        final key = '${t.year}-${t.month}-${t.day}-${t.hour}-${t.minute}_$caseKey';
         byMinute.putIfAbsent(key, () => apt);
       }
 
       final upcoming = byMinute.values.toList()
-        ..sort(
-          (a, b) => a.appointmentDateTime.compareTo(b.appointmentDateTime),
-        );
+        ..sort((a, b) {
+          final dateCmp = a.appointmentDateTime.compareTo(b.appointmentDateTime);
+          if (dateCmp != 0) return dateCmp;
+          final aCreated = a.updatedAt ?? a.createdAt;
+          final bCreated = b.updatedAt ?? b.createdAt;
+          return bCreated.compareTo(aCreated);
+        });
       return upcoming.take(5).toList();
     } catch (_) {
       return const <AppointmentModel>[];
@@ -669,11 +754,9 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
 
   Map<String, dynamic> _computeStats() {
     try {
-      final totalCases = _myCases
-          .where((c) => !CaseStatusFilter.isCompleted(c.status))
-          .length;
+      final totalCases = _myCases.length;
       final activeCases = _myCases
-          .where((c) => CaseStatusFilter.isInProgress(c.status))
+          .where((c) => !CaseStatusFilter.isCompleted(c.status))
           .length;
       final completedCases = _myCases
           .where((c) => CaseStatusFilter.isCompleted(c.status))
@@ -786,6 +869,17 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     }
   }
 
+  void _openHelpCenter() {
+    Get.to(
+      () => const HelpCenterScreen(
+        articles: attorneyHelpArticles,
+        intro:
+            'Answers come from the attorney guide: cases, appointments, tasks, billing, and messages.',
+        hint: 'Example: How do I accept an appointment?',
+      ),
+    );
+  }
+
   Future<void> _handleLogout() async {
     try {
       if (_authController != null) {
@@ -802,7 +896,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
   void _handleItemSelected(String item, {String? caseFilter}) {
     if (item == 'cases') {
       _closedCasesFolder.value = false;
-      _casesStatusFilter.value = caseFilter ?? CaseStatusFilter.active;
+      _casesStatusFilter.value = caseFilter ?? CaseStatusFilter.all;
     } else if (item == 'closed_cases') {
       _closedCasesFolder.value = true;
       _casesStatusFilter.value = CaseStatusFilter.completed;
@@ -829,6 +923,15 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
         setState(() => _activeItem = 'messages');
         unawaited(_loadUnreadCount());
         return;
+      case 'payment_history':
+        openPaymentHistoryScreen(
+          context,
+          attorneyId: _currentUser?.id,
+          recorderRole: 'attorney',
+          recorderName:
+              _currentUser?.fullName ?? _currentUser?.name ?? 'Attorney',
+        );
+        return;
     }
 
     int? bottomIndex;
@@ -842,10 +945,10 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       case 'case_requests':
         bottomIndex = 2;
         break;
-      case 'pending':
+      case 'calendar':
         bottomIndex = 3;
         break;
-      case 'calendar':
+      case 'messages':
         bottomIndex = 4;
         break;
     }
@@ -866,16 +969,14 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
         return 1;
       case 'case_requests':
         return 2;
-      case 'pending':
-        return 3;
       case 'tasks':
-        return 4;
+        return 3;
       case 'messages':
-        return 5;
+        return 4;
       case 'calendar':
-        return 6;
+        return 5;
       case 'settings':
-        return 7;
+        return 6;
       default:
         return 0;
     }
@@ -886,34 +987,87 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     final isDesktop = MediaQuery.of(context).size.width >= 800;
 
     return Scaffold(
-      // Match attorney settings background color for a cohesive UI
-      backgroundColor: const Color.fromARGB(255, 158, 182, 215),
+      // Match modern light clean background
+      backgroundColor: const Color(0xFFF4F7FC),
       appBar: !isDesktop
           ? AppBar(
               automaticallyImplyLeading: false,
               title: Text(
                 _headerTitle ?? '',
                 style: const TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w700,
                   color: Colors.white,
+                  letterSpacing: -0.2,
                 ),
               ),
-              backgroundColor: AppTheme.royalBlue,
+              backgroundColor: const Color(0xFF07152B),
+              elevation: 0,
               iconTheme: const IconThemeData(color: Colors.white),
               actions: [
-                _buildRemindersBellIcon(),
-                IconButton(
-                  icon: const Icon(Icons.person),
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => const AttorneyProfilePage(),
+                Container(
+                  margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.12),
+                    shape: BoxShape.circle,
+                  ),
+                  child: IconButton(
+                    tooltip: 'Help Center',
+                    iconSize: 20,
+                    icon: const Icon(Icons.help_outline_rounded, color: Colors.white),
+                    onPressed: _openHelpCenter,
+                  ),
+                ),
+                Container(
+                  margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.12),
+                    shape: BoxShape.circle,
+                  ),
+                  child: _buildRemindersBellIcon(),
+                ),
+                Container(
+                  margin: const EdgeInsets.only(top: 8, bottom: 8, left: 2, right: 12),
+                  child: InkWell(
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => const AttorneyProfilePage(),
+                        ),
+                      );
+                    },
+                    borderRadius: BorderRadius.circular(20),
+                    child: Container(
+                      width: 36,
+                      height: 36,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: const Color(0xFF38BDF8).withValues(alpha: 0.60),
+                          width: 1.5,
+                        ),
                       ),
-                    );
-                  },
-                  tooltip: 'Profile',
+                      child: ClipOval(
+                        child: _currentUser?.photoUrl != null &&
+                                _currentUser!.photoUrl!.trim().isNotEmpty
+                            ? Image.network(
+                                _currentUser!.photoUrl!,
+                                fit: BoxFit.cover,
+                                errorBuilder: (_, __, ___) => const Icon(
+                                  Icons.person_rounded,
+                                  color: Colors.white,
+                                  size: 20,
+                                ),
+                              )
+                            : const Icon(
+                                Icons.person_rounded,
+                                color: Colors.white,
+                                size: 20,
+                              ),
+                      ),
+                    ),
+                  ),
                 ),
               ],
             )
@@ -930,41 +1084,152 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
               isAvailable: _isAvailable,
               onAvailabilityChanged: (value) => _toggleAvailability(),
               messageUnreadCount: _unreadCount,
+              pendingRequestsCount: _pendingRequests.length,
             ),
 
           // Main Content
           Expanded(
             child: Column(
               children: [
-                // Desktop Header with Notification Bell (Web)
+                // Desktop Header with Search, Help, Reminders Bell & Avatar (Web)
                 if (isDesktop)
                   Container(
-                    height: 64,
+                    height: 68,
                     padding: const EdgeInsets.symmetric(horizontal: 24),
-                    decoration: BoxDecoration(
-                      color: AppTheme.royalBlue,
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withOpacity(0.1),
-                          blurRadius: 4,
-                          offset: const Offset(0, 2),
+                    decoration: const BoxDecoration(
+                      color: Colors.white,
+                      border: Border(
+                        bottom: BorderSide(
+                          color: Color(0xFFE2E8F0),
+                          width: 1,
                         ),
-                      ],
+                      ),
                     ),
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        Text(
-                          _currentUser?.fullName ??
-                              _currentUser?.name ??
-                              'Attorney',
-                          style: const TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.bold,
-                            color: Colors.white,
-                          ),
+                        // Left: Search input field (or Page Title + Search)
+                        Row(
+                          children: [
+                            if (_activeItem != 'dashboard' &&
+                                _headerTitle != null &&
+                                _headerTitle!.isNotEmpty) ...[
+                              Text(
+                                _headerTitle!,
+                                style: const TextStyle(
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.bold,
+                                  color: Color(0xFF0F172A),
+                                ),
+                              ),
+                              const SizedBox(width: 20),
+                            ],
+                            SizedBox(
+                              width: 360,
+                              height: 40,
+                              child: TextField(
+                                controller: _desktopSearchController,
+                                onSubmitted: _onHeaderSearchSubmitted,
+                                style: const TextStyle(
+                                  fontSize: 13,
+                                  color: Color(0xFF0F172A),
+                                ),
+                                decoration: InputDecoration(
+                                  hintText:
+                                      'Search cases, clients, or case numbers...',
+                                  hintStyle: const TextStyle(
+                                    fontSize: 13,
+                                    color: Color(0xFF94A3B8),
+                                  ),
+                                  prefixIcon: const Icon(
+                                    Icons.search_rounded,
+                                    size: 19,
+                                    color: Color(0xFF94A3B8),
+                                  ),
+                                  filled: true,
+                                  fillColor: const Color(0xFFF1F5F9),
+                                  contentPadding:
+                                      const EdgeInsets.symmetric(horizontal: 14),
+                                  border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                    borderSide: BorderSide.none,
+                                  ),
+                                  enabledBorder: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                    borderSide: BorderSide.none,
+                                  ),
+                                  focusedBorder: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                    borderSide: const BorderSide(
+                                      color: Color(0xFF1E6BFF),
+                                      width: 1.2,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
-                        _buildRemindersBellIcon(),
+                        // Right: Help, Bell, User Profile
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              tooltip: 'Help Center',
+                              icon: const Icon(
+                                Icons.help_outline_rounded,
+                                color: Color(0xFF64748B),
+                                size: 22,
+                              ),
+                              onPressed: _openHelpCenter,
+                            ),
+                            const SizedBox(width: 6),
+                            _buildRemindersBellIcon(lightSurface: true),
+                            const SizedBox(width: 14),
+                            InkWell(
+                              onTap: () {
+                                Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (context) =>
+                                        const AttorneyProfilePage(),
+                                  ),
+                                );
+                              },
+                              borderRadius: BorderRadius.circular(20),
+                              child: Container(
+                                width: 38,
+                                height: 38,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  border: Border.all(
+                                    color: const Color(0xFFCBD5E1),
+                                    width: 1.5,
+                                  ),
+                                ),
+                                child: ClipOval(
+                                  child: _currentUser?.photoUrl != null &&
+                                          _currentUser!.photoUrl!.trim().isNotEmpty
+                                      ? Image.network(
+                                          _currentUser!.photoUrl!,
+                                          fit: BoxFit.cover,
+                                          errorBuilder: (_, __, ___) =>
+                                              const Icon(
+                                            Icons.person_rounded,
+                                            color: Color(0xFF64748B),
+                                            size: 22,
+                                          ),
+                                        )
+                                      : const Icon(
+                                          Icons.person_rounded,
+                                          color: Color(0xFF64748B),
+                                          size: 22,
+                                        ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
                       ],
                     ),
                   ),
@@ -977,51 +1242,16 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       ),
       // Drawer removed on mobile – navigation handled by bottom nav
       drawer: null,
-      // Bottom Navigation - Mobile only
-      bottomNavigationBar: !isDesktop
-          ? Container(
-              decoration: BoxDecoration(
-                color: Colors.white,
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(0.1),
-                    blurRadius: 10,
-                    offset: const Offset(0, -2),
-                  ),
-                ],
-              ),
-              child: SafeArea(
-                child: Container(
-                  height: 72,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 4,
-                    vertical: 4,
-                  ),
-                  child: Row(
-                    children: [
-                      _buildBottomNavItem(Icons.dashboard, 'Dashboard', 0),
-                      _buildBottomNavItem(Icons.folder, 'Cases', 1),
-                      _buildBottomNavItem(Icons.inbox, 'Requests', 2),
-                      _buildBottomNavItem(Icons.pending, 'Pending', 3),
-                      _buildBottomNavItem(Icons.calendar_today, 'Calendar', 4),
-                      _buildBottomNavItem(
-                        Icons.message_outlined,
-                        'Messages',
-                        5,
-                        badge: _unreadCount,
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            )
-          : null,
+      // Bottom Navigation - Mobile only (iPhone-style floating frosted glass capsule dock)
+      bottomNavigationBar: !isDesktop ? _buildIphoneFloatingNavBar() : null,
     );
   }
 
   Widget _buildContent() {
     final isDesktop = MediaQuery.of(context).size.width >= 800;
 
+    final attorneyId =
+        _currentUser?.id ?? FirebaseAuth.instance.currentUser?.uid ?? '';
     if (!isDesktop) {
       return LazyIndexedStack(
         key: _mobileTabStackKey,
@@ -1030,17 +1260,16 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
             ? _dashboardTabRevision
             : _selectedBottomNavIndex == 1
                 ? 'attorney_cases_tab_v4'
-                : _selectedBottomNavIndex == 4
-                    ? 'attorney_calendar_overlay_v6'
-                    : 'mobile_tab_$_selectedBottomNavIndex',
+                : _selectedBottomNavIndex == 3
+                    ? 'attorney_calendar_overlay_v8'
+                    : 'mobile_tab_${_selectedBottomNavIndex}_$attorneyId',
         builders: [
           () => _buildDashboardView(),
           () => _buildCasesView(isMobile: true),
           () => AttorneyCaseRequestsScreen(
             embedded: true,
-            attorneyId: FirebaseAuth.instance.currentUser?.uid ?? '',
+            attorneyId: attorneyId,
           ),
-          () => _buildPendingCasesView(isMobile: true),
           () => AppointmentCalendarView(
             embedded: true,
             initialAppointments: _allAppointments,
@@ -1051,7 +1280,6 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       );
     }
 
-    final attorneyId = FirebaseAuth.instance.currentUser?.uid ?? '';
     return LazyIndexedStack(
       key: _desktopTabStackKey,
       index: _desktopTabIndex(),
@@ -1059,9 +1287,9 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
           ? _dashboardTabRevision
           : _desktopTabIndex() == 1
               ? 'attorney_cases_tab_v4'
-              : _desktopTabIndex() == 6
-                  ? 'attorney_calendar_overlay_v6'
-                  : 'desktop_tab_${_desktopTabIndex()}',
+              : _desktopTabIndex() == 5
+                  ? 'attorney_calendar_overlay_v8'
+                  : 'desktop_tab_${_desktopTabIndex()}_$attorneyId',
       builders: [
         () => _buildDashboardView(),
         () => _buildCasesView(isMobile: false),
@@ -1069,8 +1297,10 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
           embedded: true,
           attorneyId: attorneyId,
         ),
-        () => _buildPendingCasesView(isMobile: false),
-        () => const AttorneyTasksScreen(),
+        () => AttorneyTasksScreen(
+          embedded: true,
+          attorneyId: attorneyId,
+        ),
         () => const ChatListPage(),
         () => AppointmentCalendarView(
           embedded: true,
@@ -1082,167 +1312,83 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     );
   }
 
-  void _openBilling() {
-    final attorneyId = FirebaseAuth.instance.currentUser?.uid;
-    if (attorneyId == null) return;
-    Get.to(
-      () => BillingManagementScreen(
-        attorneyId: attorneyId,
-        title: 'Billing & Payments',
-        recorderRole: 'attorney',
-        recorderName: FirebaseAuth.instance.currentUser?.displayName,
-      ),
-    );
-  }
-
   Widget _buildDashboardView() {
     final isDesktop = MediaQuery.of(context).size.width >= 800;
-    final crossAxisCount = isDesktop
-        ? (MediaQuery.of(context).size.width > 1200 ? 4 : 3)
-        : 2;
-
-    return SingleChildScrollView(
-      physics: const AlwaysScrollableScrollPhysics(
-        parent: BouncingScrollPhysics(),
-      ),
-      padding: EdgeInsets.symmetric(
-        horizontal: isDesktop ? 24 : 16,
-        vertical: 16,
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            margin: const EdgeInsets.only(bottom: 24),
-            padding: const EdgeInsets.all(24),
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                colors: [AppTheme.royalBlue, AppTheme.deepNavy],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
+    return AttorneyModernDashboardView(
+      key: const ValueKey('attorney_modern_dashboard_view'),
+      stats: _stats,
+      myCases: _myCases,
+      allAppointments: _allAppointments,
+      pendingRequests: _pendingRequests,
+      upcomingAppointments: _upcomingAppointments,
+      currentUser: _currentUser,
+      isDesktop: isDesktop,
+      onCreateCase: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => const AttorneyCreateCaseScreen(),
+          ),
+        ).then((created) {
+          if (created == true && mounted) {
+            setState(() {
+              _activeItem = 'dashboard';
+            });
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Case created successfully!'),
+                backgroundColor: Colors.green,
               ),
-              borderRadius: BorderRadius.circular(20),
-              boxShadow: [
-                BoxShadow(
-                  color: AppTheme.royalBlue.withOpacity(0.3),
-                  blurRadius: 20,
-                  offset: const Offset(0, 10),
-                ),
-              ],
+            );
+            _loadDashboardData();
+          }
+        }).catchError((error) {
+          if (mounted && kDebugMode) {
+            debugPrint('Navigation error: $error');
+          }
+        });
+      },
+      onViewAllTasks: () {
+        if (isDesktop) {
+          setState(() {
+            _activeItem = 'tasks';
+          });
+        } else {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => const AttorneyTasksScreen(),
             ),
-            child: Row(
-              children: [
-                Container(
-                  width: 60,
-                  height: 60,
-                  decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.2),
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  child: const Icon(Icons.gavel, color: Colors.white, size: 32),
-                ),
-                const SizedBox(width: 20),
-                const Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Attorney Dashboard',
-                        style: TextStyle(
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                        ),
-                      ),
-                      SizedBox(height: 4),
-                      Text(
-                        'Manage your cases and appointments',
-                        style: TextStyle(
-                          fontSize: 14,
-                          color: Colors.white70,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
+          );
+        }
+      },
+      onPaymentHistory: () => _handleItemSelected('payment_history'),
+      onViewCalendar: () {
+        setState(() {
+          if (isDesktop) {
+            _activeItem = 'calendar';
+          } else {
+            _selectedBottomNavIndex = 4;
+            _activeItem = 'calendar';
+          }
+        });
+        _ensureHearingCalendarSync();
+      },
+      onNavigate: (item, {caseFilter}) =>
+          _handleItemSelected(item, caseFilter: caseFilter),
+      onCaseTap: (caseModel) {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => CaseDetailPage(
+              caseId: caseModel.id,
             ),
           ),
-          GridView.count(
-            crossAxisCount: crossAxisCount,
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            mainAxisSpacing: 16,
-            crossAxisSpacing: 16,
-            childAspectRatio: isDesktop ? 1.5 : 0.95,
-            children: [
-              StatCard(
-                title: 'Total Cases',
-                value: '${_stats['totalCases'] ?? 0}',
-                description: 'All assigned cases',
-                icon: Icons.folder_outlined,
-                iconColor: AppTheme.royalBlue,
-                percentageChange: '+3.4%',
-                onTap: () => _handleItemSelected(
-                  'cases',
-                  caseFilter: CaseStatusFilter.active,
-                ),
-              ),
-              StatCard(
-                title: 'Active Cases',
-                value: '${_stats['activeCases'] ?? 0}',
-                description: 'In progress',
-                icon: Icons.work_outline,
-                iconColor: const Color(0xFF48BB78),
-                percentageChange: '+1.2%',
-                onTap: () => _handleItemSelected(
-                  'cases',
-                  caseFilter: CaseStatusFilter.inProgress,
-                ),
-              ),
-              StatCard(
-                title: 'Completed Cases',
-                value: '${_stats['completedCases'] ?? 0}',
-                description: 'Finished cases',
-                icon: Icons.check_circle_outline,
-                iconColor: const Color(0xFFED8936),
-                percentageChange: '+0.8%',
-                onTap: () => _handleItemSelected('closed_cases'),
-              ),
-              StatCard(
-                title: 'Pending Requests',
-                value: '${_stats['pendingCases'] ?? 0}',
-                description: 'Appointment requests',
-                icon: Icons.pending_outlined,
-                iconColor: const Color(0xFFF56565),
-                isPositiveChange: false,
-                percentageChange: '-2.1%',
-                onTap: () => _handleItemSelected('pending'),
-              ),
-              StatCard(
-                title: 'Upcoming Appointments',
-                value: '${_stats['upcomingAppointments'] ?? 0}',
-                description: 'Scheduled meetings',
-                icon: Icons.calendar_today_outlined,
-                iconColor: const Color(0xFF764BA2),
-                onTap: () {
-                  setState(() {
-                    if (isDesktop) {
-                      _activeItem = 'calendar';
-                    } else {
-                      _selectedBottomNavIndex = 4;
-                      _activeItem = 'calendar';
-                    }
-                  });
-                  _ensureHearingCalendarSync();
-                },
-              ),
-            ],
-          ),
-          const SizedBox(height: 32),
-          ..._dashboardBody(isDesktop: isDesktop),
-        ],
-      ),
+        );
+      },
+      onAppointmentTap: (apt) {
+        _handleItemSelected('calendar');
+      },
     );
   }
 
@@ -1440,25 +1586,6 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
                         ),
                       ),
                     ),
-                    OutlinedButton.icon(
-                      onPressed: _openBilling,
-                      icon: const Icon(
-                        Icons.account_balance_wallet_outlined,
-                        size: 20,
-                      ),
-                      label: const Text('Billing & Payments'),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: AppTheme.royalBlue,
-                        side: const BorderSide(color: AppTheme.royalBlue),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 20,
-                          vertical: 12,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                      ),
-                    ),
                   ],
                 ),
               ],
@@ -1467,33 +1594,8 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
 
           const SizedBox(height: 32),
 
-          // Bottom section: upcoming appointments & pending requests
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final isWide = constraints.maxWidth > 900;
-              if (isWide) {
-                return Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Expanded(
-                      flex: 2,
-                      child: _buildUpcomingAppointmentsSection(),
-                    ),
-                    const SizedBox(width: 16),
-                    Expanded(flex: 1, child: _buildPendingRequestsSection()),
-                  ],
-                );
-              } else {
-                return Column(
-                  children: [
-                    _buildUpcomingAppointmentsSection(),
-                    const SizedBox(height: 16),
-                    _buildPendingRequestsSection(),
-                  ],
-                );
-              }
-            },
-          ),
+          // Bottom section: upcoming appointments
+          _buildUpcomingAppointmentsSection(),
     ];
   }
 
@@ -1554,70 +1656,15 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     );
   }
 
-  Widget _buildPendingRequestsSection() {
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: const Color(0xFFF5F7FF),
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.05),
-            blurRadius: 10,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(
-                Icons.pending_actions_outlined,
-                color: const Color(0xFFF56565),
-                size: 22,
-              ),
-              const SizedBox(width: 8),
-              Text(
-                'Pending Requests',
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                  color: const Color(0xFF1C1C1C),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          if (_pendingRequests.isEmpty)
-            Padding(
-              padding: const EdgeInsets.all(12),
-              child: Text(
-                'No pending appointment requests',
-                style: TextStyle(fontSize: 14, color: const Color(0xFF6D6D6D)),
-              ),
-            )
-          else
-            ..._pendingRequests.take(5).map((appointment) {
-              return Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: _buildPendingRequestCard(appointment),
-              );
-            }),
-        ],
-      ),
-    );
-  }
-
   Widget _buildCasesView({required bool isMobile}) {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) {
-      return const Center(child: Text('Not logged in'));
+    final uid =
+        _currentUser?.id ?? FirebaseAuth.instance.currentUser?.uid ?? '';
+    if (uid.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
     }
     return _AttorneyCasesTab(
       key: const ValueKey('attorney_cases_tab_v4'),
-      attorneyId: user.uid,
+      attorneyId: uid,
       isMobile: isMobile,
       fallbackCases: _myCases,
       caseService: _caseService,
@@ -1628,90 +1675,6 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     );
   }
 
-  /// Pending appointment requests from clients (status == 'pending')
-  Widget _buildPendingCasesView({required bool isMobile}) {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) {
-      return const Center(child: Text('Not logged in'));
-    }
-
-    return StreamBuilder<List<AppointmentModel>>(
-      stream: _appointmentService.getAttorneyAppointments(user.uid),
-      builder: (context, snapshot) {
-        final allAppointments = snapshot.hasData
-            ? snapshot.data!
-            : List<AppointmentModel>.from(_allAppointments);
-        final pending = allAppointments
-            .where((apt) => apt.status.toLowerCase() == 'pending')
-            .toList();
-        if (snapshot.hasError && pending.isEmpty) {
-          return _mobileTabShell(
-            child: const Center(
-              child: Text(
-                'Could not load pending requests',
-                style: TextStyle(color: Colors.red),
-              ),
-            ),
-          );
-        }
-
-        final displayPending = pending.isNotEmpty
-            ? pending
-            : List<AppointmentModel>.from(_pendingRequests);
-
-        if (displayPending.isEmpty) {
-          return const Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(Icons.pending_actions, size: 64, color: Colors.grey),
-                SizedBox(height: 16),
-                Text(
-                  'No pending requests',
-                  style: TextStyle(fontSize: 18, color: Colors.grey),
-                ),
-              ],
-            ),
-          );
-        }
-
-        if (isMobile) {
-          return ListView.builder(
-            physics: const AlwaysScrollableScrollPhysics(
-              parent: BouncingScrollPhysics(),
-            ),
-            padding: const EdgeInsets.all(16),
-            itemCount: displayPending.length,
-            itemBuilder: (context, index) {
-              final appointment = displayPending[index];
-              return Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: _buildPendingRequestCard(appointment),
-              );
-            },
-          );
-        } else {
-          return SingleChildScrollView(
-            physics: const AlwaysScrollableScrollPhysics(
-              parent: BouncingScrollPhysics(),
-            ),
-            padding: const EdgeInsets.all(24),
-            child: Wrap(
-              spacing: 16,
-              runSpacing: 16,
-              children: [
-                for (final appointment in displayPending)
-                  SizedBox(
-                    width: 320,
-                    child: _buildPendingRequestCard(appointment),
-                  ),
-              ],
-            ),
-          );
-        }
-      },
-    );
-  }
 
   String _activeItemForBottomNavIndex(int index) {
     switch (index) {
@@ -1720,68 +1683,108 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
       case 2:
         return 'case_requests';
       case 3:
-        return 'pending';
-      case 4:
         return 'calendar';
-      case 5:
+      case 4:
         return 'messages';
       default:
         return 'dashboard';
     }
   }
 
-  Widget _buildBottomNavItem(
-    IconData icon,
-    String label,
-    int index, {
-    int badge = 0,
-  }) {
-    final isActive = _selectedBottomNavIndex == index;
-    return Expanded(
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          onTap: () {
-            if (_selectedBottomNavIndex == index) return;
-            setState(() {
-              _selectedBottomNavIndex = index;
-              _activeItem = _activeItemForBottomNavIndex(index);
-            });
-            if (index == 1) {
-              _closedCasesFolder.value = false;
-              _casesStatusFilter.value = CaseStatusFilter.active;
-            }
-            if (index == 4) _ensureHearingCalendarSync();
-            if (index == 5) unawaited(_loadUnreadCount());
-          },
-          borderRadius: BorderRadius.circular(12),
-          child: SizedBox(
-            height: 64,
-            width: double.infinity,
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                _navIconWithBadge(
-                  icon,
-                  badge: badge,
-                  color: isActive
-                      ? AppTheme.royalBlue
-                      : const Color(0xFF6D6D6D),
+  Widget _buildIphoneFloatingNavBar() {
+    final navItems = [
+      (
+        icon: Icons.grid_view_rounded,
+        unselectedIcon: Icons.grid_view_outlined,
+        label: 'Dashboard',
+        badge: 0,
+      ),
+      (
+        icon: Icons.folder_rounded,
+        unselectedIcon: Icons.folder_outlined,
+        label: 'Cases',
+        badge: 0,
+      ),
+      (
+        icon: Icons.move_to_inbox_rounded,
+        unselectedIcon: Icons.inbox_outlined,
+        label: 'Requests',
+        badge: 0,
+      ),
+      (
+        icon: Icons.calendar_month_rounded,
+        unselectedIcon: Icons.calendar_today_outlined,
+        label: 'Calendar',
+        badge: 0,
+      ),
+      (
+        icon: Icons.chat_bubble_rounded,
+        unselectedIcon: Icons.chat_bubble_outline_rounded,
+        label: 'Messages',
+        badge: _unreadCount,
+      ),
+    ];
+
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(28),
+          child: BackdropFilter(
+            filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+            child: Container(
+              height: 66,
+              decoration: BoxDecoration(
+                color: const Color(0xFF07152B).withValues(alpha: 0.92),
+                borderRadius: BorderRadius.circular(28),
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.14),
+                  width: 1,
                 ),
-                const SizedBox(height: 4),
-                Text(
-                  label,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 10,
-                    fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
-                    color: isActive
-                        ? AppTheme.royalBlue
-                        : const Color(0xFF6D6D6D),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xFF07152B).withValues(alpha: 0.50),
+                    blurRadius: 26,
+                    offset: const Offset(0, 8),
                   ),
-                ),
-              ],
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.20),
+                    blurRadius: 10,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+              child: Row(
+                children: List.generate(navItems.length, (index) {
+                  final item = navItems[index];
+                  final isSelected = _selectedBottomNavIndex == index;
+
+                  return Expanded(
+                    child: _AttorneyIphoneNavButton(
+                      isSelected: isSelected,
+                      icon: item.icon,
+                      unselectedIcon: item.unselectedIcon,
+                      label: item.label,
+                      badge: item.badge,
+                      onTap: () {
+                        if (_selectedBottomNavIndex == index) return;
+                        setState(() {
+                          _selectedBottomNavIndex = index;
+                          _activeItem = _activeItemForBottomNavIndex(index);
+                        });
+                        if (index == 1) {
+                          _closedCasesFolder.value = false;
+                          _casesStatusFilter.value = CaseStatusFilter.all;
+                        }
+                        if (index == 3) _ensureHearingCalendarSync();
+                        if (index == 4) unawaited(_loadUnreadCount());
+                      },
+                    ),
+                  );
+                }),
+              ),
             ),
           ),
         ),
@@ -1789,408 +1792,7 @@ class _AttorneyDashboardState extends State<AttorneyDashboard> {
     );
   }
 
-  /// Card UI for a single pending appointment request
-  Widget _buildPendingRequestCard(AppointmentModel appointment) {
-    final compact = kIsWeb;
-    return InkWell(
-      borderRadius: BorderRadius.circular(12),
-      onTap: () => _showPendingRequestDetails(appointment),
-      child: Container(
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(12),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.05),
-              blurRadius: 8,
-              offset: const Offset(0, 2),
-            ),
-          ],
-        ),
-        child: Padding(
-          padding: EdgeInsets.all(compact ? 12 : 16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          DateFormat(
-                            'MMM dd, yyyy – hh:mm a',
-                          ).format(appointment.appointmentDateTime),
-                          style: TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
-                          ),
-                          overflow: TextOverflow.ellipsis,
-                          maxLines: 1,
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          'Client: ${appointment.clientName}',
-                          style: TextStyle(
-                            fontSize: 13,
-                            color: Colors.grey[700],
-                          ),
-                          overflow: TextOverflow.ellipsis,
-                          maxLines: 1,
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 4,
-                    ),
-                    decoration: BoxDecoration(
-                      color: Colors.orange.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(color: Colors.orange),
-                    ),
-                    child: Text(
-                      'PENDING',
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.orange[800],
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              if (appointment.notes != null &&
-                  appointment.notes!.trim().isNotEmpty) ...[
-                const SizedBox(height: 8),
-                Text(
-                  appointment.notes!,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 12, color: Colors.grey[700]),
-                ),
-              ],
-              // Action buttons row
-              SizedBox(height: compact ? 8 : 12),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  // Message icon button
-                  IconButton(
-                    icon: Icon(
-                      Icons.message,
-                      color: AppTheme.royalBlue,
-                      size: 18,
-                    ),
-                    tooltip: 'Message Client',
-                    onPressed: () =>
-                        unawaited(_openChatWithClient(appointment)),
-                    style: IconButton.styleFrom(
-                      backgroundColor: AppTheme.royalBlue.withOpacity(0.1),
-                      padding: const EdgeInsets.all(8),
-                      minimumSize: const Size(36, 36),
-                      fixedSize: const Size(36, 36),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  // Accept button
-                  ElevatedButton(
-                    onPressed: () async {
-                      // Navigate to confirm schedule screen
-                      await Get.to(
-                        () => ConfirmAppointmentSchedulePage(
-                          pendingRequest: appointment,
-                        ),
-                      );
-                    },
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: AppTheme.royalBlue,
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 8,
-                      ),
-                    ),
-                    child: Text(
-                      'Accept',
-                      style: TextStyle(
-                        fontWeight: FontWeight.w600,
-                        fontSize: 13,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
 
-  Future<void> _showPendingRequestDetails(AppointmentModel appointment) async {
-    await showDialog<void>(
-      context: context,
-      builder: (context) {
-        return AlertDialog(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-          ),
-          title: Text(
-            'Appointment Request',
-            style: TextStyle(fontWeight: FontWeight.bold),
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                DateFormat(
-                  'MMM dd, yyyy – hh:mm a',
-                ).format(appointment.appointmentDateTime),
-                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Client: ${appointment.clientName}',
-                style: TextStyle(fontSize: 13),
-              ),
-              if (appointment.notes != null &&
-                  appointment.notes!.trim().isNotEmpty) ...[
-                const SizedBox(height: 12),
-                Text(
-                  'Notes:',
-                  style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
-                ),
-                const SizedBox(height: 4),
-                Text(appointment.notes!, style: TextStyle(fontSize: 13)),
-              ],
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: Text('Close', style: TextStyle()),
-            ),
-            TextButton(
-              onPressed: () async {
-                Navigator.pop(context);
-                await _showDeclineRequestDialog(appointment);
-              },
-              child: Text('Decline', style: TextStyle(color: Colors.red)),
-            ),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // Message icon button
-                IconButton(
-                  icon: Icon(
-                    Icons.message,
-                    color: AppTheme.royalBlue,
-                    size: 18,
-                  ),
-                  tooltip: 'Message Client',
-                  onPressed: () {
-                    Navigator.pop(context);
-                    unawaited(_openChatWithClient(appointment));
-                  },
-                  style: IconButton.styleFrom(
-                    backgroundColor: AppTheme.royalBlue.withOpacity(0.1),
-                    padding: const EdgeInsets.all(8),
-                    minimumSize: const Size(36, 36),
-                    fixedSize: const Size(36, 36),
-                  ),
-                ),
-                const SizedBox(width: 4),
-                // Accept button
-                ElevatedButton(
-                  onPressed: () async {
-                    Navigator.pop(context);
-                    // Navigate to confirm schedule screen instead of auto-accept
-                    await Get.to(
-                      () => ConfirmAppointmentSchedulePage(
-                        pendingRequest: appointment,
-                      ),
-                    );
-                  },
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppTheme.royalBlue,
-                    foregroundColor: Colors.white,
-                  ),
-                  child: Text(
-                    'Accept',
-                    style: TextStyle(fontWeight: FontWeight.w600),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  /// Opens a chat with the client from the appointment
-  Future<void> _openChatWithClient(AppointmentModel appointment) async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) return;
-
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Opening chat...'),
-          duration: Duration(milliseconds: 600),
-        ),
-      );
-    }
-
-    try {
-      // Get or create chat with the client
-      final chatId = await _chatService.getOrCreateChat(
-        user.uid,
-        appointment.clientId,
-      );
-
-      // Navigate to attorney chat screen
-      Get.to(
-        () => AttorneyClientChatScreen(
-          chatId: chatId,
-          clientId: appointment.clientId,
-          clientName: appointment.clientName,
-        ),
-      );
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Failed to open chat: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    }
-  }
-
-  /// Secondary dialog to capture optional decline reason and update Firestore.
-  Future<void> _showDeclineRequestDialog(AppointmentModel appointment) async {
-    final TextEditingController reasonController = TextEditingController();
-    bool isSubmitting = false;
-    Map<String, dynamic>? declineResult;
-
-    await showDialog<void>(
-      context: context,
-      barrierDismissible: !isSubmitting,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setState) {
-            return AlertDialog(
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(16),
-              ),
-              title: Text(
-                'Decline Request',
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
-              content: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'You can optionally provide a reason for declining this appointment.',
-                    style: TextStyle(fontSize: 13),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: reasonController,
-                    maxLines: 3,
-                    decoration: InputDecoration(
-                      hintText: 'Reason (optional)',
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              actions: [
-                TextButton(
-                  onPressed: isSubmitting
-                      ? null
-                      : () {
-                          Navigator.pop(context);
-                        },
-                  child: Text('Cancel', style: TextStyle()),
-                ),
-                ElevatedButton(
-                  onPressed: isSubmitting
-                      ? null
-                      : () async {
-                          // Capture navigator before async operation
-                          final navigator = Navigator.of(context);
-                          setState(() {
-                            isSubmitting = true;
-                          });
-                          final result = await _appointmentService
-                              .updateRequestStatus(
-                                appointment.id,
-                                status: 'declined',
-                                declineReason: reasonController.text,
-                              );
-                          if (!mounted) return;
-                          declineResult = result;
-                          navigator.pop();
-                        },
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.red,
-                    foregroundColor: Colors.white,
-                  ),
-                  child: isSubmitting
-                      ? const SizedBox(
-                          height: 18,
-                          width: 18,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            valueColor: AlwaysStoppedAnimation<Color>(
-                              Colors.white,
-                            ),
-                          ),
-                        )
-                      : Text(
-                          'Decline Request',
-                          style: TextStyle(fontWeight: FontWeight.w600),
-                        ),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-
-    // Show snackbar after dialog closes if result is available
-    if (declineResult != null && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(declineResult!['message'] ?? 'Request declined'),
-          backgroundColor: declineResult!['success'] == true
-              ? Colors.red
-              : Colors.grey,
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-          ),
-          margin: const EdgeInsets.all(16),
-        ),
-      );
-    }
-  }
 }
 
 /// Matches case title/type against search text (supports partial + multi-word).
@@ -2246,12 +1848,15 @@ class _AttorneyCasesTab extends StatefulWidget {
 class _AttorneyCasesTabState extends State<_AttorneyCasesTab> {
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
-  String _statusFilter = CaseStatusFilter.active;
+  String _statusFilter = CaseStatusFilter.all;
   bool _closedFolder = false;
+  late Stream<List<CaseModel>> _casesStream;
 
   @override
   void initState() {
     super.initState();
+    _casesStream =
+        widget.caseService.getCasesForUser(widget.attorneyId, 'attorney');
     widget.headerSearch.addListener(_applyHeaderSearch);
     widget.statusFilter.addListener(_applyStatusFilter);
     widget.closedFolder.addListener(_applyClosedFolder);
@@ -2281,6 +1886,10 @@ class _AttorneyCasesTabState extends State<_AttorneyCasesTab> {
       oldWidget.closedFolder.removeListener(_applyClosedFolder);
       widget.closedFolder.addListener(_applyClosedFolder);
       _applyClosedFolder();
+    }
+    if (oldWidget.attorneyId != widget.attorneyId) {
+      _casesStream =
+          widget.caseService.getCasesForUser(widget.attorneyId, 'attorney');
     }
   }
 
@@ -2353,7 +1962,7 @@ class _AttorneyCasesTabState extends State<_AttorneyCasesTab> {
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<List<CaseModel>>(
-      stream: widget.caseService.getCasesForUser(widget.attorneyId, 'attorney'),
+      stream: _casesStream,
       builder: (context, snapshot) {
         final cases = snapshot.data ?? List<CaseModel>.from(widget.fallbackCases);
 
@@ -2381,9 +1990,7 @@ class _AttorneyCasesTabState extends State<_AttorneyCasesTab> {
 
         final filter = _closedFolder
             ? CaseStatusFilter.completed
-            : (_statusFilter == CaseStatusFilter.all
-                ? CaseStatusFilter.active
-                : _statusFilter);
+            : _statusFilter;
         final filteredCases = cases
             .where((c) => CaseStatusFilter.matches(c, filter))
             .where((c) => caseTitleMatchesSearch(c, _searchQuery))
@@ -2406,9 +2013,7 @@ class _AttorneyCasesTabState extends State<_AttorneyCasesTab> {
         Widget filterControl({Color? iconColor}) {
           if (_closedFolder) return const SizedBox.shrink();
           return CaseStatusFilterButton(
-            selected: _statusFilter == CaseStatusFilter.all
-                ? CaseStatusFilter.active
-                : _statusFilter,
+            selected: _statusFilter,
             iconColor: iconColor ?? AppTheme.royalBlue,
             values: CaseStatusFilter.attorneyMyCaseValues,
             onSelected: (value) {
@@ -2425,81 +2030,131 @@ class _AttorneyCasesTabState extends State<_AttorneyCasesTab> {
               widget.closedFolder.value = nextClosed;
               widget.statusFilter.value = nextClosed
                   ? CaseStatusFilter.completed
-                  : CaseStatusFilter.active;
+                  : CaseStatusFilter.all;
               setState(() {
                 _closedFolder = nextClosed;
                 _statusFilter = widget.statusFilter.value;
               });
             },
-            child: Text(_closedFolder ? 'My Cases' : 'Closed cases'),
+            child: Text(_closedFolder ? 'Cases' : 'Closed cases'),
           );
         }
 
         if (widget.isMobile) {
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
+          return Stack(
             children: [
-              Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 12,
-                ),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _searchController,
-                        decoration: _searchDecoration(),
-                        onChanged: _onSearchChanged,
-                        textInputAction: TextInputAction.search,
-                      ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 12,
                     ),
-                    folderLink(),
-                    filterControl(),
-                  ],
-                ),
-              ),
-              if (filteredCases.isEmpty)
-                Expanded(
-                  child: ListView(
-                    physics: const AlwaysScrollableScrollPhysics(
-                      parent: BouncingScrollPhysics(),
-                    ),
-                    children: [
-                      SizedBox(
-                        height: MediaQuery.of(context).size.height * 0.35,
-                        child: Center(
-                          child: Text(
-                            emptyMessage(),
-                            style: const TextStyle(
-                              fontSize: 16,
-                              color: Colors.grey,
-                            ),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _searchController,
+                            decoration: _searchDecoration(),
+                            onChanged: _onSearchChanged,
+                            textInputAction: TextInputAction.search,
                           ),
                         ),
-                      ),
-                    ],
-                  ),
-                )
-              else
-                Expanded(
-                  child: ListView.builder(
-                    physics: const AlwaysScrollableScrollPhysics(
-                      parent: BouncingScrollPhysics(),
+                        folderLink(),
+                        filterControl(),
+                      ],
                     ),
-                    padding: const EdgeInsets.all(16),
-                    itemCount: filteredCases.length,
-                    itemBuilder: (context, index) {
-                      final caseModel = filteredCases[index];
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 12),
-                        child: CaseCard(
-                          caseModel: caseModel,
-                          onTap: () {
-                            Get.to(
-                              () => CaseDetailPage(caseId: caseModel.id),
-                            );
-                          },
+                  ),
+                  if (filteredCases.isEmpty)
+                    Expanded(
+                      child: ListView(
+                        physics: const AlwaysScrollableScrollPhysics(
+                          parent: BouncingScrollPhysics(),
+                        ),
+                        children: [
+                          SizedBox(
+                            height: MediaQuery.of(context).size.height * 0.35,
+                            child: Center(
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Text(
+                                    emptyMessage(),
+                                    style: const TextStyle(
+                                      fontSize: 16,
+                                      color: Colors.grey,
+                                    ),
+                                  ),
+                                  if (!_closedFolder) ...[
+                                    const SizedBox(height: 16),
+                                    ElevatedButton.icon(
+                                      onPressed: () {
+                                        Navigator.push(
+                                          context,
+                                          MaterialPageRoute(
+                                            builder: (context) =>
+                                                const AttorneyCreateCaseScreen(),
+                                          ),
+                                        );
+                                      },
+                                      icon: const Icon(Icons.add, size: 18),
+                                      label: const Text('Create New Case'),
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: AppTheme.royalBlue,
+                                        foregroundColor: Colors.white,
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    )
+                  else
+                    Expanded(
+                      child: ListView.builder(
+                        physics: const AlwaysScrollableScrollPhysics(
+                          parent: BouncingScrollPhysics(),
+                        ),
+                        padding: const EdgeInsets.all(16),
+                        itemCount: filteredCases.length,
+                        itemBuilder: (context, index) {
+                          final caseModel = filteredCases[index];
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 12),
+                            child: CaseCard(
+                              caseModel: caseModel,
+                              onTap: () {
+                                Get.to(
+                                  () => CaseDetailPage(caseId: caseModel.id),
+                                );
+                              },
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                ],
+              ),
+              if (!_closedFolder)
+                Positioned(
+                  right: 16,
+                  bottom: 16,
+                  child: FloatingActionButton.extended(
+                    heroTag: 'attorney_cases_mobile_create_fab',
+                    backgroundColor: AppTheme.royalBlue,
+                    foregroundColor: Colors.white,
+                    icon: const Icon(Icons.add),
+                    label: const Text('Create Case'),
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) =>
+                              const AttorneyCreateCaseScreen(),
                         ),
                       );
                     },
@@ -2658,3 +2313,151 @@ class _NavBarItemState extends State<_NavBarItem> {
     );
   }
 }
+
+class _AttorneyIphoneNavButton extends StatefulWidget {
+  final bool isSelected;
+  final IconData icon;
+  final IconData unselectedIcon;
+  final String label;
+  final int badge;
+  final VoidCallback onTap;
+
+  const _AttorneyIphoneNavButton({
+    required this.isSelected,
+    required this.icon,
+    required this.unselectedIcon,
+    required this.label,
+    required this.badge,
+    required this.onTap,
+  });
+
+  @override
+  State<_AttorneyIphoneNavButton> createState() =>
+      _AttorneyIphoneNavButtonState();
+}
+
+class _AttorneyIphoneNavButtonState extends State<_AttorneyIphoneNavButton> {
+  bool _isDown = false;
+
+  @override
+  Widget build(BuildContext context) {
+    const activeColor = Color(0xFF38BDF8); // Electric cyan-blue
+    final inactiveColor = Colors.white.withValues(alpha: 0.60);
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTapDown: (_) => setState(() => _isDown = true),
+      onTapUp: (_) {
+        setState(() => _isDown = false);
+        unawaited(HapticFeedback.lightImpact());
+        widget.onTap();
+      },
+      onTapCancel: () => setState(() => _isDown = false),
+      child: AnimatedScale(
+        scale: _isDown ? 0.88 : (widget.isSelected ? 1.04 : 1.0),
+        duration: const Duration(milliseconds: 140),
+        curve: Curves.easeOutCubic,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOutCubic,
+          margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+          decoration: BoxDecoration(
+            color: widget.isSelected
+                ? const Color(0xFF1E6BFF).withValues(alpha: 0.24)
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: widget.isSelected
+                  ? const Color(0xFF38BDF8).withValues(alpha: 0.35)
+                  : Colors.transparent,
+              width: 1,
+            ),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Stack(
+                clipBehavior: Clip.none,
+                alignment: Alignment.center,
+                children: [
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 200),
+                    transitionBuilder: (child, anim) =>
+                        ScaleTransition(scale: anim, child: child),
+                    child: Icon(
+                      widget.isSelected ? widget.icon : widget.unselectedIcon,
+                      key: ValueKey<bool>(widget.isSelected),
+                      size: 21,
+                      color: widget.isSelected ? activeColor : inactiveColor,
+                    ),
+                  ),
+                  if (widget.badge > 0)
+                    Positioned(
+                      right: -8,
+                      top: -6,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 4.5,
+                          vertical: 1.5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFEF4444),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: const Color(0xFF07152B),
+                            width: 1.5,
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color:
+                                  const Color(0xFFEF4444).withValues(alpha: 0.4),
+                              blurRadius: 4,
+                              offset: const Offset(0, 1),
+                            ),
+                          ],
+                        ),
+                        constraints: const BoxConstraints(
+                          minWidth: 16,
+                          minHeight: 16,
+                        ),
+                        child: Text(
+                          widget.badge > 99 ? '99+' : '${widget.badge}',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 9,
+                            fontWeight: FontWeight.bold,
+                            height: 1,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 3),
+              AnimatedDefaultTextStyle(
+                duration: const Duration(milliseconds: 200),
+                curve: Curves.easeOutCubic,
+                style: TextStyle(
+                  fontFamily: AppTheme.fontFamily,
+                  fontSize: 10,
+                  fontWeight:
+                      widget.isSelected ? FontWeight.w700 : FontWeight.w500,
+                  color: widget.isSelected ? activeColor : inactiveColor,
+                  letterSpacing: 0.1,
+                ),
+                child: Text(
+                  widget.label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+

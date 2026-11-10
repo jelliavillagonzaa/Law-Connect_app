@@ -4,8 +4,11 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../services/chat_service.dart';
 import '../../models/message_model.dart';
+import '../../models/user_model.dart';
 import '../../theme/app_theme.dart';
 import '../../screens/client/chat_screen.dart';
+import '../../screens/attorney/attorney_client_chat_screen.dart';
+import '../../screens/staff/staff_client_chat_screen.dart';
 import '../../widgets/common/nav_unread_dot.dart';
 
 class ChatListPage extends StatefulWidget {
@@ -62,7 +65,7 @@ class _ChatListPageState extends State<ChatListPage> {
         );
       }
     }
-    // For clients: show attorney if available, otherwise staff
+    // For clients: prefer attorney if it's an attorney chat, or staff if it's a staff chat
     else if (_currentUserRole == 'client') {
       if (chat.attorneyId != null && chat.attorneyId != currentUserId) {
         return chat.attorneyId;
@@ -71,7 +74,7 @@ class _ChatListPageState extends State<ChatListPage> {
       } else {
         return chat.participants.firstWhere(
           (id) => id != currentUserId && !id.startsWith('staff_'),
-          orElse: () => '',
+          orElse: () => chat.staffId ?? '',
         );
       }
     }
@@ -97,14 +100,38 @@ class _ChatListPageState extends State<ChatListPage> {
     }
   }
 
+  final ChatService _chatService = ChatService();
+  Stream<List<ChatModel>>? _inboxStream;
+  String? _streamUserId;
+
+  static final Map<String, Map<String, dynamic>> _userProfileCache = {};
+  static final Set<String> _pendingUserFetches = {};
+
+  void _ensureUserProfile(String uid) {
+    if (uid.isEmpty || _userProfileCache.containsKey(uid) || _pendingUserFetches.contains(uid)) return;
+    _pendingUserFetches.add(uid);
+    FirebaseFirestore.instance.collection('users').doc(uid).get().then((doc) {
+      _pendingUserFetches.remove(uid);
+      if (doc.exists && doc.data() != null) {
+        _userProfileCache[uid] = doc.data()!;
+        if (mounted) setState(() {});
+      }
+    }).catchError((_) {
+      _pendingUserFetches.remove(uid);
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
-    final chatService = ChatService();
     final user = FirebaseAuth.instance.currentUser;
-    final firestore = FirebaseFirestore.instance;
 
     if (user == null) {
       return const Scaffold(body: Center(child: Text('Not logged in')));
+    }
+
+    if (_inboxStream == null || _streamUserId != user.uid) {
+      _streamUserId = user.uid;
+      _inboxStream = _chatService.watchInboxChats(user.uid);
     }
 
     return Scaffold(
@@ -114,7 +141,7 @@ class _ChatListPageState extends State<ChatListPage> {
         foregroundColor: Colors.white,
       ),
       body: StreamBuilder<List<ChatModel>>(
-        stream: chatService.getUserChats(user.uid),
+        stream: _inboxStream,
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.waiting &&
               !snapshot.hasData) {
@@ -125,7 +152,9 @@ class _ChatListPageState extends State<ChatListPage> {
             return Center(child: Text('Error: ${snapshot.error}'));
           }
 
-          final chats = snapshot.data ?? [];
+          final chats = ChatModel.oneThreadPerClient(
+            (snapshot.data ?? []).where((chat) => chat.hasMessages).toList(),
+          );
 
           if (chats.isEmpty) {
             return Center(
@@ -156,89 +185,126 @@ class _ChatListPageState extends State<ChatListPage> {
                 return const SizedBox.shrink();
               }
 
-              return FutureBuilder<DocumentSnapshot>(
-                future: firestore.collection('users').doc(otherUserId).get(),
-                builder: (context, userSnapshot) {
-                  String displayName = 'User';
-                  String? userRole;
-                  String? userEmail;
+              final cachedUserData = _userProfileCache[otherUserId];
+              if (cachedUserData == null) {
+                _ensureUserProfile(otherUserId);
+              }
 
-                  if (userSnapshot.hasData && userSnapshot.data!.exists) {
-                    final userData =
-                        userSnapshot.data!.data() as Map<String, dynamic>?;
-                    if (userData != null) {
-                      displayName =
-                          userData['fullName'] ??
-                          userData['name'] ??
-                          userData['email']?.split('@')[0] ??
-                          'User';
-                      userRole = userData['role'];
-                      userEmail = userData['email'];
+              String displayName = 'User';
+              String? userRole;
+              String? userEmail;
+
+              if (cachedUserData != null) {
+                displayName = UserModel.resolveDisplayName(cachedUserData);
+                userRole = cachedUserData['role'];
+                userEmail = cachedUserData['email'];
+              } else if (chat.clientName != null && chat.clientName!.trim().isNotEmpty) {
+                displayName = chat.clientName!.trim();
+              }
+
+              if (chat.clientId == otherUserId) {
+                if (userRole != null && userRole != 'client') {
+                  return const SizedBox.shrink();
+                }
+                if (ChatModel.isPlaceholderClientLabel(displayName) &&
+                    (userEmail == null || userEmail.trim().isEmpty)) {
+                  return const SizedBox.shrink();
+                }
+              }
+
+              // Determine role label
+              String roleLabel = '';
+              Color roleColor = Colors.grey;
+              if (userRole == 'client') {
+                roleLabel = 'CLIENT';
+                roleColor = AppTheme.royalBlue;
+              } else if (userRole == 'attorney') {
+                roleLabel = 'ATTORNEY';
+                roleColor = AppTheme.royalBlue;
+                if (!displayName.startsWith('Atty.') &&
+                    displayName.trim().isNotEmpty &&
+                    displayName != 'User' &&
+                    displayName != 'Attorney') {
+                  displayName = 'Atty. $displayName';
+                }
+              } else if (userRole == 'staff') {
+                roleLabel = 'STAFF';
+                roleColor = const Color(0xFF00897B);
+              } else {
+                roleLabel = 'STAFF';
+                roleColor = const Color(0xFF00897B);
+              }
+
+              final storedUnread = chat.unreadCountFor(user.uid);
+              final hasUnread = storedUnread > 0;
+              final unreadLabel = storedUnread > 0
+                  ? (storedUnread > 99 ? '99+' : '$storedUnread')
+                  : null;
+
+              return Card(
+                margin: const EdgeInsets.only(bottom: 12),
+                elevation: 2,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: InkWell(
+                  onTap: () {
+                    if (_currentUserRole == 'attorney' &&
+                        userRole == 'client') {
+                      Get.to(
+                        () => AttorneyClientChatScreen(
+                          chatId: chat.id,
+                          clientId: otherUserId,
+                          clientName: displayName,
+                        ),
+                      );
+                    } else if (_currentUserRole == 'staff' &&
+                        userRole == 'client') {
+                      Get.to(
+                        () => StaffClientChatScreen(
+                          chatId: chat.id,
+                          clientId: otherUserId,
+                          clientName: displayName,
+                        ),
+                      );
+                    } else {
+                      Get.to(
+                        () => ChatScreen(
+                          conversationId: chat.id,
+                          otherUserId: otherUserId,
+                          otherUserName: displayName,
+                        ),
+                      );
                     }
-                  }
-
-                  // Determine role label
-                  String roleLabel = '';
-                  Color roleColor = Colors.grey;
-                  if (userRole == 'client') {
-                    roleLabel = 'CLIENT';
-                    roleColor = AppTheme.royalBlue;
-                  } else if (userRole == 'attorney') {
-                    roleLabel = 'ATTORNEY';
-                    roleColor = AppTheme.gold;
-                  } else if (userRole == 'staff') {
-                    roleLabel = 'STAFF';
-                    roleColor = AppTheme.royalBlue;
-                  }
-
-                  return StreamBuilder<bool>(
-                    stream: chatService.watchChatHasUnread(chat.id, user.uid),
-                    builder: (context, unreadSnap) {
-                      final hasUnread = unreadSnap.data == true;
-                      return Card(
-                    margin: const EdgeInsets.only(bottom: 12),
-                    elevation: 2,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: InkWell(
-                      onTap: () {
-                        Get.to(
-                          () => ChatScreen(
-                            conversationId: chat.id,
-                            otherUserId: otherUserId,
-                            otherUserName: displayName,
-                          ),
-                        );
-                      },
-                      borderRadius: BorderRadius.circular(12),
-                      child: Padding(
-                        padding: const EdgeInsets.all(16),
-                        child: Row(
-                          children: [
-                            CircleAvatar(
-                              radius: 28,
-                              backgroundColor: roleColor.withValues(alpha: 0.1),
-                              child: Text(
-                                displayName.isNotEmpty
-                                    ? displayName[0].toUpperCase()
-                                    : '?',
-                                style: TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.bold,
-                                  color: roleColor,
-                                ),
-                              ),
+                  },
+                  borderRadius: BorderRadius.circular(12),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Row(
+                      children: [
+                        CircleAvatar(
+                          radius: 28,
+                          backgroundColor: roleColor.withValues(alpha: 0.1),
+                          child: Text(
+                            displayName.isNotEmpty
+                                ? displayName[0].toUpperCase()
+                                : '?',
+                            style: TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.bold,
+                              color: roleColor,
                             ),
-                            const SizedBox(width: 16),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
+                          ),
+                        ),
+                        const SizedBox(width: 16),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
                                 children: [
-                                  Row(
-                                    children: [
-                                      Expanded(
-                                        child: Text(
+                                  Expanded(
+                                    child: Text(
                                           displayName,
                                           style: TextStyle(
                                             fontSize: 16,
@@ -322,7 +388,30 @@ class _ChatListPageState extends State<ChatListPage> {
                                     color: Colors.grey[600],
                                   ),
                                 ),
-                                if (hasUnread) const ListUnreadDot(),
+                                if (unreadLabel != null)
+                                  Container(
+                                    constraints:
+                                        const BoxConstraints(minWidth: 22),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 6,
+                                      vertical: 2,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFFE53935),
+                                      borderRadius: BorderRadius.circular(11),
+                                    ),
+                                    child: Text(
+                                      unreadLabel,
+                                      textAlign: TextAlign.center,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  )
+                                else if (hasUnread)
+                                  const ListUnreadDot(),
                               ],
                             ),
                           ],
@@ -330,10 +419,6 @@ class _ChatListPageState extends State<ChatListPage> {
                       ),
                     ),
                   );
-                    },
-                  );
-                },
-              );
             },
           );
         },

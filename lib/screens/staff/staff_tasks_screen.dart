@@ -12,7 +12,8 @@ import '../../utils/task_priority.dart';
 import 'task_detail_screen.dart';
 
 class StaffTasksScreen extends StatefulWidget {
-  const StaffTasksScreen({super.key});
+  final String? initialFilter;
+  const StaffTasksScreen({super.key, this.initialFilter});
 
   @override
   State<StaffTasksScreen> createState() => _StaffTasksScreenState();
@@ -22,7 +23,7 @@ class _StaffTasksScreenState extends State<StaffTasksScreen> {
   final TaskService _taskService = TaskService();
   final StaffService _staffService = StaffService();
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-  String _selectedFilter = 'open';
+  String _selectedFilter = 'all';
   Set<String> _closedCaseIds = {};
   StreamSubscription<List<CaseModel>>? _assignedCasesSub;
   StreamSubscription<List<CaseModel>>? _attorneyCasesSub;
@@ -30,7 +31,20 @@ class _StaffTasksScreenState extends State<StaffTasksScreen> {
   @override
   void initState() {
     super.initState();
+    if (widget.initialFilter != null) {
+      _selectedFilter = widget.initialFilter!;
+    }
     _listenClosedCases();
+  }
+
+  @override
+  void didUpdateWidget(StaffTasksScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.initialFilter != null &&
+        widget.initialFilter != oldWidget.initialFilter &&
+        widget.initialFilter != _selectedFilter) {
+      setState(() => _selectedFilter = widget.initialFilter!);
+    }
   }
 
   @override
@@ -64,6 +78,213 @@ class _StaffTasksScreenState extends State<StaffTasksScreen> {
     });
   }
 
+  Future<void> _showCreateTaskDialog(BuildContext context) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    final titleCtrl = TextEditingController();
+    final descCtrl = TextEditingController();
+    DateTime? selectedDate = DateTime.now().add(const Duration(days: 3));
+    int priority = 3; // 2 = High, 3 = Normal, 4 = Low
+    String? selectedCaseId;
+    List<CaseModel> availableCases = [];
+
+    try {
+      final snap = await FirebaseFirestore.instance
+          .collection('cases')
+          .where('staffAssigned', arrayContains: user.uid)
+          .limit(30)
+          .get();
+      availableCases =
+          snap.docs.map((doc) => CaseModel.fromFirestore(doc)).toList();
+    } catch (_) {}
+
+    if (!mounted) return;
+
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (modalCtx, setModalState) {
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 20,
+                right: 20,
+                top: 20,
+                bottom: MediaQuery.of(modalCtx).viewInsets.bottom + 20,
+              ),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Create New Task',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF1E293B),
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close),
+                          onPressed: () => Navigator.pop(modalCtx),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: titleCtrl,
+                      decoration: const InputDecoration(
+                        labelText: 'Task Title *',
+                        border: OutlineInputBorder(),
+                        hintText: 'e.g., Draft affidavit, Review case documents',
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: descCtrl,
+                      maxLines: 3,
+                      decoration: const InputDecoration(
+                        labelText: 'Description',
+                        border: OutlineInputBorder(),
+                        hintText: 'Details about this task...',
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<int>(
+                      value: priority,
+                      decoration: const InputDecoration(
+                        labelText: 'Priority',
+                        border: OutlineInputBorder(),
+                      ),
+                      items: const [
+                        DropdownMenuItem(value: 2, child: Text('High Priority')),
+                        DropdownMenuItem(value: 3, child: Text('Normal Priority')),
+                        DropdownMenuItem(value: 4, child: Text('Low Priority')),
+                      ],
+                      onChanged: (v) {
+                        if (v != null) setModalState(() => priority = v);
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    if (availableCases.isNotEmpty) ...[
+                      DropdownButtonFormField<String>(
+                        value: selectedCaseId,
+                        decoration: const InputDecoration(
+                          labelText: 'Related Case (Optional)',
+                          border: OutlineInputBorder(),
+                        ),
+                        items: [
+                          const DropdownMenuItem(value: null, child: Text('None / General Task')),
+                          ...availableCases.map(
+                            (c) => DropdownMenuItem(
+                              value: c.id,
+                              child: Text(
+                                c.caseTitle.length > 35
+                                    ? '${c.caseTitle.substring(0, 32)}...'
+                                    : c.caseTitle,
+                              ),
+                            ),
+                          ),
+                        ],
+                        onChanged: (v) => setModalState(() => selectedCaseId = v),
+                      ),
+                      const SizedBox(height: 12),
+                    ],
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            selectedDate == null
+                                ? 'No due date set'
+                                : 'Due: ${selectedDate!.month}/${selectedDate!.day}/${selectedDate!.year}',
+                            style: const TextStyle(fontSize: 14),
+                          ),
+                        ),
+                        TextButton.icon(
+                          icon: const Icon(Icons.calendar_today, size: 18),
+                          label: const Text('Pick Date'),
+                          onPressed: () async {
+                            final now = DateTime.now();
+                            final picked = await showDatePicker(
+                              context: modalCtx,
+                              initialDate: selectedDate ?? now,
+                              firstDate: now,
+                              lastDate: now.add(const Duration(days: 365)),
+                            );
+                            if (picked != null) {
+                              setModalState(() => selectedDate = picked);
+                            }
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 48,
+                      child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppTheme.royalBlue,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                        ),
+                        onPressed: () async {
+                          final title = titleCtrl.text.trim();
+                          if (title.isEmpty) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Please enter a task title')),
+                            );
+                            return;
+                          }
+                          Navigator.pop(modalCtx);
+                          final res = await _taskService.createTask(
+                            title: title,
+                            description: descCtrl.text.trim(),
+                            assignedTo: user.uid,
+                            caseId: selectedCaseId,
+                            dueDate: selectedDate,
+                            priority: priority,
+                          );
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  res['success'] == true
+                                      ? 'Task created successfully!'
+                                      : 'Failed to create task: ${res['message']}',
+                                ),
+                                backgroundColor: res['success'] == true
+                                    ? Colors.green
+                                    : Colors.red,
+                              ),
+                            );
+                          }
+                        },
+                        child: const Text('Save Task', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
   void _mergeClosedCases(List<CaseModel> cases) {
     setState(() {
       _closedCaseIds = {
@@ -73,7 +294,36 @@ class _StaffTasksScreenState extends State<StaffTasksScreen> {
     });
   }
 
+  String _filterLabel(String filter) {
+    switch (filter) {
+      case 'open':
+        return 'Open Work';
+      case 'pending':
+        return 'Pending Tasks';
+      case 'in_progress':
+        return 'In Progress';
+      case 'completed':
+        return 'Completed Tasks';
+      case 'closed':
+        return 'Closed Cases';
+      case 'all':
+      default:
+        return 'All Tasks';
+    }
+  }
+
   List<TaskModel> _applyFilter(List<TaskModel> tasks) {
+    bool isPending(String status) =>
+        status.toLowerCase().trim() == 'pending';
+    bool isInProgress(String status) {
+      final s = status.toLowerCase().trim();
+      return s == 'in_progress' || s == 'in progress';
+    }
+    bool isCompleted(String status) {
+      final s = status.toLowerCase().trim();
+      return s == 'completed' || s == 'done';
+    }
+
     switch (_selectedFilter) {
       case 'open':
         return OpenWorkTasks.live(tasks, _closedCaseIds);
@@ -84,12 +334,22 @@ class _StaffTasksScreenState extends State<StaffTasksScreen> {
           return id.isNotEmpty && _closedCaseIds.contains(id);
         }).toList();
       case 'pending':
-      case 'in_progress':
-        return OpenWorkTasks.live(tasks, _closedCaseIds)
-            .where((t) => t.status.toLowerCase().trim() == _selectedFilter)
+        return tasks
+            .where((t) =>
+                !OpenWorkTasks.isCancelled(t.status) && isPending(t.status))
             .toList();
+      case 'in_progress':
+        return tasks
+            .where((t) =>
+                !OpenWorkTasks.isCancelled(t.status) && isInProgress(t.status))
+            .toList();
+      case 'completed':
+        return tasks.where((t) => isCompleted(t.status)).toList();
+      case 'all':
       default:
-        return tasks;
+        return tasks
+            .where((t) => !OpenWorkTasks.isCancelled(t.status))
+            .toList();
     }
   }
 
@@ -102,17 +362,36 @@ class _StaffTasksScreenState extends State<StaffTasksScreen> {
 
     return Scaffold(
       backgroundColor: AppTheme.lightGray,
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => _showCreateTaskDialog(context),
+        backgroundColor: AppTheme.royalBlue,
+        icon: const Icon(Icons.add, color: Colors.white),
+        label: const Text('New Task', style: TextStyle(color: Colors.white)),
+      ),
       appBar: AppBar(
         backgroundColor: AppTheme.royalBlue,
         foregroundColor: AppTheme.cleanWhite,
         elevation: 0,
-        title: const Text(
-          'My Tasks',
-          style: TextStyle(
-            fontSize: 20,
-            fontWeight: FontWeight.bold,
-            color: AppTheme.cleanWhite,
-          ),
+        title: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'My Tasks',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                color: AppTheme.cleanWhite,
+              ),
+            ),
+            Text(
+              _filterLabel(_selectedFilter),
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w500,
+                color: AppTheme.cleanWhite.withValues(alpha: 0.85),
+              ),
+            ),
+          ],
         ),
         centerTitle: true,
         actions: [
@@ -140,11 +419,7 @@ class _StaffTasksScreenState extends State<StaffTasksScreen> {
         ],
       ),
       body: StreamBuilder<List<TaskModel>>(
-        stream: (_selectedFilter == 'pending' ||
-                _selectedFilter == 'in_progress' ||
-                _selectedFilter == 'completed')
-            ? _taskService.getStaffTasksByStatus(user.uid, _selectedFilter)
-            : _taskService.getStaffTasks(user.uid),
+        stream: _taskService.getStaffTasks(user.uid, staffEmail: user.email),
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.waiting &&
               !snapshot.hasData) {

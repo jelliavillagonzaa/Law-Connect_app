@@ -76,13 +76,15 @@ service cloud.firestore {
              );
     }
     
-    // Check if user is admin (case-insensitive role on users doc)
+    // Admin OR staff (staff manage the admin side). Case-insensitive role on users doc.
     function isAdmin() {
       return isAuthenticated()
         && userExists()
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role is string
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
-             .matches('(?i)^admin$');
+             .matches('(?i)^(admin|staff|paralegal|legal[ _-]?assistant)$')
+        // Staff now manage the admin side: same permissions as admin.
+        || exists(/databases/$(database)/documents/staff/$(request.auth.uid));
     }
     
     // Check if user is attorney (case-insensitive — "Attorney" must match rules)
@@ -417,27 +419,60 @@ service cloud.firestore {
              && resource.data.ownerClientId == request.auth.uid;
     }
 
-    function hearingClientNameMatchesAuthUser() {
-      let u = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
-      return isClient()
-             && 'clientName' in resource.data
-             && resource.data.clientName is string
-             && resource.data.clientName.size() > 0
+    function profileMatchesHearingText(profileName, targetText) {
+      return profileName is string
+             && profileName.size() > 0
+             && targetText is string
+             && targetText.size() > 0
              && (
-               ('name' in u && profileContainsHearingClientName(u.name))
-               || ('fullName' in u && profileContainsHearingClientName(u.fullName))
-               || ('displayName' in u && profileContainsHearingClientName(u.displayName))
+               normalizedPersonName(profileName) == normalizedPersonName(targetText)
+               || profileName.lower() == targetText.lower()
+               || profileName.lower().matches('.*' + targetText.lower() + '.*')
+               || targetText.lower().matches('.*' + profileName.lower() + '.*')
              );
     }
 
-    // Client row keyed by profile name (OCR imports may omit fullText).
+    function hearingClientNameMatchesAuthUser() {
+      let u = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      let firstLast = ('firstName' in u && u.firstName is string && u.firstName.size() > 0
+                       && 'lastName' in u && u.lastName is string && u.lastName.size() > 0)
+                      ? (u.firstName + ' ' + u.lastName)
+                      : '';
+      return isClient()
+             && (
+               (
+                 'clientName' in resource.data
+                 && resource.data.clientName is string
+                 && resource.data.clientName.size() > 0
+                 && (
+                   ('name' in u && profileContainsHearingClientName(u.name))
+                   || ('fullName' in u && profileContainsHearingClientName(u.fullName))
+                   || ('displayName' in u && profileContainsHearingClientName(u.displayName))
+                   || (firstLast.size() > 0 && profileContainsHearingClientName(firstLast))
+                 )
+               )
+               || (
+                 'caseTitle' in resource.data
+                 && resource.data.caseTitle is string
+                 && resource.data.caseTitle.size() > 0
+                 && (
+                   ('name' in u && profileMatchesHearingText(u.name, resource.data.caseTitle))
+                   || ('fullName' in u && profileMatchesHearingText(u.fullName, resource.data.caseTitle))
+                   || ('displayName' in u && profileMatchesHearingText(u.displayName, resource.data.caseTitle))
+                   || (firstLast.size() > 0 && profileMatchesHearingText(firstLast, resource.data.caseTitle))
+                 )
+               )
+             );
+    }
+
+    // Client row keyed by profile name (OCR imports may omit fullText or store caseNo as int).
     function hearingClientContextRow() {
       return isClient()
              && hearingClientNameMatchesAuthUser()
              && (
                ('caseNo' in resource.data
-                && resource.data.caseNo is string
-                && resource.data.caseNo.size() > 0)
+                && ((resource.data.caseNo is string && resource.data.caseNo.size() > 0)
+                    || resource.data.caseNo is int))
                || ('caseId' in resource.data
                    && resource.data.caseId is string
                    && resource.data.caseId.size() > 0)
@@ -874,6 +909,22 @@ service cloud.firestore {
     }
     
     // ==============================
+    // NOTARY SERVICES COLLECTION (Catalog of notary documents & templates)
+    // ==============================
+    match /notary_services/{serviceId} {
+      // Anyone can read notary services catalog so clients and staff can view guidelines & requirements
+      allow get, list: if true;
+
+      // Staff, Attorneys, and Admins can create, edit, or remove catalog services
+      allow create, update, delete: if isAuthenticated()
+                                    && (isStaff() 
+                                        || isAttorney() 
+                                        || isAdmin() 
+                                        || userRoleMatchesAttorneyAdminStaff()
+                                        || (userExists() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role != 'client'));
+    }
+    
+    // ==============================
     // TASKS COLLECTION
     // ==============================
     match /tasks/{taskId} {
@@ -1026,8 +1077,8 @@ service cloud.firestore {
       // Court / OCR import rows (caseNo + fullText) — no caseId required
       function hearingImportedResource() {
         return 'caseNo' in resource.data
-               && resource.data.caseNo is string
-               && resource.data.caseNo != ''
+               && ((resource.data.caseNo is string && resource.data.caseNo != '')
+                   || resource.data.caseNo is int)
                && 'fullText' in resource.data
                && resource.data.fullText is string
                && resource.data.fullText != '';
@@ -1040,9 +1091,10 @@ service cloud.firestore {
       }
       
       // List/query on `hearings` must be able to return every matching doc, or Firestore
-      // denies the whole query (permission-denied). Firm staff/attorneys therefore need a
-      // broad read path; clients still rely on caseId + canAccessHearingCase only.
-      allow read: if isAuthenticated()
+      // denies the whole query (permission-denied). Firm staff/attorneys and authenticated
+      // clients (matching `cases` / `calendar_events` list rules) may query `hearings` to
+      // discover court orders where their name appears in captions or order text; writes stay strict.
+      allow get: if isAuthenticated()
                     && (
                       ('caseId' in resource.data
                        && resource.data.caseId is string
@@ -1053,7 +1105,10 @@ service cloud.firestore {
                       || hearingClientContextRow()
                       || hearingOwnerIsAuthClient()
                       || isFirmUser()
+                      || isClient()
                     );
+      allow list: if isAuthenticated()
+                     && (isFirmUser() || isClient());
       
       allow create: if isAuthenticated()
                     && (
@@ -1121,6 +1176,8 @@ service cloud.firestore {
                         && (
                           !('ownerClientId' in request.resource.data)
                           || request.resource.data.ownerClientId == request.auth.uid
+                          || ('ownerClientId' in resource.data
+                              && request.resource.data.ownerClientId == resource.data.ownerClientId)
                         )
                         && (
                           !('caseId' in request.resource.data)
@@ -1491,12 +1548,12 @@ service cloud.firestore {
     // BACKUPS COLLECTION
     // ==============================
     match /backups/{backupId} {
-      // Allow read: only admins can read backups
-      allow get: if isAdmin();
-      allow list: if isAdmin();
+      // Admins + staff (staff dashboard has a Backup page)
+      allow get: if isAdmin() || isStaff();
+      allow list: if isAdmin() || isStaff();
       
       // Allow create: only admins can create backups (when deleting items)
-      allow create: if isAdmin()
+      allow create: if (isAdmin() || isStaff())
                     && request.resource.data.collection is string
                     && request.resource.data.documentId is string
                     && request.resource.data.data is map
@@ -1504,10 +1561,10 @@ service cloud.firestore {
                     && request.resource.data.restored is bool;
       
       // Allow update: admins mark restored (avoid fragile diff() expressions)
-      allow update: if isAdmin();
+      allow update: if isAdmin() || isStaff();
       
       // Allow delete: only admins can delete backups (cleanup)
-      allow delete: if isAdmin();
+      allow delete: if isAdmin() || isStaff();
     }
     
     // ==============================

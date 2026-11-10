@@ -1,5 +1,5 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
 import 'package:get/get.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../theme/app_theme.dart';
@@ -7,6 +7,7 @@ import '../../services/enhanced_appointment_service.dart';
 import '../../services/auth_service.dart';
 import '../../utils/currency.dart';
 import '../../widgets/maps/oroquieta_map_viewer.dart';
+import '../../widgets/client/attorney_slot_picker.dart';
 import '../../widgets/common/schedule_full_dialog.dart';
 import '../../models/user_model.dart';
 
@@ -33,8 +34,7 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
   final _authService = AuthService();
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
-  DateTime? _selectedDate;
-  TimeOfDay? _selectedTime;
+  DateTime? _selectedSlot;
   String _selectedType = 'Online Meeting';
   final TextEditingController _notesController = TextEditingController();
   bool _isSubmitting = false;
@@ -86,39 +86,6 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
     }
   }
 
-  Future<void> _pickDate() async {
-    final now = DateTime.now();
-    final initialDate = _selectedDate ?? now;
-
-    final picked = await showDatePicker(
-      context: context,
-      initialDate: initialDate,
-      firstDate: now,
-      lastDate: DateTime(now.year + 2),
-    );
-
-    if (picked != null) {
-      setState(() {
-        _selectedDate = picked;
-      });
-    }
-  }
-
-  Future<void> _pickTime() async {
-    final initialTime = _selectedTime ?? TimeOfDay.now();
-
-    final picked = await showTimePicker(
-      context: context,
-      initialTime: initialTime,
-    );
-
-    if (picked != null) {
-      setState(() {
-        _selectedTime = picked;
-      });
-    }
-  }
-
   Future<void> _submit() async {
     if (_isSubmitting) return;
 
@@ -136,44 +103,103 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
       return;
     }
 
-    if (_selectedDate == null || _selectedTime == null) {
+    if (_selectedSlot == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please select both date and time.')),
+        const SnackBar(content: Text('Please select an open date and time.')),
       );
       return;
     }
 
-    final dateTime = DateTime(
-      _selectedDate!.year,
-      _selectedDate!.month,
-      _selectedDate!.day,
-      _selectedTime!.hour,
-      _selectedTime!.minute,
-    );
+    final dateTime = _selectedSlot!;
 
     setState(() {
       _isSubmitting = true;
     });
 
     try {
-      var clientName = user.displayName?.trim() ?? '';
+      var clientName = '';
       try {
         final profileDoc = await _firestore
             .collection('users')
             .doc(user.uid)
             .get();
         if (profileDoc.exists && profileDoc.data() != null) {
-          final resolved = UserModel.resolveDisplayName(profileDoc.data()!);
-          if (resolved.trim().isNotEmpty &&
+          final data = profileDoc.data()!;
+          final resolved = UserModel.resolveDisplayName(data).trim();
+          if (resolved.isNotEmpty &&
               !resolved.contains('@') &&
               resolved.toLowerCase() != 'user' &&
-              resolved.toLowerCase() != 'client') {
-            clientName = resolved.trim();
+              resolved.toLowerCase() != 'client' &&
+              (resolved.contains(' ') || !RegExp(r'\d{3,}').hasMatch(resolved))) {
+            clientName = resolved;
           }
         }
       } catch (_) {}
+
+      // If clientName not found or looks like an email/username, check pending_signups
+      if (clientName.isEmpty ||
+          clientName.contains('@') ||
+          (!clientName.contains(' ') && RegExp(r'\d{3,}').hasMatch(clientName))) {
+        try {
+          Map<String, dynamic>? psData;
+          final userEmail = user.email?.trim().toLowerCase() ?? '';
+          if (userEmail.isNotEmpty) {
+            final psDoc = await _firestore
+                .collection('pending_signups')
+                .doc(userEmail)
+                .get();
+            if (psDoc.exists && psDoc.data() != null) {
+              psData = psDoc.data();
+            }
+          }
+          if (psData == null) {
+            final psSnap = await _firestore
+                .collection('pending_signups')
+                .where('userId', isEqualTo: user.uid)
+                .limit(1)
+                .get();
+            if (psSnap.docs.isNotEmpty) {
+              psData = psSnap.docs.first.data();
+            }
+          }
+          if (psData != null) {
+            final first = (psData['firstName'] ?? '').toString().trim();
+            final middle = (psData['middleName'] ?? '').toString().trim();
+            final last = (psData['lastName'] ?? '').toString().trim();
+            final composed = [first, middle, last].where((s) => s.isNotEmpty).join(' ');
+            if (composed.isNotEmpty) {
+              clientName = composed;
+              // Also heal the users document for the future
+              unawaited(_firestore.collection('users').doc(user.uid).set({
+                'firstName': first,
+                if (middle.isNotEmpty) 'middleName': middle,
+                'lastName': last,
+                'name': composed,
+                'fullName': composed,
+              }, SetOptions(merge: true)));
+            }
+          }
+        } catch (_) {}
+      }
+
+      // If still empty, check user.displayName
+      if (clientName.isEmpty && user.displayName != null && user.displayName!.trim().isNotEmpty) {
+        final dn = user.displayName!.trim();
+        if (!dn.contains('@') && (dn.contains(' ') || !RegExp(r'\d{3,}').hasMatch(dn))) {
+          clientName = dn;
+        }
+      }
+
+      // If still empty, format cleanly without numbers or @domain - NEVER save raw email
       if (clientName.isEmpty || clientName.contains('@')) {
-        clientName = user.email ?? 'Client';
+        final emailPrefix = (user.email ?? 'Client').split('@').first.replaceAll(RegExp(r'\d+$'), '');
+        final clean = emailPrefix
+            .split(RegExp(r'[._\s]+'))
+            .where((w) => w.isNotEmpty)
+            .map((w) => w[0].toUpperCase() + w.substring(1).toLowerCase())
+            .join(' ')
+            .trim();
+        clientName = clean.isNotEmpty ? clean : 'Client';
       }
 
       final result = await _appointmentService.createAppointment(
@@ -258,9 +284,10 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        'Choose a preferred date, time, and type of meeting. '
-                        'This request is sent to ${widget.attorneyName}, '
-                        'who will review and confirm it.',
+                        'This is a consultation with ${widget.attorneyName}, '
+                        'not a notary visit. Choose when and how you want to meet. '
+                        'The attorney confirms it. To notarize a document, use '
+                        'Notary Portal on the Dashboard.',
                         style: AppTheme.bodySmall.copyWith(
                           color: AppTheme.textSecondary,
                         ),
@@ -272,100 +299,12 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
                         _buildAttorneyAdditionalDetails(),
                       ],
                       const SizedBox(height: 24),
-
-                      // Date field
-                      Text(
-                        'Date',
-                        style: AppTheme.bodyMedium.copyWith(
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      const SizedBox(height: 6),
-                      InkWell(
-                        onTap: _pickDate,
-                        borderRadius: BorderRadius.circular(12),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 14,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.grey[50],
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: Colors.grey[300]!),
-                          ),
-                          child: Row(
-                            children: [
-                              const Icon(
-                                Icons.calendar_today_rounded,
-                                size: 18,
-                                color: AppTheme.royalBlue,
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Text(
-                                  _selectedDate == null
-                                      ? 'Select date'
-                                      : DateFormat(
-                                          'MMM dd, yyyy',
-                                        ).format(_selectedDate!),
-                                  style: AppTheme.bodyMedium.copyWith(
-                                    color: _selectedDate == null
-                                        ? Colors.grey[500]
-                                        : AppTheme.textPrimary,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-
-                      // Time field
-                      Text(
-                        'Time',
-                        style: AppTheme.bodyMedium.copyWith(
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      const SizedBox(height: 6),
-                      InkWell(
-                        onTap: _pickTime,
-                        borderRadius: BorderRadius.circular(12),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 14,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.grey[50],
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: Colors.grey[300]!),
-                          ),
-                          child: Row(
-                            children: [
-                              const Icon(
-                                Icons.access_time_rounded,
-                                size: 18,
-                                color: AppTheme.royalBlue,
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Text(
-                                  _selectedTime == null
-                                      ? 'Select time'
-                                      : _selectedTime!.format(context),
-                                  style: AppTheme.bodyMedium.copyWith(
-                                    color: _selectedTime == null
-                                        ? Colors.grey[500]
-                                        : AppTheme.textPrimary,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
+                      AttorneySlotPicker(
+                        attorneyId: widget.attorneyId,
+                        selectedSlot: _selectedSlot,
+                        onSlotChanged: (slot) {
+                          setState(() => _selectedSlot = slot);
+                        },
                       ),
                       const SizedBox(height: 16),
 
@@ -421,7 +360,7 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
 
                       // Notes
                       Text(
-                        'Notes',
+                        'What do you want to discuss?',
                         style: AppTheme.bodyMedium.copyWith(
                           fontWeight: FontWeight.w600,
                         ),
@@ -432,7 +371,7 @@ class _RequestAppointmentScreenState extends State<RequestAppointmentScreen> {
                         maxLines: 4,
                         decoration: InputDecoration(
                           hintText:
-                              'Briefly describe the reason for your appointment...',
+                              'Example: a contract question, a case update, or a family matter.',
                           filled: true,
                           fillColor: Colors.grey[50],
                           border: OutlineInputBorder(

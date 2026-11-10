@@ -115,7 +115,7 @@ class BillingManagementScreen extends StatelessWidget {
               Text('Case History', style: AppTheme.heading4),
               const SizedBox(height: 12),
               _CaseHistorySection(
-                invoices: invoices,
+                invoices: active,
                 billing: billing,
                 canManage: canManage,
                 onRecordPayment: (inv) =>
@@ -129,14 +129,14 @@ class BillingManagementScreen extends StatelessWidget {
   }
 
   void _openPaymentHistory(BuildContext context, BillingService billing) {
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => _PaymentHistoryScreen(
-          attorneyId: attorneyId,
-          billing: billing,
-          canManage: canManage,
-        ),
-      ),
+    openPaymentHistoryScreen(
+      context,
+      attorneyId: attorneyId,
+      billing: billing,
+      canManage: canManage,
+      recorderRole: recorderRole,
+      recorderName: recorderName,
+      recorderId: FirebaseAuth.instance.currentUser?.uid,
     );
   }
 
@@ -178,6 +178,33 @@ class BillingManagementScreen extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Opens the firm-wide or attorney Payment History Report screen.
+void openPaymentHistoryScreen(
+  BuildContext context, {
+  String? attorneyId,
+  BillingService? billing,
+  bool canManage = true,
+  String recorderRole = 'staff',
+  String? recorderName,
+  String? recorderId,
+}) {
+  if (recorderRole.toLowerCase() == 'client') {
+    return;
+  }
+  Navigator.of(context).push(
+    MaterialPageRoute(
+      builder: (_) => PaymentHistoryScreen(
+        attorneyId: attorneyId ?? '',
+        billing: billing ?? BillingService(),
+        canManage: canManage,
+        recorderRole: recorderRole,
+        recorderName: recorderName,
+        recorderId: recorderId ?? FirebaseAuth.instance.currentUser?.uid,
+      ),
+    ),
+  );
 }
 
 bool _invoiceMatchesCaseSearch(InvoiceModel invoice, String rawQuery) {
@@ -299,30 +326,246 @@ class _CaseHistorySectionState extends State<_CaseHistorySection> {
   }
 }
 
-class _PaymentHistoryScreen extends StatefulWidget {
+class PaymentHistoryScreen extends StatefulWidget {
   final String attorneyId;
   final BillingService billing;
   final bool canManage;
   final List<InvoiceModel>? invoices;
+  final String recorderRole;
+  final String? recorderName;
+  final String? recorderId;
 
-  const _PaymentHistoryScreen({
+  const PaymentHistoryScreen({
+    super.key,
     required this.attorneyId,
     required this.billing,
     required this.canManage,
     this.invoices,
+    this.recorderRole = 'attorney',
+    this.recorderName,
+    this.recorderId,
   });
 
   @override
-  State<_PaymentHistoryScreen> createState() => _PaymentHistoryScreenState();
+  State<PaymentHistoryScreen> createState() => _PaymentHistoryScreenState();
 }
 
-class _PaymentHistoryScreenState extends State<_PaymentHistoryScreen> {
+enum _HistoryPeriodPreset { all, thisMonth, last2, last3, custom }
+
+class _PaymentHistoryScreenState extends State<PaymentHistoryScreen> {
   final TextEditingController _searchController = TextEditingController();
+  _HistoryPeriodPreset _preset = _HistoryPeriodPreset.all;
+  int? _fromYear;
+  int? _fromMonth;
+  int? _toYear;
+  int? _toMonth;
+
+  static const _months = <(int, String)>[
+    (1, 'January'),
+    (2, 'February'),
+    (3, 'March'),
+    (4, 'April'),
+    (5, 'May'),
+    (6, 'June'),
+    (7, 'July'),
+    (8, 'August'),
+    (9, 'September'),
+    (10, 'October'),
+    (11, 'November'),
+    (12, 'December'),
+  ];
+
+  PaymentHistoryPeriod get _selectedPeriod {
+    final now = DateTime.now();
+    switch (_preset) {
+      case _HistoryPeriodPreset.all:
+        return const PaymentHistoryPeriod.all();
+      case _HistoryPeriodPreset.thisMonth:
+        return PaymentHistoryPeriod.thisMonth(now);
+      case _HistoryPeriodPreset.last2:
+        return PaymentHistoryPeriod.lastMonths(now, 2);
+      case _HistoryPeriodPreset.last3:
+        return PaymentHistoryPeriod.lastMonths(now, 3);
+      case _HistoryPeriodPreset.custom:
+        return PaymentHistoryPeriod(
+          fromYear: _fromYear,
+          fromMonth: _fromMonth,
+          toYear: _toYear ?? _fromYear,
+          toMonth: _toMonth ?? _fromMonth,
+        );
+    }
+  }
 
   @override
   void dispose() {
     _searchController.dispose();
     super.dispose();
+  }
+
+  InputDecoration _filterDecoration(String label) => InputDecoration(
+        labelText: label,
+        labelStyle: const TextStyle(fontSize: 12),
+        filled: true,
+        fillColor: Colors.white,
+        isDense: true,
+        contentPadding:
+            const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: const BorderSide(color: AppTheme.royalBlue, width: 1.5),
+        ),
+      );
+
+  void _selectPreset(_HistoryPeriodPreset preset) {
+    setState(() {
+      _preset = preset;
+      if (preset == _HistoryPeriodPreset.custom) {
+        final now = DateTime.now();
+        _fromYear ??= now.year;
+        _fromMonth ??= now.month;
+        _toYear ??= now.year;
+        _toMonth ??= now.month;
+      }
+    });
+  }
+
+  Widget _yearDropdown({
+    required String keyName,
+    required String label,
+    required int? value,
+    required List<int> years,
+    required ValueChanged<int?> onChanged,
+  }) {
+    return DropdownButtonFormField<int>(
+      key: ValueKey('$keyName-$value'),
+      initialValue: value ?? years.first,
+      isExpanded: true,
+      decoration: _filterDecoration(label),
+      items: [
+        for (final year in years)
+          DropdownMenuItem<int>(
+            value: year,
+            child: Text('$year'),
+          ),
+      ],
+      onChanged: onChanged,
+    );
+  }
+
+  Widget _monthDropdown({
+    required String keyName,
+    required String label,
+    required int? value,
+    required ValueChanged<int?> onChanged,
+  }) {
+    return DropdownButtonFormField<int>(
+      key: ValueKey('$keyName-$value'),
+      initialValue: value ?? 1,
+      isExpanded: true,
+      decoration: _filterDecoration(label),
+      items: [
+        for (final month in _months)
+          DropdownMenuItem<int>(
+            value: month.$1,
+            child: Text(month.$2),
+          ),
+      ],
+      onChanged: onChanged,
+    );
+  }
+
+  Widget _presetDropdown() {
+    return DropdownButtonFormField<_HistoryPeriodPreset>(
+      key: ValueKey(_preset),
+      initialValue: _preset,
+      isExpanded: true,
+      decoration: _filterDecoration('Period'),
+      items: const [
+        DropdownMenuItem(
+          value: _HistoryPeriodPreset.all,
+          child: Text('All time'),
+        ),
+        DropdownMenuItem(
+          value: _HistoryPeriodPreset.thisMonth,
+          child: Text('This month'),
+        ),
+        DropdownMenuItem(
+          value: _HistoryPeriodPreset.last2,
+          child: Text('Last 2 months'),
+        ),
+        DropdownMenuItem(
+          value: _HistoryPeriodPreset.last3,
+          child: Text('Last 3 months'),
+        ),
+        DropdownMenuItem(
+          value: _HistoryPeriodPreset.custom,
+          child: Text('Custom range'),
+        ),
+      ],
+      onChanged: (value) {
+        if (value != null) _selectPreset(value);
+      },
+    );
+  }
+
+  Widget _customRange(List<int> years) {
+    return Column(
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: _yearDropdown(
+                keyName: 'from-year',
+                label: 'From year',
+                value: _fromYear,
+                years: years,
+                onChanged: (value) => setState(() => _fromYear = value),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _monthDropdown(
+                keyName: 'from-month',
+                label: 'From month',
+                value: _fromMonth,
+                onChanged: (value) => setState(() => _fromMonth = value),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: _yearDropdown(
+                keyName: 'to-year',
+                label: 'To year',
+                value: _toYear,
+                years: years,
+                onChanged: (value) => setState(() => _toYear = value),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _monthDropdown(
+                keyName: 'to-month',
+                label: 'To month',
+                value: _toMonth,
+                onChanged: (value) => setState(() => _toMonth = value),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
   }
 
   String _csvCell(String value) => '"${value.replaceAll('"', '""')}"';
@@ -336,7 +579,8 @@ class _PaymentHistoryScreenState extends State<_PaymentHistoryScreen> {
     }
 
     final now = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
-    final fileName = 'payment_history_report_$now.pdf';
+    final fileName =
+        'payment_history_report_${_selectedPeriod.fileSlug}_$now.pdf';
 
     try {
       final bytes = await buildPaymentHistoryReportPdf(report);
@@ -404,7 +648,8 @@ class _PaymentHistoryScreenState extends State<_PaymentHistoryScreen> {
     try {
       await saveBytes(
         bytes: Uint8List.fromList(utf8.encode(buffer.toString())),
-        filename: 'payment_history_report_$now.csv',
+        filename:
+            'payment_history_report_${_selectedPeriod.fileSlug}_$now.csv',
         mimeType: 'text/csv',
       );
       if (!mounted) return;
@@ -434,24 +679,33 @@ class _PaymentHistoryScreenState extends State<_PaymentHistoryScreen> {
         backgroundColor: AppTheme.royalBlue,
       ),
       body: StreamBuilder<List<InvoiceModel>>(
-        stream: widget.billing.streamInvoicesForAttorney(widget.attorneyId),
+        stream: widget.attorneyId.trim().isNotEmpty
+            ? widget.billing.streamInvoicesForAttorney(widget.attorneyId.trim())
+            : widget.billing.streamAllInvoices(),
         builder: (context, invoiceSnap) {
           final invoices =
               invoiceSnap.data ?? widget.invoices ?? const <InvoiceModel>[];
 
           return StreamBuilder<List<PaymentModel>>(
-            stream: widget.billing.streamPaymentsForAttorney(widget.attorneyId),
+            stream: widget.attorneyId.trim().isNotEmpty
+                ? widget.billing.streamPaymentsForAttorney(widget.attorneyId.trim())
+                : widget.billing.streamAllPayments(),
             builder: (context, snap) {
               final payments = snap.data ?? [];
               final reportKey =
                   '${invoices.map((i) => i.id).join('|')}|${payments.map((p) => p.id).join('|')}';
 
               return FutureBuilder<PaymentHistoryReport>(
-                key: ValueKey('$reportKey|${_searchController.text}'),
+                key: ValueKey(
+                  '$reportKey|${widget.recorderRole}|${widget.recorderName}|${widget.recorderId}',
+                ),
                 future: buildPaymentHistoryReport(
                   invoices: invoices,
                   payments: payments,
                   attorneyId: widget.attorneyId,
+                  recorderRole: widget.recorderRole,
+                  recorderName: widget.recorderName,
+                  recorderId: widget.recorderId,
                 ),
                 builder: (context, reportSnap) {
                   if ((invoiceSnap.connectionState == ConnectionState.waiting &&
@@ -466,15 +720,24 @@ class _PaymentHistoryScreenState extends State<_PaymentHistoryScreen> {
                     return const Center(child: CircularProgressIndicator());
                   }
 
-                  final filteredRows = filterReportRows(
+                  final period = _selectedPeriod;
+                  final periodRows = filterReportRowsByPaidPeriod(
                     baseReport.rows,
+                    payments,
+                    period: period,
+                  );
+                  final filteredRows = filterReportRows(
+                    periodRows,
                     _searchController.text,
                   );
                   final report = PaymentHistoryReport(
-                    meta: baseReport.meta,
+                    meta: baseReport.meta.copyWith(
+                      periodNote: paymentHistoryPeriodNote(period),
+                    ),
                     rows: filteredRows,
                     summary: buildPaymentReportSummary(filteredRows),
                   );
+                  final years = paymentHistoryFilterYears(payments);
 
                   final isMobile = MediaQuery.sizeOf(context).width < 720;
 
@@ -485,44 +748,118 @@ class _PaymentHistoryScreenState extends State<_PaymentHistoryScreen> {
                         TextField(
                           controller: _searchController,
                           onChanged: (_) => setState(() {}),
-                          decoration: const InputDecoration(
+                          style: const TextStyle(fontSize: 13),
+                          decoration: InputDecoration(
                             hintText:
                                 'Search client, case no, payment status...',
-                            prefixIcon: Icon(Icons.search),
+                            hintStyle: const TextStyle(fontSize: 12.5),
+                            prefixIcon: const Icon(Icons.search, size: 20),
+                            isDense: true,
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 10,
+                            ),
                             filled: true,
                             fillColor: Colors.white,
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10),
+                              borderSide:
+                                  const BorderSide(color: Color(0xFFE2E8F0)),
+                            ),
+                            enabledBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10),
+                              borderSide:
+                                  const BorderSide(color: Color(0xFFE2E8F0)),
+                            ),
+                            focusedBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10),
+                              borderSide: const BorderSide(
+                                color: AppTheme.royalBlue,
+                                width: 1.5,
+                              ),
+                            ),
+                            suffixIcon: _searchController.text.isNotEmpty
+                                ? IconButton(
+                                    icon: const Icon(Icons.clear, size: 18),
+                                    onPressed: () {
+                                      _searchController.clear();
+                                      setState(() {});
+                                    },
+                                  )
+                                : null,
                           ),
                         ),
                         const SizedBox(height: 8),
-                        Align(
-                          alignment: Alignment.centerRight,
-                          child: PopupMenuButton<String>(
-                            icon: const Icon(Icons.download_outlined,
-                                color: AppTheme.royalBlue),
-                            tooltip: 'Download report',
-                            onSelected: (value) {
-                              if (value == 'pdf') {
-                                _downloadReportPdf(report);
-                              } else {
-                                _downloadReportCsv(report);
-                              }
-                            },
-                            itemBuilder: (_) => const [
-                              PopupMenuItem(
-                                value: 'pdf',
-                                child: Text('Download PDF Report'),
+                        Row(
+                          children: [
+                            Expanded(child: _presetDropdown()),
+                            const SizedBox(width: 8),
+                            PopupMenuButton<String>(
+                              tooltip: 'Download report',
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
                               ),
-                              PopupMenuItem(
-                                value: 'csv',
-                                child: Text('Download CSV'),
+                              onSelected: (value) {
+                                if (value == 'pdf') {
+                                  _downloadReportPdf(report);
+                                } else {
+                                  _downloadReportCsv(report);
+                                }
+                              },
+                              itemBuilder: (_) => const [
+                                PopupMenuItem(
+                                  value: 'pdf',
+                                  child: Text('Download PDF Report'),
+                                ),
+                                PopupMenuItem(
+                                  value: 'csv',
+                                  child: Text('Download CSV'),
+                                ),
+                              ],
+                              child: Container(
+                                height: 42,
+                                padding:
+                                    const EdgeInsets.symmetric(horizontal: 12),
+                                decoration: BoxDecoration(
+                                  color: Colors.white,
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: Border.all(
+                                    color: const Color(0xFFE2E8F0),
+                                  ),
+                                ),
+                                child: const Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      Icons.download_rounded,
+                                      size: 18,
+                                      color: AppTheme.royalBlue,
+                                    ),
+                                    SizedBox(width: 5),
+                                    Text(
+                                      'Export',
+                                      style: TextStyle(
+                                        fontSize: 12.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: AppTheme.royalBlue,
+                                      ),
+                                    ),
+                                  ],
+                                ),
                               ),
-                            ],
-                          ),
+                            ),
+                          ],
                         ),
-                      ] else
+                        if (_preset == _HistoryPeriodPreset.custom) ...[
+                          const SizedBox(height: 8),
+                          _customRange(years),
+                        ],
+                        const SizedBox(height: 10),
+                      ] else ...[
                         Row(
                           children: [
                             Expanded(
+                              flex: 3,
                               child: TextField(
                                 controller: _searchController,
                                 onChanged: (_) => setState(() {}),
@@ -535,6 +872,8 @@ class _PaymentHistoryScreenState extends State<_PaymentHistoryScreen> {
                                 ),
                               ),
                             ),
+                            const SizedBox(width: 10),
+                            Expanded(flex: 2, child: _presetDropdown()),
                             const SizedBox(width: 10),
                             PopupMenuButton<String>(
                               icon: const Icon(Icons.download_outlined,
@@ -559,6 +898,11 @@ class _PaymentHistoryScreenState extends State<_PaymentHistoryScreen> {
                             ),
                           ],
                         ),
+                        if (_preset == _HistoryPeriodPreset.custom) ...[
+                          const SizedBox(height: 8),
+                          _customRange(years),
+                        ],
+                      ],
                       const SizedBox(height: 16),
                       if (baseReport.rows.isEmpty)
                         Text(
@@ -586,7 +930,7 @@ class _PaymentHistoryScreenState extends State<_PaymentHistoryScreen> {
   }
 }
 
-/// Confirms and deletes an invoice together with all of its payment receipts.
+/// Hides an invoice from billing. Payment receipts stay on Payment History.
 Future<void> _confirmDeleteInvoice(
   BuildContext context,
   BillingService billing,
@@ -598,12 +942,11 @@ Future<void> _confirmDeleteInvoice(
   final confirmed = await showDialog<bool>(
     context: context,
     builder: (ctx) => AlertDialog(
-      title: const Text('Delete invoice?'),
+      title: const Text('Remove from billing?'),
       content: Text(
-        'This permanently deletes the invoice for "$title" '
-        '(${Currency.peso(invoice.totalLegalFee)}) and every payment recorded '
-        'against it. Its fees and payments will be removed from all totals. '
-        'This cannot be undone.',
+        'This removes "$title" (${Currency.peso(invoice.totalLegalFee)}) '
+        'from the billing list and totals. Payment history is kept and '
+        'can still be viewed and downloaded.',
       ),
       actions: [
         TextButton(
@@ -613,7 +956,7 @@ Future<void> _confirmDeleteInvoice(
         TextButton(
           onPressed: () => Navigator.of(ctx).pop(true),
           style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
-          child: const Text('Delete'),
+          child: const Text('Remove'),
         ),
       ],
     ),
@@ -621,13 +964,13 @@ Future<void> _confirmDeleteInvoice(
 
   if (confirmed != true) return;
 
-  final result = await billing.deleteInvoice(invoice);
+  final result = await billing.cancelInvoice(invoice.id);
   if (!context.mounted) return;
   ScaffoldMessenger.of(context).showSnackBar(
     SnackBar(
       content: Text(result.success
-          ? 'Invoice deleted and totals updated.'
-          : (result.message ?? 'Failed to delete invoice.')),
+          ? 'Removed from billing. Payment history was kept.'
+          : (result.message ?? 'Failed to remove invoice.')),
       backgroundColor: result.success ? Colors.green : Colors.redAccent,
     ),
   );
@@ -864,7 +1207,7 @@ class _FirmInvoiceCard extends StatelessWidget {
               if (canManage)
                 IconButton(
                   visualDensity: VisualDensity.compact,
-                  tooltip: 'Delete invoice',
+                  tooltip: 'Remove from billing. Payment history is kept.',
                   icon: const Icon(Icons.delete_outline,
                       color: Colors.redAccent, size: 20),
                   onPressed: () =>

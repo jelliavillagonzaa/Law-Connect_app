@@ -390,7 +390,7 @@ class _ArchiveStorageScreenState extends State<ArchiveStorageScreen> {
                 widget.onOpenBackup?.call();
                 Get.snackbar(
                   'Moved to Backup',
-                  'Case saved in Backup. Use Restore or Delete permanently there.',
+                  'Case saved in Backup. Use Restore there to recover it.',
                   backgroundColor: Colors.green,
                   colorText: Colors.white,
                 );

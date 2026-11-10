@@ -18,8 +18,8 @@ import '../../services/fcm_service.dart';
 import '../../services/profile_service.dart';
 import '../../models/user_model.dart';
 import '../../routes/portal_navigation.dart';
-import 'dashboard/client_dashboard_tabs.dart' deferred as dashboard_tabs;
-import 'dashboard/client_dashboard_nav.dart' deferred as dashboard_nav;
+import 'dashboard/client_dashboard_tabs.dart' as dashboard_tabs;
+import 'dashboard/client_dashboard_nav.dart' as dashboard_nav;
 import '../../utils/safe_network_image.dart';
 import '../../utils/quiet_console.dart';
 import '../../utils/screen_debug_probe.dart';
@@ -29,7 +29,9 @@ import '../../widgets/common/brand_logo.dart';
 import '../../widgets/common/instant_async.dart';
 import '../../widgets/common/lazy_indexed_stack.dart';
 import '../../widgets/client/client_notification_bell_button.dart';
+import 'help_center_screen.dart';
 import '../../services/auth_service.dart';
+import '../../services/hearing_notification_fanout_service.dart';
 
 class DashboardScreenWithNav extends StatefulWidget {
   const DashboardScreenWithNav({super.key});
@@ -53,8 +55,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
   StreamSubscription<User?>? _authStreamSubscription;
   Timer? _unreadCountRefreshTimer;
   bool _redirectingToLanding = false;
-  Future<void>? _tabsLibrary;
-  Future<void>? _navLibrary;
+  bool _fanoutAttached = false;
 
   int _currentIndex = 0;
   UserModel? _currentUser;
@@ -89,17 +90,9 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         _probe.event('postFrame');
-        _tabsLibrary = _probe
-            .track(
-              'loadTabsLibrary',
-              dashboard_tabs.loadLibrary,
-            )
-            .catchError((Object e, StackTrace st) {
-          // Prevent unhandled async errors from crashing the app.
-          appLog('Failed to load dashboard tabs library: $e\n$st');
-        });
-        unawaited(_loadUserData());
-        Future<void>.delayed(const Duration(milliseconds: 400), () {
+        _loadUserData();
+        unawaited(_refreshSummaryCounts());
+        Future<void>.delayed(const Duration(milliseconds: 600), () {
           if (!mounted || _currentIndex != 0) return;
           unawaited(
             _refreshSummaryCounts().catchError((Object e, StackTrace st) {
@@ -131,7 +124,6 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
       if (!mounted || _redirectingToLanding) return;
       if (user == null) {
         _redirectingToLanding = true;
-        // App → LoginPage; website stays on the firm-portal landing.
         navigateAfterLogout();
       }
     });
@@ -199,6 +191,14 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
         }
 
         data['role'] = portalRole;
+        if (!_fanoutAttached) {
+          _fanoutAttached = true;
+          HearingNotificationFanoutService.instance.attach();
+        }
+        unawaited(
+          HearingNotificationFanoutService.instance
+              .syncClientHearingNotifications(),
+        );
         setState(() {
           _currentUser = UserModel.fromFirestore(data, user.uid);
           _isLoading = false;
@@ -280,17 +280,17 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
         final query = _firestore
             .collection('cases')
             .where('clientId', isEqualTo: user.uid)
-            .limit(8);
+            .limit(50);
         QuerySnapshot<Map<String, dynamic>> snapshot;
         try {
           snapshot = await query
               .get(const GetOptions(source: Source.cache))
-              .timeout(const Duration(seconds: 1));
+              .timeout(const Duration(seconds: 2));
           if (snapshot.docs.isEmpty) {
-            snapshot = await query.get().timeout(const Duration(seconds: 1));
+            snapshot = await query.get().timeout(const Duration(seconds: 8));
           }
         } catch (_) {
-          snapshot = await query.get().timeout(const Duration(seconds: 1));
+          snapshot = await query.get().timeout(const Duration(seconds: 8));
         }
         if (!mounted) return;
         final visible = <CaseModel>[];
@@ -305,11 +305,11 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
             .where((c) => !CaseStatusFilter.isCompleted(c.status))
             .toList();
         setState(() {
-          _caseCount = active.length;
-          _previewCases = active.take(5).toList();
+          _caseCount = active.isNotEmpty ? active.length : visible.length;
+          _previewCases = (active.isNotEmpty ? active : visible).take(5).toList();
         });
-      } catch (_) {
-        /* keep last painted counts */
+      } catch (e) {
+        appLog('Error in _loadCaseCount inner: $e');
       }
     } catch (e) {
       appLog('Error in _loadCaseCount: ${safeErrorString(e)}');
@@ -337,22 +337,21 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
         final query = _firestore
             .collection('appointments')
             .where('clientId', isEqualTo: user.uid)
-            .limit(20);
+            .limit(100);
         QuerySnapshot<Map<String, dynamic>> snapshot;
         try {
           snapshot = await query
               .get(const GetOptions(source: Source.cache))
-              .timeout(const Duration(seconds: 1));
+              .timeout(const Duration(seconds: 2));
           if (snapshot.docs.isEmpty) {
-            snapshot = await query.get().timeout(const Duration(seconds: 1));
+            snapshot = await query.get().timeout(const Duration(seconds: 8));
           }
         } catch (_) {
-          snapshot = await query.get().timeout(const Duration(seconds: 1));
+          snapshot = await query.get().timeout(const Duration(seconds: 8));
         }
         if (!mounted) return;
         final now = DateTime.now();
-        final today = DateTime(now.year, now.month, now.day);
-        var todayCount = 0;
+        var upcomingCount = 0;
         AppointmentModel? next;
         for (final doc in snapshot.docs) {
           AppointmentModel apt;
@@ -361,26 +360,24 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
           } catch (_) {
             continue;
           }
-          final status = apt.status.toLowerCase();
-          if (status == 'cancelled' || status == 'completed') continue;
-          final aptDateOnly = DateTime(
-            apt.appointmentDateTime.year,
-            apt.appointmentDateTime.month,
-            apt.appointmentDateTime.day,
-          );
-          if (aptDateOnly == today) todayCount++;
-          if (apt.appointmentDateTime.isBefore(now)) continue;
-          if (next == null ||
-              apt.appointmentDateTime.isBefore(next.appointmentDateTime)) {
-            next = apt;
+          final status = apt.status.toLowerCase().trim();
+          if (status == 'cancelled' || status == 'declined' || status == 'completed') {
+            continue;
+          }
+          if (!apt.appointmentDateTime.isBefore(now)) {
+            upcomingCount++;
+            if (next == null ||
+                apt.appointmentDateTime.isBefore(next.appointmentDateTime)) {
+              next = apt;
+            }
           }
         }
         setState(() {
-          _appointmentCount = todayCount;
+          _appointmentCount = upcomingCount;
           _nextAppointment = next;
         });
-      } catch (_) {
-        /* keep last painted counts */
+      } catch (e) {
+        appLog('Error in _loadAppointmentCount inner: $e');
       }
     } catch (e) {
       appLog('Error in _loadAppointmentCount: $e');
@@ -400,7 +397,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
       try {
         final count = await _chatService
             .getUnreadCount(user.uid)
-            .timeout(const Duration(seconds: 1));
+            .timeout(const Duration(seconds: 8));
         if (!mounted) return;
         if (count != _unreadMessageCount) {
           setState(() => _unreadMessageCount = count);
@@ -413,9 +410,6 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
     }
   });
 
-  Future<void> _ensureNavLibrary() {
-    return _navLibrary ??= dashboard_nav.loadLibrary();
-  }
 
   @override
   void dispose() {
@@ -427,35 +421,52 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
     _appointmentStreamSubscription?.cancel();
     _unreadCountStreamSubscription?.cancel();
     _unreadCountRefreshTimer?.cancel();
+    if (_fanoutAttached) {
+      _fanoutAttached = false;
+      HearingNotificationFanoutService.instance.detach();
+    }
     super.dispose();
   }
 
+  bool _openingCounselChat = false;
+
   Future<void> _openMessageStaffForm() async {
+    if (_openingCounselChat) return;
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
 
-    try {
-      // Get or create chat with staff using email identifier
-      // This will create a chat that staff can access via their email
-      final chatId = await _chatService.getOrCreateChatByStaffEmail(
-        clientId: user.uid,
-        staffEmail: 'staff@gmail.com',
-      );
+    setState(() => _openingCounselChat = true);
 
-      // Navigate directly to chat screen (message form)
-      await _ensureNavLibrary();
+    try {
+      final result = await _chatService.getOrCreateClientOfficeChatWithCounterpart(user.uid);
+
       await dashboard_nav.openChat(
-        conversationId: chatId,
-        otherUserId: 'staff@gmail.com',
-        otherUserName: 'Staff',
+        conversationId: result.chatId,
+        otherUserId: result.counterpart.id,
+        otherUserName: result.counterpart.name,
+        otherUserRole: result.counterpart.role,
       );
     } catch (e) {
-      // On any error, navigate to Messages tab
+      if (!mounted) return;
+      Get.snackbar(
+        'Messages',
+        e.toString().replaceFirst('Exception: ', ''),
+        backgroundColor: Colors.red,
+        colorText: Colors.white,
+      );
       setState(() => _currentIndex = 3);
+    } finally {
+      if (mounted) {
+        setState(() => _openingCounselChat = false);
+      }
     }
   }
 
   Future<void> _refreshData() => _probe.track('pullToRefresh', () async {
+    unawaited(
+      HearingNotificationFanoutService.instance
+          .syncClientHearingNotifications(force: true),
+    );
     await _loadUserData();
     await _refreshSummaryCounts();
     if (!kIsWeb) {
@@ -469,6 +480,9 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
     setState(() {
       _currentIndex = index;
     });
+    if (index == 0) {
+      unawaited(_refreshSummaryCounts());
+    }
   }
 
   Widget _buildHomeScreen() {
@@ -694,8 +708,8 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
           Expanded(
             child: _buildSummaryCard(
               icon: Icons.folder_copy_rounded,
-              label: 'Active Cases',
-              subtitle: "Case's in progress.",
+              label: 'Cases',
+              subtitle: _caseCount > 0 ? "Cases on record." : "No cases yet.",
               count: _caseCount,
               color: primaryColor,
               onTap: () {
@@ -708,7 +722,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
             child: _buildSummaryCard(
               icon: Icons.calendar_today_rounded,
               label: 'Appointments',
-              subtitle: 'Upcoming schedule.',
+              subtitle: "Upcoming schedule.",
               count: _appointmentCount,
               color: goldColor,
               onTap: () {
@@ -721,7 +735,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
             child: _buildSummaryCard(
               icon: Icons.chat_bubble_outline_rounded,
               label: 'Unread Messages',
-              subtitle: 'New messages.',
+              subtitle: _unreadMessageCount > 0 ? "New messages." : "All caught up.",
               count: _unreadMessageCount,
               color: Colors.green,
               onTap: () {
@@ -747,7 +761,6 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
                 filled: true,
                 gold: false,
                 onTap: () async {
-                  await _ensureNavLibrary();
                   await dashboard_nav.openAttorneySelection();
                 },
               ),
@@ -756,10 +769,11 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
             Expanded(
               child: _actionTile(
                 icon: Icons.chat_bubble_outline,
-                title: 'Message Attorney',
+                title: 'Message with Counsel',
                 subtitle: 'Chat with counsel',
                 filled: true,
                 gold: true,
+                isLoading: _openingCounselChat,
                 onTap: _openMessageStaffForm,
               ),
             ),
@@ -776,7 +790,6 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
                 filled: false,
                 gold: false,
                 onTap: () async {
-                  await _ensureNavLibrary();
                   await dashboard_nav.openSendRequest();
                 },
               ),
@@ -790,7 +803,6 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
                 filled: false,
                 gold: false,
                 onTap: () async {
-                  await _ensureNavLibrary();
                   await dashboard_nav.openNotaryPortal();
                 },
               ),
@@ -805,7 +817,6 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
           filled: false,
           gold: false,
           onTap: () async {
-            await _ensureNavLibrary();
             await dashboard_nav.openBilling();
           },
         ),
@@ -820,6 +831,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
     required bool filled,
     required bool gold,
     required VoidCallback onTap,
+    bool isLoading = false,
   }) {
     final bg = gold
         ? ClientUi.gold
@@ -835,7 +847,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
       color: bg,
       borderRadius: BorderRadius.circular(14),
       child: InkWell(
-        onTap: onTap,
+        onTap: isLoading ? null : onTap,
         borderRadius: BorderRadius.circular(14),
         child: Container(
           width: double.infinity,
@@ -877,7 +889,17 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
                   ],
                 ),
               ),
-              Icon(Icons.chevron_right, color: fg),
+              if (isLoading)
+                SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation<Color>(fg),
+                  ),
+                )
+              else
+                Icon(Icons.chevron_right, color: fg),
             ],
           ),
         ),
@@ -1194,22 +1216,10 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
           _currentIndex == 0 ? _homeTabRevision : 'frozen-tabs',
       builders: [
         () => _buildHomeScreen(),
-        () => _DeferredClientTab(
-              ensureLoaded: _ensureTabsLibrary,
-              pageBuilder: () => dashboard_tabs.buildClientDashboardTab(1),
-            ),
-        () => _DeferredClientTab(
-              ensureLoaded: _ensureTabsLibrary,
-              pageBuilder: () => dashboard_tabs.buildClientDashboardTab(2),
-            ),
-        () => _DeferredClientTab(
-              ensureLoaded: _ensureTabsLibrary,
-              pageBuilder: () => dashboard_tabs.buildClientDashboardTab(3),
-            ),
-        () => _DeferredClientTab(
-              ensureLoaded: _ensureTabsLibrary,
-              pageBuilder: () => dashboard_tabs.buildClientDashboardTab(4),
-            ),
+        () => dashboard_tabs.buildClientDashboardTab(1),
+        () => dashboard_tabs.buildClientDashboardTab(2),
+        () => dashboard_tabs.buildClientDashboardTab(3),
+        () => dashboard_tabs.buildClientDashboardTab(4),
       ],
     );
   }
@@ -1224,13 +1234,6 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
         _localImageBase64?.length,
       );
 
-  Future<void> _ensureTabsLibrary() {
-    return _tabsLibrary ??= dashboard_tabs.loadLibrary().catchError(
-      (Object e, StackTrace st) {
-        appLog('Failed to load dashboard tabs library: $e\n$st');
-      },
-    );
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -1310,8 +1313,13 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
                   ),
                 ],
               ),
-              actions: const [
-                ClientNotificationBellButton(),
+              actions: [
+                IconButton(
+                  tooltip: 'Help Center',
+                  icon: const Icon(Icons.help_outline),
+                  onPressed: () => Get.to(() => const HelpCenterScreen()),
+                ),
+                const ClientNotificationBellButton(),
               ],
             )
           : null,
@@ -1319,6 +1327,7 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
       bottomNavigationBar: CustomBottomNavigationBar5Tabs(
         currentIndex: _currentIndex,
         onTap: _onTabTapped,
+        messageUnreadCount: _unreadMessageCount,
       ),
       ),
     );
@@ -1338,41 +1347,5 @@ class _DashboardScreenWithNavState extends State<DashboardScreenWithNav> {
 
     // Return null — network photos use SafeNetworkAvatar in the header UI.
     return null;
-  }
-}
-
-class _DeferredClientTab extends StatefulWidget {
-  const _DeferredClientTab({
-    required this.ensureLoaded,
-    required this.pageBuilder,
-  });
-
-  final Future<void> Function() ensureLoaded;
-  final Widget Function() pageBuilder;
-
-  @override
-  State<_DeferredClientTab> createState() => _DeferredClientTabState();
-}
-
-class _DeferredClientTabState extends State<_DeferredClientTab> {
-  Widget? _page;
-
-  @override
-  void initState() {
-    super.initState();
-    unawaited(_open());
-  }
-
-  Future<void> _open() async {
-    try {
-      await widget.ensureLoaded();
-    } catch (_) {}
-    if (!mounted) return;
-    setState(() => _page = widget.pageBuilder());
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return _page ?? const InstantFill();
   }
 }

@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../../models/case_model.dart';
 import '../../services/case_service.dart';
 import '../../services/auth_service.dart';
+import '../../pages/case/create_case_page.dart';
 import 'case_details_screen.dart';
 
 class ProfessionalDashboardScreen extends StatefulWidget {
@@ -20,13 +23,16 @@ class _ProfessionalDashboardScreenState extends State<ProfessionalDashboardScree
   String _selectedFilter = 'All';
   List<CaseModel> _allCases = [];
   List<CaseModel> _filteredCases = [];
-  
+
+  // Firestore stream — must be cancelled in dispose to prevent listener leak
+  StreamSubscription<List<CaseModel>>? _caseStreamSubscription;
+
   // Summary counts
   int _totalCases = 0;
   int _activeCases = 0;
   int _completedCases = 0;
   int _declinedCases = 0;
-  
+
   String? _currentUserId;
 
   // Color constants
@@ -56,14 +62,22 @@ class _ProfessionalDashboardScreenState extends State<ProfessionalDashboardScree
 
   void _loadCases() {
     if (_currentUserId == null) return;
-    
-    _caseService.getCasesForUser(_currentUserId!, 'client').listen((cases) {
+
+    // Cancel any existing subscription before creating a new one.
+    // Without this, every navigation to the screen stacks a new listener,
+    // all firing setState() simultaneously and causing the ANR freeze.
+    _caseStreamSubscription?.cancel();
+    _caseStreamSubscription = _caseService
+        .getCasesForUser(_currentUserId!, 'client')
+        .listen((cases) {
+      if (!mounted) return;
       setState(() {
         _allCases = cases;
         _updateSummaryCounts();
         _applyFilter();
       });
-    }).onError((error) {
+    });
+    _caseStreamSubscription!.onError((Object error) {
       if (mounted) setState(() {});
     });
   }
@@ -152,6 +166,7 @@ class _ProfessionalDashboardScreenState extends State<ProfessionalDashboardScree
 
   @override
   void dispose() {
+    _caseStreamSubscription?.cancel();
     _searchController.dispose();
     super.dispose();
   }
@@ -191,8 +206,24 @@ class _ProfessionalDashboardScreenState extends State<ProfessionalDashboardScree
           ],
         ),
       ),
+      floatingActionButton: FloatingActionButton.extended(
+        heroTag: 'pro_dashboard_create_case_fab',
+        backgroundColor: primaryRed,
+        foregroundColor: Colors.white,
+        icon: const Icon(Icons.add),
+        label: const Text('Create Case / Request'),
+        onPressed: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (context) => const CreateCasePage(),
+            ),
+          );
+        },
+      ),
     );
   }
+
 
   Widget _buildTopNavbar() {
     return Container(
@@ -262,7 +293,7 @@ class _ProfessionalDashboardScreenState extends State<ProfessionalDashboardScree
           
           // Notifications Icon
           _buildNavIcon(Icons.notifications_outlined, () {
-            // Navigate to notifications
+            Navigator.of(context).pushNamed('/ClientNotifications');
           }, hasBadge: true),
         ],
       ),
@@ -445,11 +476,29 @@ class _ProfessionalDashboardScreenState extends State<ProfessionalDashboardScree
                   fontWeight: FontWeight.w500,
                 ),
               ),
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                onPressed: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => const CreateCasePage(),
+                    ),
+                  );
+                },
+                icon: const Icon(Icons.add, size: 18),
+                label: const Text('Create Case / Send Request'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: primaryRed,
+                  foregroundColor: Colors.white,
+                ),
+              ),
             ],
           ),
         ),
       );
     }
+
 
     return ListView.builder(
       shrinkWrap: true,

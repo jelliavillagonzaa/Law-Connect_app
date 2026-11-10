@@ -12,6 +12,7 @@ class AdminAppointmentSchedulerForm extends StatefulWidget {
   final String? clientName;
   final String? caseId;
   final AppointmentModel? existingAppointment;
+  final DateTime? initialDate;
 
   const AdminAppointmentSchedulerForm({
     super.key,
@@ -19,6 +20,7 @@ class AdminAppointmentSchedulerForm extends StatefulWidget {
     this.clientName,
     this.caseId,
     this.existingAppointment,
+    this.initialDate,
   });
 
   @override
@@ -75,8 +77,10 @@ class _AdminAppointmentSchedulerFormState
         _appointmentType = 'meeting_office';
       }
     } else {
-      _selectedDate = DateTime.now();
-      _selectedTime = TimeOfDay.now();
+      _selectedDate = widget.initialDate ?? DateTime.now();
+      _selectedTime = widget.initialDate != null
+          ? TimeOfDay.fromDateTime(widget.initialDate!)
+          : TimeOfDay.now();
     }
     if (widget.clientId != null) {
       _loadClientCases();

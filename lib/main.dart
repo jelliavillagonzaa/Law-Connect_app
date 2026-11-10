@@ -1,6 +1,8 @@
 import 'dart:async' show TimeoutException, unawaited;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_quill/flutter_quill.dart';
 import 'package:get/get.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 
@@ -20,6 +22,9 @@ import 'routes/deferred_route_loaders.dart';
 import 'services/notification_service.dart';
 import 'services/fcm_service.dart';
 import 'screens/client/chat_screen.dart';
+import 'pages/case/create_case_page.dart';
+import 'screens/attorney/attorney_create_case_screen.dart';
+import 'screens/client/send_request_screen.dart';
 import 'firebase_messaging_handler.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'supabase/supabase_bootstrap.dart';
@@ -41,7 +46,6 @@ Future<void> _initDeferredServices() async {
   }
 
   if (!kIsWeb) {
-    FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
     unawaited(NotificationService().initialize().catchError((_) {}));
   }
   unawaited(FCMService().initialize().catchError((_) {}));
@@ -66,6 +70,7 @@ Future<void> _bootstrap() async {
   }
 
   await initializeFirebaseInBackground();
+  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
   runApp(const LawConnectApp());
   unawaited(_initDeferredServices());
 }
@@ -84,6 +89,13 @@ class LawConnectApp extends StatelessWidget {
       title: 'Law Connect',
       theme: AppTheme.lightTheme,
       scrollBehavior: const AppScrollBehavior(),
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+        FlutterQuillLocalizations.delegate,
+      ],
+      supportedLocales: const [Locale('en')],
       logWriterCallback: kVerboseAppLogs
           ? null
           : (text, {bool isError = false}) {},
@@ -113,8 +125,7 @@ class LawConnectApp extends StatelessWidget {
         ),
         GetPage(
           name: '/LoginPage',
-          page: () =>
-              kIsWeb ? const ClientLandingPage() : const LoginPage(),
+          page: () => const LoginPage(),
         ),
         GetPage(name: '/Signup', page: () => const SignupPage()),
         GetPage(name: '/ClientSignup', page: () => const SignupPage()),
@@ -153,6 +164,18 @@ class LawConnectApp extends StatelessWidget {
               conversationId: map['chatId']?.toString(),
             );
           },
+        ),
+        GetPage(
+          name: '/CreateCase',
+          page: () => const CreateCasePage(),
+        ),
+        GetPage(
+          name: '/AttorneyCreateCase',
+          page: () => const AttorneyCreateCaseScreen(),
+        ),
+        GetPage(
+          name: '/SendRequest',
+          page: () => const SendRequestScreen(),
         ),
       ],
       unknownRoute: GetPage(

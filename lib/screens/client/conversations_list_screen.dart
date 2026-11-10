@@ -49,7 +49,12 @@ class _ConversationsListScreenState extends State<ConversationsListScreen> {
     return Scaffold(
       backgroundColor: AppTheme.lightBackground,
       appBar: AppBar(title: const Text('Messages')),
-      body: StreamBuilder<List<ChatModel>>(
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _signedInAsBar(user),
+          Expanded(
+            child: StreamBuilder<List<ChatModel>>(
         stream: _chatService.getUserConversations(user.uid),
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.waiting &&
@@ -61,7 +66,9 @@ class _ConversationsListScreenState extends State<ConversationsListScreen> {
             return Center(child: Text('Error: ${snapshot.error}'));
           }
 
-          final conversations = snapshot.data ?? [];
+          final conversations = ChatModel.oneThreadPerClient(
+            (snapshot.data ?? []).where((c) => c.hasMessages).toList(),
+          );
 
           if (conversations.isEmpty) {
             return const MessageFormWidget();
@@ -72,25 +79,21 @@ class _ConversationsListScreenState extends State<ConversationsListScreen> {
             itemCount: conversations.length,
             itemBuilder: (context, index) {
               final conversation = conversations[index];
-              // Get the other user ID (the one that's not the current user)
-              // For client-staff chats, prefer staffId if available
-              // For client-attorney chats, prefer attorneyId if available
+              // Get the other user ID (prefer attorneyId for attorney chats, staffId for staff chats)
               String otherUserId;
-              if (conversation.staffId != null &&
-                  conversation.staffId != user.uid) {
-                otherUserId = conversation.staffId!;
-              } else if (conversation.attorneyId != null &&
+              if (conversation.attorneyId != null &&
                   conversation.attorneyId != user.uid) {
                 otherUserId = conversation.attorneyId!;
+              } else if (conversation.staffId != null &&
+                  conversation.staffId != user.uid) {
+                otherUserId = conversation.staffId!;
               } else if (conversation.clientId != null &&
                   conversation.clientId != user.uid) {
                 otherUserId = conversation.clientId!;
               } else {
                 otherUserId = conversation.participants.firstWhere(
-                  (id) => id != user.uid,
-                  orElse: () => conversation.participants.isNotEmpty
-                      ? conversation.participants[0]
-                      : '',
+                  (id) => id != user.uid && !id.startsWith('staff_'),
+                  orElse: () => '',
                 );
               }
 
@@ -149,17 +152,45 @@ class _ConversationsListScreenState extends State<ConversationsListScreen> {
                 },
                 child: Builder(
                   builder: (context) {
-                    final isStaffConversation =
-                        conversation.staffId == otherUserId ||
-                        conversation.staffId != null ||
-                        conversation.staffEmail != null;
-                    final isAttorneyConversation =
-                        conversation.attorneyId == otherUserId ||
-                        conversation.attorneyId != null;
-                    final otherUserName = isAttorneyConversation
-                        ? 'Attorney'
-                        : 'Staff';
-                    final letter = otherUserName[0];
+                    return FutureBuilder<({String id, String name, String role})>(
+                      future: _chatService.chatCounterpartInfo(
+                        chatId: conversation.id,
+                        currentUserId: user.uid,
+                      ),
+                      builder: (context, counterpartSnap) {
+                        final counterpart = counterpartSnap.data;
+                        final isStaff = conversation.isClientStaffChat ||
+                            conversation.chatType == 'client_staff' ||
+                            counterpart?.role == 'staff' ||
+                            (conversation.staffId != null &&
+                                conversation.staffId!.isNotEmpty) ||
+                            (conversation.staffEmail != null &&
+                                conversation.staffEmail!.isNotEmpty);
+                        final isAttorney = !isStaff &&
+                            (counterpart?.role == 'attorney' ||
+                                (conversation.attorneyId != null &&
+                                    conversation.attorneyId != user.uid));
+                        final otherUserName = (counterpart != null &&
+                                counterpart.name.trim().isNotEmpty)
+                            ? counterpart.name
+                            : (isAttorney ? 'Attorney' : 'Legal Staff');
+                        final resolvedOtherId = (counterpart != null &&
+                                counterpart.id.isNotEmpty &&
+                                counterpart.id != 'staff@gmail.com')
+                            ? counterpart.id
+                            : (isAttorney
+                                ? (conversation.attorneyId ?? otherUserId)
+                                : (conversation.staffId ?? otherUserId));
+                        final cleanLetterSource = isAttorney
+                            ? otherUserName.replaceAll('Atty. ', '').trim()
+                            : otherUserName.trim();
+                        final letter = cleanLetterSource.isNotEmpty
+                            ? cleanLetterSource[0].toUpperCase()
+                            : (isAttorney ? 'A' : 'S');
+                        final roleBadgeText = isAttorney ? 'ATTORNEY' : 'STAFF';
+                        final roleBadgeColor = isAttorney
+                            ? AppTheme.royalBlue
+                            : const Color(0xFF00897B);
 
                     return Card(
                       margin: const EdgeInsets.symmetric(
@@ -168,11 +199,11 @@ class _ConversationsListScreenState extends State<ConversationsListScreen> {
                       ),
                       child: ListTile(
                         leading: CircleAvatar(
-                          backgroundColor: AppTheme.navy.withOpacity(0.1),
+                          backgroundColor: roleBadgeColor.withOpacity(0.1),
                           child: Text(
                             letter,
                             style: AppTheme.bodyMedium.copyWith(
-                              color: AppTheme.navy,
+                              color: roleBadgeColor,
                               fontWeight: FontWeight.bold,
                             ),
                           ),
@@ -187,54 +218,29 @@ class _ConversationsListScreenState extends State<ConversationsListScreen> {
                                 ),
                               ),
                             ),
-                            if (isAttorneyConversation)
-                              Container(
-                                margin: const EdgeInsets.only(left: 8),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 4,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: AppTheme.royalBlue.withOpacity(0.1),
-                                  borderRadius: BorderRadius.circular(12),
-                                  border: Border.all(
-                                    color: AppTheme.royalBlue.withOpacity(0.3),
-                                    width: 1,
-                                  ),
-                                ),
-                                child: Text(
-                                  'ATTORNEY',
-                                  style: AppTheme.caption.copyWith(
-                                    color: AppTheme.royalBlue,
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 10,
-                                  ),
-                                ),
-                              )
-                            else if (isStaffConversation)
-                              Container(
-                                margin: const EdgeInsets.only(left: 8),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 4,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: AppTheme.royalBlue.withOpacity(0.1),
-                                  borderRadius: BorderRadius.circular(12),
-                                  border: Border.all(
-                                    color: AppTheme.royalBlue.withOpacity(0.3),
-                                    width: 1,
-                                  ),
-                                ),
-                                child: Text(
-                                  'STAFF',
-                                  style: AppTheme.caption.copyWith(
-                                    color: AppTheme.royalBlue,
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 10,
-                                  ),
+                            Container(
+                              margin: const EdgeInsets.only(left: 8),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: roleBadgeColor.withOpacity(0.1),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                  color: roleBadgeColor.withOpacity(0.3),
+                                  width: 1,
                                 ),
                               ),
+                              child: Text(
+                                roleBadgeText,
+                                style: AppTheme.caption.copyWith(
+                                  color: roleBadgeColor,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 10,
+                                ),
+                              ),
+                            ),
                           ],
                         ),
                         subtitle: Text(
@@ -345,12 +351,15 @@ class _ConversationsListScreenState extends State<ConversationsListScreen> {
                           Get.to(
                             () => ChatScreen(
                               conversationId: conversation.id,
-                              otherUserId: otherUserId,
+                              otherUserId: resolvedOtherId,
                               otherUserName: otherUserName,
+                              otherUserRole: counterpart?.role ?? (isAttorney ? 'attorney' : 'staff'),
                             ),
                           );
                         },
                       ),
+                    );
+                      },
                     );
                   },
                 ),
@@ -358,6 +367,27 @@ class _ConversationsListScreenState extends State<ConversationsListScreen> {
             },
           );
         },
+      ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _signedInAsBar(User user) {
+    return Material(
+      color: const Color(0xFFE8F0FE),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        child: Text(
+          'Sending as ${user.displayName?.trim().isNotEmpty == true ? user.displayName : (user.email ?? 'this client account')}'
+          '${user.email != null ? ' · ${user.email}' : ''}',
+          style: const TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: Color(0xFF1A3A6C),
+          ),
+        ),
       ),
     );
   }

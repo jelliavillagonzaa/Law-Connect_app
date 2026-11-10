@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/common/change_password_dialog.dart';
 
 class ProfileMenuScreen extends StatelessWidget {
   const ProfileMenuScreen({super.key});
@@ -118,13 +119,7 @@ class ProfileMenuScreen extends StatelessWidget {
                     context,
                     icon: Icons.lock_outline,
                     title: 'Change Password',
-                    onTap: () {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text('Change Password coming soon'),
-                        ),
-                      );
-                    },
+                    onTap: () => ChangePasswordDialog.show(context),
                   ),
                   const SizedBox(height: 12),
                   _buildMenuTile(

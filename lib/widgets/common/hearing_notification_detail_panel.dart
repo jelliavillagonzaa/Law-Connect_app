@@ -14,12 +14,31 @@ final Map<String, Future<Map<String, dynamic>>> _enrichedHearingFutures =
 
 /// Structured hearing details (all Firestore fields, labeled rows).
 bool _seedLooksComplete(Map<String, dynamic> seed) {
-  final caseNo = HearingCalendarFields.asDisplayString(seed['caseNo']);
+  final rawCaseNo = HearingCalendarFields.asDisplayString(seed['caseNo']).isNotEmpty
+      ? HearingCalendarFields.asDisplayString(seed['caseNo'])
+      : HearingCalendarFields.asDisplayString(seed['caseNumber']);
+  final caseNo = HearingCalendarFields.cleanCaseDocketNo(rawCaseNo);
   final client = HearingCalendarFields.asDisplayString(seed['clientName']);
-  final full = HearingCalendarFields.asDisplayString(seed['fullText']).isNotEmpty
-      ? HearingCalendarFields.asDisplayString(seed['fullText'])
-      : HearingCalendarFields.asDisplayString(seed['message']);
-  return caseNo.isNotEmpty && (client.isNotEmpty || full.length > 40);
+  final caseTitle = HearingCalendarFields.asDisplayString(seed['caseTitle']);
+  final full = HearingCalendarFields.asDisplayString(seed['fullText']);
+  final hasRealFullText = full.isNotEmpty && !CourtOrderTextSources.isInboxWrapper(full);
+  final loc = HearingCalendarFields.asDisplayString(seed['location']).isNotEmpty
+      ? HearingCalendarFields.asDisplayString(seed['location'])
+      : HearingCalendarFields.asDisplayString(seed['courtBranch']);
+  final hasCompleteLocation =
+      loc.isNotEmpty && !HearingCalendarFields.isBareLocation(loc);
+
+  final titleHasCaption = caseTitle.isNotEmpty && HearingCalendarFields.hasCaseCaptionMarker(caseTitle);
+  final clientIsPlaintiff = client.toLowerCase().startsWith('heirs of') ||
+      (caseTitle.isNotEmpty && caseTitle.toLowerCase().startsWith(client.toLowerCase()));
+
+  return caseNo.isNotEmpty &&
+      !HearingCalendarFields.isPlaceholderCaseNo(caseNo) &&
+      client.isNotEmpty &&
+      !clientIsPlaintiff &&
+      titleHasCaption &&
+      hasCompleteLocation &&
+      hasRealFullText;
 }
 
 Future<Map<String, dynamic>> _loadEnrichedHearing(
@@ -40,21 +59,28 @@ Future<Map<String, dynamic>> _loadEnrichedHearing(
           .timeout(const Duration(seconds: 4));
       final hd = snap.data();
       if (hd == null || hd.isEmpty) return Map<String, dynamic>.from(seed);
-      return {
+      final out = <String, dynamic>{
         ...seed,
         ...hd,
-        if (HearingCalendarFields.asDisplayString(seed['caseNo']).isNotEmpty)
+        if (HearingCalendarFields.asDisplayString(seed['caseNo']).isNotEmpty &&
+            !HearingCalendarFields.isPlaceholderCaseNo(seed['caseNo']))
           'caseNo': HearingCalendarFields.asDisplayString(seed['caseNo']),
         if (HearingCalendarFields.asDisplayString(seed['clientName']).isNotEmpty)
           'clientName': HearingCalendarFields.asDisplayString(seed['clientName']),
       };
+      final venue = HearingCalendarFields.resolveVenueForDisplay(out);
+      if (venue.isNotEmpty) out['location'] = venue;
+      return out;
     } catch (_) {
       return Map<String, dynamic>.from(seed);
     }
   }
 
   if (_seedLooksComplete(seed)) {
-    return HearingCalendarFields.prepareForNotificationDisplay(seed);
+    final prep = HearingCalendarFields.prepareForNotificationDisplay(seed);
+    final venue = HearingCalendarFields.resolveVenueForDisplay(prep);
+    if (venue.isNotEmpty) prep['location'] = venue;
+    return prep;
   }
   try {
     Map<String, dynamic> hd = <String, dynamic>{};
@@ -69,7 +95,7 @@ Future<Map<String, dynamic>> _loadEnrichedHearing(
     }
 
     final seedCaseNo = HearingCalendarFields.asDisplayString(seed['caseNo']);
-    if (seedCaseNo.isNotEmpty) {
+    if (seedCaseNo.isNotEmpty && !HearingCalendarFields.isPlaceholderCaseNo(seedCaseNo)) {
       hd['caseNo'] = seedCaseNo;
     }
     final seedClient = HearingCalendarFields.asDisplayString(seed['clientName']);
@@ -84,9 +110,15 @@ Future<Map<String, dynamic>> _loadEnrichedHearing(
       caseMaps: caseMaps,
       siblingRows: siblingRows,
     );
-    if (merged.isNotEmpty) return merged;
+    if (merged.isNotEmpty) {
+      final venue = HearingCalendarFields.resolveVenueForDisplay(merged);
+      if (venue.isNotEmpty) merged['location'] = venue;
+      return merged;
+    }
     final prepared =
         await HearingCalendarFields.prepareForNotificationDisplayAsync(hd);
+    final venue = HearingCalendarFields.resolveVenueForDisplay(prepared);
+    if (venue.isNotEmpty) prepared['location'] = venue;
     return prepared;
   } catch (_) {
     final fallback = await FirebaseFirestore.instance
@@ -94,13 +126,19 @@ Future<Map<String, dynamic>> _loadEnrichedHearing(
         .doc(hearingDocId)
         .get();
     if (fallback.exists && fallback.data() != null) {
-      return HearingCalendarFields.prepareForNotificationDisplayAsync(
+      final prep = await HearingCalendarFields.prepareForNotificationDisplayAsync(
         fallback.data()!,
       );
+      final venue = HearingCalendarFields.resolveVenueForDisplay(prep);
+      if (venue.isNotEmpty) prep['location'] = venue;
+      return prep;
     }
-    return HearingCalendarFields.mergeHearingSources(
+    final merged = HearingCalendarFields.mergeHearingSources(
       [if (seed.isNotEmpty) seed, ...siblingRows],
     );
+    final venue = HearingCalendarFields.resolveVenueForDisplay(merged);
+    if (venue.isNotEmpty) merged['location'] = venue;
+    return merged;
   }
 }
 
@@ -267,11 +305,21 @@ class _FieldsList extends StatelessWidget {
 
     final regular = <MapEntry<String, String>>[];
     String? fullText;
+    String? involvedParty;
+    String? partyRole;
 
     for (final row in fields) {
       if (row.key == 'Order / full text') {
         fullText = row.value;
       } else {
+        if (row.key == 'Involved Party' ||
+            row.key == 'Involved Parties' ||
+            row.key == 'Client' ||
+            row.key == 'Clients') {
+          involvedParty = row.value;
+        } else if (row.key == 'Your Role / Status') {
+          partyRole = row.value;
+        }
         regular.add(row);
       }
     }
@@ -279,8 +327,55 @@ class _FieldsList extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        if (involvedParty != null && involvedParty.isNotEmpty)
+          Container(
+            margin: const EdgeInsets.only(bottom: 14),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF0FDF4),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFFBBF7D0)),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Icon(
+                  Icons.verified_user_rounded,
+                  color: Color(0xFF16A34A),
+                  size: 20,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Official Court Notice • Involved Party',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF15803D),
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'You are named as an involved party (${partyRole != null && partyRole.isNotEmpty ? partyRole : "Named Party"}) in this court order. Please attend the scheduled hearing or coordinate with your legal counsel.',
+                        style: TextStyle(
+                          fontSize: 12.5,
+                          color: Colors.green.shade900,
+                          height: 1.35,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
         ...regular.map((row) => _DetailRow(label: row.key, value: row.value)),
-        if (fullText != null && fullText.isNotEmpty) ...[
+        if (fullText != null &&
+            fullText.isNotEmpty &&
+            !CourtOrderTextSources.isInboxWrapper(fullText)) ...[
           const SizedBox(height: 4),
           _OrderFullTextSection(text: fullText),
         ],
@@ -391,6 +486,31 @@ class _OrderTextView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (text.trim().isEmpty || CourtOrderTextSources.isInboxWrapper(text)) {
+      return Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.grey.shade50,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          children: [
+            Icon(Icons.info_outline, size: 18, color: Colors.blueGrey.shade600),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'Complete original court order document is archived under court branch records.',
+                style: TextStyle(
+                  fontSize: 12.5,
+                  color: Colors.grey.shade700,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
     final clipped = text.length > _maxChars
         ? '${text.substring(0, _maxChars)}…'
         : text;

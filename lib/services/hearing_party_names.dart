@@ -3,7 +3,7 @@ class HearingPartyNames {
   HearingPartyNames._();
 
   static final _partySeparators = RegExp(
-    r'\s*(?:,|;|/|\band\b|&)\s*',
+    r'\s*(?:,|;|/|\band\b|&|\bvs\.?(?=\s|$)|\bversus\b|\bv\.(?=\s))\s*',
     caseSensitive: false,
   );
   static final _spsCouple = RegExp(
@@ -50,20 +50,54 @@ class HearingPartyNames {
     final out = <String>[];
     void add(String p) {
       p = p.replaceAll(RegExp(r'\s+'), ' ').trim();
+      // Court contact emails belong in the header, not party captions.
+      p = p
+          .replaceAll(
+            RegExp(r'[\w.+-]+@,?\s*[\w.-]+\.\w{2,}', caseSensitive: false),
+            ' ',
+          )
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .trim();
       p = p.replaceAll(RegExp(r'^and\s+', caseSensitive: false), '').trim();
       p = p.replaceAll(RegExp(r'[.,;:]+$'), '').trim();
       if (p.length < 4) return;
       if (_partySkipTokens.contains(p.toLowerCase())) return;
+      if (RegExp(r'^[\w.+-]+@').hasMatch(p)) return;
       if (out.any((e) => e.toLowerCase() == p.toLowerCase())) return;
       out.add(p);
     }
 
     for (final p in s.split(_partySeparators)) {
       add(p);
+      final stripped = stripRoles(p);
+      if (stripped.isNotEmpty && stripped != p) add(stripped);
     }
     for (final p in extras) {
       add(p);
+      final stripped = stripRoles(p);
+      if (stripped.isNotEmpty && stripped != p) add(stripped);
     }
     return out;
+  }
+
+  static String stripRoles(String raw) {
+    var s = raw.trim();
+    s = s.replaceAll(
+      RegExp(
+        r'\b(?:accused|defendant|petitioner|respondent|complainant|plaintiff|appellant|appellee|witness|victim)\b',
+        caseSensitive: false,
+      ),
+      ' ',
+    );
+    s = s.replaceAll(
+      RegExp(
+        r'\b(?:mr\.?|ms\.?|mrs\.?|atty\.?|atty|attorney|judge|hon\.?)\b',
+        caseSensitive: false,
+      ),
+      ' ',
+    );
+    s = s.replaceAll(RegExp(r'[()[\]{}]'), ' ');
+    s = s.replaceAll(RegExp(r'[-–—]'), ' ');
+    return s.replaceAll(RegExp(r'\s+'), ' ').trim();
   }
 }

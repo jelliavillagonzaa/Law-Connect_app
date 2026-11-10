@@ -14,13 +14,9 @@ firebase.initializeApp({
 
 const messaging = firebase.messaging();
 
-messaging.onBackgroundMessage((payload) => {
-  const title = (payload.notification && payload.notification.title) || 'New message';
-  const body = (payload.notification && payload.notification.body) || '';
-  return self.registration.showNotification(title, {
-    body: body,
-    data: payload.data || {},
-  });
+messaging.onBackgroundMessage(() => {
+  // Push is shown on the phone app only, not as a browser popup.
+  return Promise.resolve();
 });
 
 self.addEventListener('notificationclick', (event) => {

@@ -4,6 +4,9 @@ n8n POSTs classified court mail to **`courtEmailIngest`**. The function writes `
 
 **IMAP mailbox polling and OCR are removed.** Do not look for `imap_inbox_…` documents.
 
+> **Google Calendar in n8n does not notify Law Connect.**  
+> Use HTTP → `courtEmailIngest` (see [docs/N8N_LAWCONNECT_SETUP.md](docs/N8N_LAWCONNECT_SETUP.md)).
+
 ## Deploy
 
 ```bash

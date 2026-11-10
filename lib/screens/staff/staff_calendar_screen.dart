@@ -3,13 +3,13 @@ import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
+import '../../services/client_directory_service.dart';
 import '../../services/staff_service.dart';
 import '../../services/staff_auth_service.dart';
 import '../../services/notification_service.dart';
 import '../../services/hearing_calendar_fields.dart';
 import '../../services/hearing_calendar_sync_service.dart';
 import '../../services/enhanced_appointment_service.dart';
-import '../../services/notary_service.dart';
 import '../../models/appointment_model.dart';
 import '../../models/case_model.dart';
 import '../../models/user_model.dart';
@@ -21,7 +21,6 @@ import '../../widgets/common/hearing_notification_detail_panel.dart';
 import '../../widgets/common/calendar_month_grid.dart';
 import '../../widgets/common/stable_merged_listenable_builder.dart';
 import '../attorney/appointment_calendar_view.dart';
-import '../attorney/attorney_notary_request_detail_screen.dart';
 
 class StaffCalendarScreen extends StatefulWidget {
   /// Pre-filled from dashboard so the grid shows instantly on first open.
@@ -57,7 +56,6 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
   final NotificationService _notificationService = NotificationService();
   final EnhancedAppointmentService _appointmentService =
       EnhancedAppointmentService();
-  final NotaryService _notaryService = NotaryService();
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   String? _assignedAttorneyId;
   late final ValueNotifier<DateTime> _viewDateNotifier = ValueNotifier(
@@ -98,8 +96,6 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
   StreamSubscription<List<Map<String, dynamic>>>? _liveHearingsSub;
   StreamSubscription<List<Map<String, dynamic>>>? _notificationsSubscription;
   StreamSubscription<List<AppointmentModel>>? _appointmentsSubscription;
-  StreamSubscription<List<Map<String, dynamic>>>? _notaryCalendarSub;
-  List<Map<String, dynamic>> _notaryCalendarRows = [];
 
   // Calendar color theme (match attorney calendar)
   static const Color calendarBlue = Color.fromARGB(255, 46, 109, 192);
@@ -136,50 +132,32 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     _hydrateCalendarEventsFromCache();
     _hydrateLiveHearingsFromCache();
     _paintGridFromCachedData();
+    final aid = _assignedAttorneyId?.trim() ?? '';
+    if (aid.isNotEmpty) {
+      // Warm overlay before AppointmentCalendarView mounts.
+      HearingCalendarSyncService.instance.attachForAttorney(aid);
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _bindAppointments();
       _loadCalendarEvents();
       _loadAttorneyCases();
       _scheduleBackgroundHearingSync();
-      Future<void>.delayed(
-        Duration(milliseconds: kIsWeb ? 80 : CalendarPerf.hearingStreamDeferMs),
-        () {
-          if (!mounted) return;
-          _subscribeLiveHearings();
-          _subscribeNotaryCalendar();
-        },
-      );
-      Future<void>.delayed(
-        Duration(milliseconds: kIsWeb ? 200 : 2000),
-        () {
-          if (mounted) unawaited(_loadAutomatedHearings());
-        },
-      );
+      // AppointmentCalendarView loads automated hearings; keep a warm cache here.
     });
   }
 
   void _scheduleBackgroundHearingSync() {
     final aid = _assignedAttorneyId?.trim() ?? '';
     if (aid.isEmpty) return;
-    Future<void>.delayed(
-      Duration(
-        milliseconds: kIsWeb ? 200 : CalendarPerf.attachSyncDeferMs,
-      ),
-      () {
-        if (!mounted) return;
-        HearingCalendarSyncService.instance.attachForAttorney(aid);
-      },
-    );
+    HearingCalendarSyncService.instance.attachForAttorney(aid);
   }
 
   List<Map<String, dynamic>> _gridCalendarEvents() {
-    final merged = CalendarLiveHearingMap.mergeIntoCalendarEvents(
+    return CalendarLiveHearingMap.mergeIntoCalendarEvents(
       _calendarEvents,
       _liveHearingRows,
     );
-    if (_notaryCalendarRows.isEmpty) return merged;
-    return [...merged, ..._notaryCalendarRows];
   }
 
   void _hydrateCalendarEventsFromCache() {
@@ -226,7 +204,7 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
   }
 
   String _eventsIndexFingerprint() =>
-      '${_appointmentsFingerprint(_appointments)}|${_calendarEventsFingerprint(_calendarEvents)}|${_calendarEventsFingerprint(_liveHearingRows)}|${_calendarEventsFingerprint(_notaryCalendarRows)}';
+      '${_appointmentsFingerprint(_appointments)}|${_calendarEventsFingerprint(_calendarEvents)}|${_calendarEventsFingerprint(_liveHearingRows)}';
 
   Future<void> _rebuildEventsIndexAsync() async {
     final fp = _eventsIndexFingerprint();
@@ -331,21 +309,9 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     return [for (final k in order) out[k]!];
   }
 
-  void _subscribeNotaryCalendar() {
-    final aid = _assignedAttorneyId?.trim() ?? '';
-    if (aid.isEmpty) return;
-    _notaryCalendarSub?.cancel();
-    _notaryCalendarSub = _notaryService.watchNotaryCalendarRows(aid).listen(
-      (rows) {
-        if (!mounted) return;
-        _notaryCalendarRows = rows;
-        _scheduleEventsIndexRebuild();
-        _hearingNavRevision.value++;
-      },
-      onError: (_) {},
-    );
-  }
-
+  // Kept for the staff month grid. The website shows AppointmentCalendarView,
+  // which loads these hearings itself.
+  // ignore: unused_element
   void _subscribeLiveHearings() {
     final aid = HearingCalendarSyncService.overlayKey(_assignedAttorneyId ?? '');
 
@@ -365,17 +331,26 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     );
   }
 
+  // ignore: unused_element
   Future<void> _loadAutomatedHearings() async {
     final aid = HearingCalendarSyncService.overlayKey(_assignedAttorneyId ?? '');
     if (!mounted) return;
     try {
-      var rows = await HearingCalendarSyncService.instance
-          .fetchAutomatedCalendarRows(aid);
+      final rows = await HearingCalendarSyncService.instance
+          .fetchAutomatedCalendarRows(
+            aid,
+            onRows: (partial) {
+              if (!mounted || partial.isEmpty) return;
+              _applyAutomatedHearingRows(partial);
+            },
+          );
+      if (!mounted) return;
+      if (rows.isNotEmpty) _applyAutomatedHearingRows(rows);
       final inbox = await HearingCalendarSyncService.instance
           .fetchRowsFromHearingNotifications(aid);
-      rows = CalendarLiveHearingMap.mergeHearingRows(rows, inbox);
-      if (!mounted || rows.isEmpty) return;
-      _applyAutomatedHearingRows(rows);
+      final merged = CalendarLiveHearingMap.mergeHearingRows(rows, inbox);
+      if (!mounted || merged.isEmpty) return;
+      _applyAutomatedHearingRows(merged);
     } catch (e) {
       debugPrint('[StaffCalendar] automated hearings failed: $e');
     }
@@ -388,8 +363,9 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
       rows,
     );
     final fp = CalendarPerf.eventsFingerprint(merged);
-    _jumpToInboxHearingMonth(rows);
+    _jumpToAutomatedHearingMonth(rows);
     if (fp == _lastLiveHearingsFingerprint && _liveHearingRows.isNotEmpty) {
+      _maybeRevealHearingMonth();
       return;
     }
     _liveHearingRows = merged;
@@ -400,21 +376,36 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     if (!_followNewHearingMonth(_liveHearingRows)) {
       _maybeRevealHearingMonth();
     }
-    unawaited(_rebuildEventsIndexAsync());
+    _scheduleEventsIndexRebuild(immediate: true);
   }
 
-  void _jumpToInboxHearingMonth(List<Map<String, dynamic>> rows) {
+  /// Any new / inbox hearing notif → jump to that hearing's month immediately.
+  void _jumpToAutomatedHearingMonth(List<Map<String, dynamic>> rows) {
     DateTime? when;
     for (final r in rows) {
-      if (r['fromInbox'] != true) continue;
+      final hid = HearingCalendarFields.asDisplayString(r['hearingDocId']);
+      final fromInbox = r['fromInbox'] == true;
+      final unseen = hid.isNotEmpty && !_seenHearingDocIds.contains(hid);
+      if (!fromInbox && !unseen && _didRevealHearingMonth) continue;
       final d = _dateTimeFromField(r['eventDate']);
       if (d == null) continue;
       if (when == null || d.isAfter(when)) when = d;
     }
+    if (when == null && !_didRevealHearingMonth) {
+      for (final r in rows) {
+        final d = _dateTimeFromField(r['eventDate']);
+        if (d == null) continue;
+        if (when == null || d.isAfter(when)) when = d;
+      }
+    }
     if (when == null) return;
     final view = _viewDateNotifier.value;
-    if (when.year == view.year && when.month == view.month) return;
+    if (when.year == view.year && when.month == view.month) {
+      _didRevealHearingMonth = true;
+      return;
+    }
     _viewDateNotifier.value = DateTime(when.year, when.month);
+    _didRevealHearingMonth = true;
   }
 
   void _seedSeenHearings(List<Map<String, dynamic>> rows) {
@@ -424,7 +415,7 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
   void _scheduleFollowArm() {
     if (_followNewHearings) return;
     _armFollowTimer?.cancel();
-    _armFollowTimer = Timer(const Duration(seconds: 2), () {
+    _armFollowTimer = Timer(const Duration(milliseconds: 400), () {
       if (!mounted) return;
       _followNewHearings = true;
     });
@@ -435,7 +426,8 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     if (!_followNewHearings) {
       _seedSeenHearings(rows);
       _scheduleFollowArm();
-      return false;
+      _maybeRevealHearingMonth();
+      return _didRevealHearingMonth;
     }
     final when = CalendarHearingNav.newestUnseenHearingDate(
       rows,
@@ -446,6 +438,7 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     final view = _viewDateNotifier.value;
     if (when.year == view.year && when.month == view.month) return true;
     _viewDateNotifier.value = DateTime(when.year, when.month);
+    _didRevealHearingMonth = true;
     return true;
   }
 
@@ -509,7 +502,6 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     _casesSubscription?.cancel();
     _eventsSubscription?.cancel();
     _liveHearingsSub?.cancel();
-    _notaryCalendarSub?.cancel();
     _notificationsSubscription?.cancel();
     if (_ownsAppointmentsStream) {
       _appointmentsSubscription?.cancel();
@@ -810,7 +802,6 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
   }
 
   bool _isHearingCalendarEvent(Map<String, dynamic> ev) {
-    if (NotaryService.isNotaryCalendarRow(ev)) return false;
     if ((ev['hearingDocId'] as String?)?.trim().isNotEmpty == true) {
       return true;
     }
@@ -891,9 +882,6 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
   }
 
   Color _eventChipColor(Map<String, dynamic> event) {
-    if (NotaryService.isNotaryCalendarRow(event)) {
-      return const Color(0xFF00897B);
-    }
     if (_isHearingCalendarEvent(event)) return hearingEventColor;
     if ((event['eventType'] as String?) == 'appointment') {
       switch (event['status'] as String? ?? 'scheduled') {
@@ -922,7 +910,6 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
   }
 
   Widget _buildCompactDayEvent(Map<String, dynamic> event) {
-    final when = _dateTimeFromField(event['eventDate']);
     final isHearing = _isHearingCalendarEvent(event);
     final label = isHearing
         ? _hearingDisplayTitle(event)
@@ -932,67 +919,60 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
       child: Container(
         width: double.infinity,
         height: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        alignment: Alignment.centerLeft,
         decoration: BoxDecoration(
           color: _eventChipColor(event),
           borderRadius: BorderRadius.circular(4),
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          mainAxisAlignment: MainAxisAlignment.center,
-          mainAxisSize: MainAxisSize.min,
+        child: Row(
           children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    when != null ? DateFormat('hh:mm a').format(when) : '',
-                    style: const TextStyle(
-                      fontSize: 7.5,
-                      height: 1,
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+            Expanded(
+              child: Text(
+                label,
+                style: const TextStyle(
+                  fontSize: 10,
+                  height: 1,
+                  color: Colors.white,
+                  fontWeight: FontWeight.w600,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (isAiSyncedCalendarEvent(event)) ...[
+              const SizedBox(width: 2),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 1),
+                decoration: BoxDecoration(
+                  color: calendarGold,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+                child: const Text(
+                  'AI',
+                  style: TextStyle(
+                    fontSize: 7,
+                    height: 1,
+                    color: Colors.black87,
+                    fontWeight: FontWeight.w800,
                   ),
                 ),
-                if (isAiSyncedCalendarEvent(event))
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 2,
-                      vertical: 1,
-                    ),
-                    decoration: BoxDecoration(
-                      color: calendarGold,
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                    child: const Text(
-                      'AI',
-                      style: TextStyle(
-                        fontSize: 5.5,
-                        height: 1,
-                        color: Colors.black87,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-            const SizedBox(height: 1),
-            Text(
-              label,
-              style: const TextStyle(
-                fontSize: 8,
-                height: 1.05,
-                color: Colors.white,
-                fontWeight: FontWeight.w500,
               ),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
+            ],
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _dayCellOverflowPill(int hidden, VoidCallback onTap) {
+    return SizedBox(
+      height: CalendarPerf.monthCellMoreRowHeight,
+      width: double.infinity,
+      child: CalendarOverflowPill(
+        hiddenCount: hidden,
+        onTap: onTap,
+        color: calendarBlue,
       ),
     );
   }
@@ -1000,7 +980,9 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
   Widget _buildDayCellEntryColumn(
     List<Map<String, dynamic>> events, {
     required double bodyHeight,
+    required DateTime day,
   }) {
+    void openDay() => _showEventsForDate(day, events);
     if (events.isEmpty) return const SizedBox.shrink();
     final layout = CalendarPerf.layoutDayCellEntries(
       bodyHeight: bodyHeight,
@@ -1008,43 +990,25 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     );
     if (layout.shown <= 0) {
       if (!layout.showMore) return const SizedBox.shrink();
-      return Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-        child: Text(
-          '+${events.length} more',
-          style: TextStyle(fontSize: 9, color: Colors.grey[600]),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
-      );
+      return _dayCellOverflowPill(events.length, openDay);
     }
+    final chipBody = layout.chipHeight - CalendarPerf.monthCellChipGap;
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         for (var i = 0; i < layout.shown; i++)
-          SizedBox(
-            height: layout.chipHeight,
-            child: ClipRect(
+          Padding(
+            padding: const EdgeInsets.only(
+              bottom: CalendarPerf.monthCellChipGap,
+            ),
+            child: SizedBox(
+              height: chipBody,
               child: _buildCompactDayEvent(events[i]),
             ),
           ),
         if (layout.showMore)
-          SizedBox(
-            height: CalendarPerf.monthCellMoreRowHeight,
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 4),
-                child: Text(
-                  '+${events.length - layout.shown} more',
-                  style: TextStyle(fontSize: 9, color: Colors.grey[600]),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            ),
-          ),
+          _dayCellOverflowPill(events.length - layout.shown, openDay),
       ],
     );
   }
@@ -1071,8 +1035,6 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
         return Colors.purple;
       case 'appointment':
         return calendarBlue;
-      case 'notary':
-        return const Color(0xFF00897B);
       default:
         return calendarBlue;
     }
@@ -1509,44 +1471,23 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
             ),
           ),
           Expanded(
-            child: monthCellBodyHeight != null
-                ? SizedBox(
-                    height: monthCellBodyHeight,
-                    width: double.infinity,
-                    child: ClipRect(
-                      child: Align(
-                        alignment: Alignment.topLeft,
-                        child: Padding(
-                          padding: const EdgeInsets.fromLTRB(2, 0, 2, 0),
-                          child: _buildDayCellEntryColumn(
-                            events,
-                            bodyHeight: monthCellBodyHeight,
-                          ),
-                        ),
-                      ),
-                    ),
-                  )
-                : LayoutBuilder(
-                    builder: (context, constraints) {
-                      final bodyHeight = constraints.maxHeight;
-                      return SizedBox(
-                        height: bodyHeight,
-                        width: double.infinity,
-                        child: ClipRect(
-                          child: Align(
-                            alignment: Alignment.topLeft,
-                            child: Padding(
-                              padding: const EdgeInsets.fromLTRB(2, 0, 2, 0),
-                              child: _buildDayCellEntryColumn(
-                                events,
-                                bodyHeight: bodyHeight,
-                              ),
-                            ),
-                          ),
-                        ),
-                      );
-                    },
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final available = constraints.maxHeight;
+                final raw = available.isFinite && available > 0
+                    ? available
+                    : (monthCellBodyHeight ?? 0);
+                final bodyHeight = (raw - 2).clamp(0.0, double.infinity);
+                return Padding(
+                  padding: const EdgeInsets.fromLTRB(2, 0, 2, 2),
+                  child: _buildDayCellEntryColumn(
+                    events,
+                    bodyHeight: bodyHeight,
+                    day: day,
                   ),
+                );
+              },
+            ),
           ),
         ],
       ),
@@ -1813,47 +1754,52 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     );
   }
 
-  Future<void> _showHearingEventDetails(Map<String, dynamic> ev) async {
-    var display = Map<String, dynamic>.from(ev);
-    final hearingDocId = (ev['hearingDocId'] as String?)?.trim() ?? '';
-    if (hearingDocId.isNotEmpty) {
-      try {
-        final snap = await _firestore
-            .collection('hearings')
-            .doc(hearingDocId)
-            .get();
-        if (snap.exists && snap.data() != null) {
-          final hd = snap.data()!;
-          final caseMaps = <Map<String, dynamic>>[];
-          final caseId = (hd['caseId'] as String?)?.trim() ?? '';
-          if (caseId.isNotEmpty) {
-            final caseSnap = await _firestore
-                .collection('cases')
-                .doc(caseId)
-                .get();
-            if (caseSnap.exists && caseSnap.data() != null) {
-              caseMaps.add({'id': caseSnap.id, ...caseSnap.data()!});
-            }
-          }
-          final cn = (hd['caseNo'] as String?)?.trim() ?? '';
-          final siblings = _hearingSiblingsForCase(cn);
-          display = await HearingCalendarFields.loadMergedHearingForDisplay(
-            hearingDocId: hearingDocId,
-            hearingData: hd,
-            caseMaps: caseMaps,
-            siblingRows: siblings,
-          );
-          display['hearingDocId'] = hearingDocId;
-          display['readOnly'] = true;
-          display['eventType'] = 'hearing';
-          display['source'] =
-              ev['source'] as String? ?? HearingCalendarSyncService.sourceTag;
-        }
-      } catch (_) {
-        /* keep calendar snapshot */
+  void _showHearingEventDetails(Map<String, dynamic> ev) {
+    final display = Map<String, dynamic>.from(ev);
+    var hearingDocId = (ev['hearingDocId'] as String?)?.trim() ?? '';
+    if (hearingDocId.isEmpty) {
+      final id = (ev['id'] as String?)?.trim() ?? '';
+      if (id.startsWith('live_hearing_')) {
+        hearingDocId = id.substring('live_hearing_'.length);
       }
     }
-    if (!mounted) return;
+    if (hearingDocId.isEmpty) {
+      final did = (ev['docId'] as String?)?.trim() ?? '';
+      if (did.isNotEmpty) {
+        hearingDocId = did;
+      }
+    }
+    if (hearingDocId.isNotEmpty) {
+      display['hearingDocId'] = hearingDocId;
+    }
+    final rawCaseNo = HearingCalendarFields.asDisplayString(display['caseNo']).isNotEmpty
+        ? HearingCalendarFields.asDisplayString(display['caseNo'])
+        : HearingCalendarFields.asDisplayString(display['caseNumber']);
+    final cleanNo = HearingCalendarFields.cleanCaseDocketNo(rawCaseNo);
+    if (cleanNo.isNotEmpty && !HearingCalendarFields.isPlaceholderCaseNo(cleanNo)) {
+      display['caseNo'] = cleanNo;
+    }
+    final rawTitle = HearingCalendarFields.asDisplayString(display['caseTitle']);
+    if (!HearingCalendarFields.hasCaseCaptionMarker(rawTitle)) {
+      final resolvedTitle = HearingCalendarFields.resolveCaseTitleForDisplay(display);
+      if (resolvedTitle.isNotEmpty && HearingCalendarFields.hasCaseCaptionMarker(resolvedTitle)) {
+        display['caseTitle'] = resolvedTitle;
+      }
+    }
+    final resolvedClient = HearingCalendarFields.resolveClientForDisplay(display);
+    if (resolvedClient.isNotEmpty) {
+      display['clientName'] = resolvedClient;
+    }
+    final venue = HearingCalendarFields.resolveVenueForDisplay(display);
+    if (venue.isNotEmpty) {
+      display['location'] = venue;
+    }
+    display['readOnly'] = true;
+    display['eventType'] = 'hearing';
+    display['source'] =
+        ev['source'] as String? ?? HearingCalendarSyncService.sourceTag;
+
+    // Display immediately with zero latency.
     _showHearingEventDetailsDialog(display);
   }
 
@@ -1997,20 +1943,6 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
   }
 
   void _showEventDetails(Map<String, dynamic> event) {
-    if (NotaryService.isNotaryCalendarRow(event)) {
-      final id = (event['notaryRequestId'] as String?)?.trim() ?? '';
-      if (id.isEmpty) return;
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => AttorneyNotaryRequestDetailScreen(
-            requestId: id,
-            actingAsStaff: true,
-          ),
-        ),
-      );
-      return;
-    }
     if (_isHearingCalendarEvent(event)) {
       _showHearingEventDetails(event);
       return;
@@ -2191,9 +2123,12 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
     String? eventType;
     String? selectedCaseId;
     String? selectedClientId; // Single client from dropdown
+    var otherClient = false;
+    final otherNameController = TextEditingController();
     bool notifyClient = false;
     bool notifyAttorney = false; // To notify the assigned attorney
 
+    try {
     await showDialog(
       context: context,
       barrierDismissible: false,
@@ -2271,6 +2206,7 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
                           if (value != 'hearing') {
                             selectedCaseId = null;
                             selectedClientId = null;
+                            otherClient = false;
                           }
                         });
                       },
@@ -2305,6 +2241,7 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
                                   (c) => c.id == value,
                                 );
                                 selectedClientId = selectedCase.clientId;
+                                otherClient = false;
                               } catch (e) {
                                 selectedClientId = null;
                               }
@@ -2400,10 +2337,9 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
                       },
                     ),
                     const SizedBox(height: 24),
-                    // Select Client (Optional) dropdown
-                    const Text(
-                      'Select Client (Optional)',
-                      style: TextStyle(
+                    Text(
+                      kIsWeb ? 'Select Client' : 'Select Client (Optional)',
+                      style: const TextStyle(
                         fontSize: 16,
                         fontWeight: FontWeight.w600,
                         color: Colors.black87,
@@ -2411,38 +2347,81 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
                     ),
                     const SizedBox(height: 8),
                     FutureBuilder<List<Map<String, dynamic>>>(
-                      future: _loadClientsWithDetails(_assignedAttorneyId),
+                      future: kIsWeb
+                          ? _loadAttorneyDirectoryClients(_assignedAttorneyId)
+                          : _loadClientsWithDetails(_assignedAttorneyId),
                       builder: (context, snapshot) {
-                        final clients = snapshot.data ?? [];
-                        return DropdownButtonFormField<String>(
-                          decoration: const InputDecoration(
-                            hintText: 'Select a client *',
-                            border: OutlineInputBorder(),
-                          ),
-                          value: selectedClientId,
-                          items: [
-                            const DropdownMenuItem(
-                              value: null,
-                              child: Text('No Client Selected'),
+                        final raw = snapshot.data ?? [];
+                        final clients = kIsWeb
+                            ? _oneClientEach(raw)
+                            : List<Map<String, dynamic>>.from(raw);
+                        if (selectedClientId != null &&
+                            !clients.any((c) => c['id'] == selectedClientId)) {
+                          for (final client in raw) {
+                            if (client['id'] == selectedClientId) {
+                              clients.insert(0, client);
+                              break;
+                            }
+                          }
+                        }
+                        final dropdownValue = otherClient
+                            ? '__other__'
+                            : selectedClientId;
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            DropdownButtonFormField<String>(
+                              decoration: const InputDecoration(
+                                hintText: 'Select a client',
+                                border: OutlineInputBorder(),
+                              ),
+                              value: dropdownValue,
+                              items: [
+                                const DropdownMenuItem(
+                                  value: null,
+                                  child: Text('No Client Selected'),
+                                ),
+                                ...clients.map(
+                                  (client) => DropdownMenuItem(
+                                    value: client['id'] as String,
+                                    child: Text(
+                                      client['name'] as String? ?? 'Client',
+                                    ),
+                                  ),
+                                ),
+                                if (kIsWeb)
+                                  const DropdownMenuItem(
+                                    value: '__other__',
+                                    child: Text('Other'),
+                                  ),
+                              ],
+                              onChanged: (value) {
+                                safeSetState(() {
+                                  if (value == '__other__') {
+                                    otherClient = true;
+                                    selectedClientId = null;
+                                    notifyClient = false;
+                                  } else {
+                                    otherClient = false;
+                                    selectedClientId = value;
+                                    if (value == null && notifyClient) {
+                                      notifyClient = false;
+                                    }
+                                  }
+                                });
+                              },
                             ),
-                            ...clients.map(
-                              (client) => DropdownMenuItem(
-                                value: client['id'] as String,
-                                child: Text(
-                                  client['name'] as String? ?? 'Client',
+                            if (kIsWeb && otherClient) ...[
+                              const SizedBox(height: 8),
+                              TextField(
+                                controller: otherNameController,
+                                decoration: const InputDecoration(
+                                  labelText: 'Name of client',
+                                  border: OutlineInputBorder(),
                                 ),
                               ),
-                            ),
+                            ],
                           ],
-                          onChanged: (value) {
-                            safeSetState(() {
-                              selectedClientId = value;
-                              // If client is cleared and Client checkbox is checked, uncheck it
-                              if (value == null && notifyClient) {
-                                notifyClient = false;
-                              }
-                            });
-                          },
                         );
                       },
                     ),
@@ -2567,13 +2546,19 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
               ),
               ElevatedButton(
                 onPressed: () async {
+                  final typedClient = otherNameController.text.trim();
                   if (titleController.text.isEmpty ||
                       selectedDate == null ||
                       selectedTime == null ||
-                      eventType == null) {
+                      eventType == null ||
+                      (kIsWeb && otherClient && typedClient.isEmpty)) {
                     ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('Please fill all required fields'),
+                      SnackBar(
+                        content: Text(
+                          kIsWeb && otherClient && typedClient.isEmpty
+                              ? 'Enter the client name'
+                              : 'Please fill all required fields',
+                        ),
                       ),
                     );
                     return;
@@ -2589,7 +2574,9 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
 
                   // If notifyClient is checked, use the selectedClientId from the dropdown
                   final clientIdsToRemind =
-                      notifyClient && selectedClientId != null
+                      notifyClient &&
+                          selectedClientId != null &&
+                          !otherClient
                       ? [selectedClientId!]
                       : <String>[];
 
@@ -2604,7 +2591,10 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
                         : descriptionController.text,
                     caseId: selectedCaseId,
                     assignedTo: _assignedAttorneyId,
-                    clientId: selectedClientId,
+                    clientId: otherClient ? null : selectedClientId,
+                    extraFields: kIsWeb && otherClient
+                        ? {'clientName': typedClient}
+                        : null,
                     remindAttorney:
                         notifyAttorney, // Based on checkbox selection
                     remindClient: notifyClient,
@@ -2663,10 +2653,78 @@ class _StaffCalendarScreenState extends State<StaffCalendarScreen> {
         },
       ),
     );
+    } finally {
+      otherNameController.dispose();
+    }
   }
 
   Future<void> _showAddEventDialog() async {
     await _showAddEventDialogForDate(DateTime.now());
+  }
+
+  /// Same client accounts the attorney schedule form lists, plus anyone
+  /// already on that attorney's cases. Website add-schedule only.
+  Future<List<Map<String, dynamic>>> _loadAttorneyDirectoryClients(
+    String? attorneyId,
+  ) async {
+    final signedUp = await ClientDirectoryService().loadSignedUpClients();
+    final fromCases = await _loadClientsWithDetails(attorneyId);
+    final byId = <String, Map<String, dynamic>>{};
+
+    void addClient(String id, String label) {
+      final cleanId = id.trim();
+      if (cleanId.isEmpty || byId.containsKey(cleanId)) return;
+      final cleanLabel = label.trim();
+      byId[cleanId] = {
+        'id': cleanId,
+        'name': cleanLabel.isEmpty ? 'Client' : cleanLabel,
+      };
+    }
+
+    for (final client in signedUp) {
+      final display = (client['displayName'] as String?)?.trim() ?? '';
+      final full = (client['fullName'] as String?)?.trim() ?? '';
+      final name = (client['name'] as String?)?.trim() ?? '';
+      final label = display.isNotEmpty
+          ? display
+          : (full.isNotEmpty ? full : name);
+      addClient(client['id'] as String? ?? '', label);
+    }
+    for (final client in fromCases) {
+      addClient(
+        client['id'] as String? ?? '',
+        client['name'] as String? ?? '',
+      );
+    }
+
+    final clients = byId.values.toList();
+    clients.sort(
+      (a, b) => (a['name'] as String)
+          .toLowerCase()
+          .compareTo((b['name'] as String).toLowerCase()),
+    );
+    return clients;
+  }
+
+  /// One row per client. Same id or same name is not listed twice.
+  List<Map<String, dynamic>> _oneClientEach(
+    List<Map<String, dynamic>> clients,
+  ) {
+    final seenIds = <String>{};
+    final seenNames = <String>{};
+    final unique = <Map<String, dynamic>>[];
+    for (final client in clients) {
+      final id = (client['id'] as String?)?.trim() ?? '';
+      final name = (client['name'] as String?)?.trim() ?? '';
+      if (id.isEmpty || !seenIds.add(id)) continue;
+      final nameKey = name.toLowerCase();
+      if (nameKey.isNotEmpty && !seenNames.add(nameKey)) continue;
+      unique.add({
+        'id': id,
+        'name': name.isEmpty ? 'Client' : name,
+      });
+    }
+    return unique;
   }
 
   Future<List<Map<String, dynamic>>> _loadClientsWithDetails(

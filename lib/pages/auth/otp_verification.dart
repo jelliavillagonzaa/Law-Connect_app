@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
@@ -35,35 +36,21 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
     _checkStaffAndRedirect();
   }
   
-  // Auto-redirect staff/admin/attorney to their dashboard - they don't need email verification
+  // Auto-redirect authenticated registered users directly to their portal dashboard
   Future<void> _checkStaffAndRedirect() async {
     final user = _authService.currentUser;
     if (user == null) return;
     
     try {
-      final role = await _firestoreService.getUserRole(user.uid);
+      final role = await _firestoreService.getUserRole(user.uid) ?? 'client';
+      // Auto-heal verified status in Firestore
+      unawaited(_firestoreService.updateUserVerification(user.uid, true));
       
-      // Staff, admin, and attorney should not be on verification page - redirect them immediately
-      if (role == 'staff') {
-        // Redirect immediately without delay
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) {
-            navigateToPortalDashboard('staff');
-          }
-        });
-      } else if (role == 'admin') {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) {
-            navigateToPortalDashboard('admin');
-          }
-        });
-      } else if (role == 'attorney') {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) {
-            navigateToPortalDashboard('attorney');
-          }
-        });
-      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          navigateToPortalDashboard(role);
+        }
+      });
     } catch (e) {
       // Error getting role - continue normally
     }
@@ -558,40 +545,43 @@ class _OtpVerificationPageState extends State<OtpVerificationPage> {
                         ),
                 ),
                 const SizedBox(height: 16),
-                // Skip to dashboard button for staff/admin/attorney
+                // Proceed to dashboard button for all authenticated users
                 FutureBuilder<String?>(
                   future: _getUserRole(),
                   builder: (context, snapshot) {
-                    final role = snapshot.data;
-                    if (role == 'staff' || role == 'admin' || role == 'attorney') {
-                      return Column(
-                        children: [
-                          TextButton(
-                            onPressed: () {
-                              if (role == 'staff') {
-                                navigateToPortalDashboard('staff');
-                              } else if (role == 'admin') {
-                                navigateToPortalDashboard('admin');
-                              } else if (role == 'attorney') {
-                                navigateToPortalDashboard('attorney');
+                    final role = snapshot.data ?? 'client';
+                    return Column(
+                      children: [
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton(
+                            onPressed: () async {
+                              final user = _authService.currentUser;
+                              if (user != null) {
+                                await _firestoreService.updateUserVerification(user.uid, true);
                               }
+                              navigateToPortalDashboard(role);
                             },
-                            style: TextButton.styleFrom(
-                              foregroundColor: AppTheme.royalBlue,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AppTheme.royalBlue,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(vertical: 14),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
                             ),
                             child: const Text(
-                              'Go to Dashboard',
+                              'Proceed to Dashboard',
                               style: TextStyle(
                                 fontWeight: FontWeight.bold,
                                 fontSize: 16,
                               ),
                             ),
                           ),
-                          const SizedBox(height: 8),
-                        ],
-                      );
-                    }
-                    return const SizedBox.shrink();
+                        ),
+                        const SizedBox(height: 8),
+                      ],
+                    );
                   },
                 ),
                 // Back to login

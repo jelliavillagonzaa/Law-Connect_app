@@ -25,8 +25,9 @@ class CaseStatusFilter {
     completed,
   ];
 
-  /// Attorney My Cases: active work only (no Completed).
+  /// Attorney My Cases filter values.
   static const List<String> attorneyMyCaseValues = [
+    all,
     active,
     draft,
     open,
@@ -35,6 +36,10 @@ class CaseStatusFilter {
 
   static String label(String filter) {
     switch (filter) {
+      case all:
+        return 'All';
+      case active:
+        return 'Active';
       case draft:
         return 'Draft';
       case open:
@@ -43,15 +48,14 @@ class CaseStatusFilter {
         return 'In progress';
       case completed:
         return 'Completed';
-      case active:
-      case all:
       default:
         return 'All';
     }
   }
 
   static String menuLabel(String filter) {
-    if (filter == all || filter == active) return 'All cases';
+    if (filter == all) return 'All cases';
+    if (filter == active) return 'Active cases';
     return label(filter);
   }
 

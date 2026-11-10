@@ -6,6 +6,7 @@ import 'package:get/get.dart';
 import '../../services/staff_auth_service.dart';
 import '../../services/chat_service.dart';
 import '../../models/message_model.dart';
+import '../../models/user_model.dart';
 import '../../theme/app_theme.dart';
 import '../../screens/client/chat_screen.dart';
 import '../../widgets/common/nav_unread_dot.dart';
@@ -76,27 +77,29 @@ class _StaffCommunicationScreenState extends State<StaffCommunicationScreen> {
       final List<ChatModel> mergedChats = allChatsMap.values.where((chat) {
         // Include client chats (from getClientChatsForStaff)
         if (chat.clientId != null && chat.clientId!.isNotEmpty) {
-          return true;
+          return chat.hasMessages;
         }
-        // Include attorney chat if it's with assigned attorney and no client
         if (_assignedAttorneyId != null &&
             chat.attorneyId == _assignedAttorneyId &&
             chat.staffId == _currentStaffId &&
             (chat.clientId == null || chat.clientId!.isEmpty)) {
-          return true;
+          return chat.hasMessages;
         }
         return false;
       }).toList();
 
       mergedChats.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
       if (!controller.isClosed) {
-        controller.add(mergedChats);
+        controller.add(ChatModel.oneThreadPerClient(mergedChats));
       }
     }
 
     // Listen to client chats
     clientSub = clientChatsStream.listen(
       (chats) {
+        allChatsMap.removeWhere(
+          (id, chat) => chat.clientId != null && chat.clientId!.isNotEmpty,
+        );
         for (var chat in chats) {
           allChatsMap[chat.id] = chat;
         }
@@ -435,16 +438,31 @@ class _StaffCommunicationScreenState extends State<StaffCommunicationScreen> {
       return StreamBuilder<DocumentSnapshot>(
         stream: _firestore.collection('users').doc(chat.clientId!).snapshots(),
         builder: (context, snapshot) {
-          String clientName = chat.clientId ?? 'Client';
-          String clientEmail = '';
+          if (!snapshot.hasData) {
+            return const SizedBox.shrink();
+          }
+          if (!snapshot.data!.exists) {
+            return const SizedBox.shrink();
+          }
 
-          if (snapshot.hasData && snapshot.data!.exists) {
-            final data = snapshot.data!.data() as Map<String, dynamic>?;
-            if (data != null) {
-              clientName =
-                  data['fullName'] ?? data['name'] ?? chat.clientId ?? 'Client';
-              clientEmail = data['email'] ?? '';
-            }
+          final data = snapshot.data!.data() as Map<String, dynamic>?;
+          if (data == null) return const SizedBox.shrink();
+
+          final role = (data['role'] as String?)?.toLowerCase() ?? '';
+          if (role != 'client') {
+            return const SizedBox.shrink();
+          }
+
+          var clientName = UserModel.resolveDisplayName(data);
+          if (ChatModel.isPlaceholderClientLabel(clientName) &&
+              chat.clientName != null &&
+              !ChatModel.isPlaceholderClientLabel(chat.clientName!)) {
+            clientName = chat.clientName!.trim();
+          }
+          final clientEmail = (data['email'] as String?) ?? '';
+          if (ChatModel.isPlaceholderClientLabel(clientName) &&
+              clientEmail.trim().isEmpty) {
+            return const SizedBox.shrink();
           }
 
           return _buildChatCardUI(
@@ -481,7 +499,8 @@ class _StaffCommunicationScreenState extends State<StaffCommunicationScreen> {
           if (snapshot.hasData && snapshot.data!.exists) {
             final data = snapshot.data!.data() as Map<String, dynamic>?;
             if (data != null) {
-              attorneyName = data['fullName'] ?? data['name'] ?? 'Attorney';
+              attorneyName = UserModel.resolveDisplayName(data);
+              if (attorneyName == 'User') attorneyName = 'Attorney';
               attorneyEmail = data['email'] ?? '';
             }
           }
@@ -528,7 +547,14 @@ class _StaffCommunicationScreenState extends State<StaffCommunicationScreen> {
     return StreamBuilder<bool>(
       stream: _chatService.watchChatHasUnread(chat.id, userId),
       builder: (context, unreadSnap) {
-        final hasUnread = unreadSnap.data == true;
+        final storedUnread = chat.unreadCountFor(
+          userId,
+          includeOfficeStaff: true,
+        );
+        final hasUnread = unreadSnap.data == true || storedUnread > 0;
+        final unreadLabel = storedUnread > 0
+            ? (storedUnread > 99 ? '99+' : '$storedUnread')
+            : null;
         return Card(
       margin: const EdgeInsets.only(bottom: 12),
       elevation: 2,
@@ -625,7 +651,29 @@ class _StaffCommunicationScreenState extends State<StaffCommunicationScreen> {
                 crossAxisAlignment: CrossAxisAlignment.end,
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  if (hasUnread) const ListUnreadDot(),
+                  if (unreadLabel != null)
+                    Container(
+                      constraints: const BoxConstraints(minWidth: 22),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFE53935),
+                        borderRadius: BorderRadius.circular(11),
+                      ),
+                      child: Text(
+                        unreadLabel,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    )
+                  else if (hasUnread)
+                    const ListUnreadDot(),
                   const SizedBox(height: 8),
                   Icon(Icons.arrow_forward_ios, size: 16, color: Colors.grey[400]),
                 ],

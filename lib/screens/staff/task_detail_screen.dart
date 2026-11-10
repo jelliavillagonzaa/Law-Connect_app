@@ -127,7 +127,9 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
             final data = clientDoc.data();
             clientName = data?['fullName'] ?? data?['name'] ?? data?['email'];
             clientEmail = data?['email'];
-            clientPhone = data?['phone'] ?? data?['phoneNumber'];
+            final phoneNumber = data?['phoneNumber']?.toString().trim() ?? '';
+            final phone = data?['phone']?.toString().trim() ?? '';
+            clientPhone = phoneNumber.isNotEmpty ? phoneNumber : phone;
           }
         }
       }

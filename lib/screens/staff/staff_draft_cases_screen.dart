@@ -165,70 +165,15 @@ class _StaffDraftCasesScreenState extends State<StaffDraftCasesScreen> {
                   itemBuilder: (context, index) {
                     final caseModel = draftCases[index];
                     return Card(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      elevation: 2,
+                      margin: const EdgeInsets.only(bottom: 8),
+                      elevation: 0,
+                      color: Colors.white,
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(12),
+                        side: const BorderSide(color: Color(0xFFE2E8F0), width: 1),
                       ),
-                      child: ListTile(
-                        contentPadding: const EdgeInsets.all(16),
-                        leading: Container(
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: AppTheme.royalBlue.withOpacity(0.1),
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                          child: const Icon(
-                            Icons.description_outlined,
-                            color: AppTheme.royalBlue,
-                            size: 24,
-                          ),
-                        ),
-                        title: Text(
-                          caseModel.caseTitle,
-                          style: const TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 16,
-                          ),
-                        ),
-                        subtitle: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const SizedBox(height: 4),
-                            Text(
-                              'Type: ${caseModel.caseType}',
-                              style: const TextStyle(fontSize: 14),
-                            ),
-                            const SizedBox(height: 4),
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 4,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.orange.withOpacity(0.1),
-                                borderRadius: BorderRadius.circular(4),
-                              ),
-                              child: Text(
-                                'DRAFT - Awaiting Attorney Review',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.orange[700],
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              'Created: ${DateFormat('MMM dd, yyyy').format(caseModel.createdAt)}',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: AppTheme.mutedText,
-                              ),
-                            ),
-                          ],
-                        ),
-                        trailing: const Icon(Icons.chevron_right),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(12),
                         onTap: () {
                           // Navigate to case detail or show draft details
                           Get.snackbar(
@@ -239,6 +184,111 @@ class _StaffDraftCasesScreenState extends State<StaffDraftCasesScreen> {
                             duration: const Duration(seconds: 2),
                           );
                         },
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.center,
+                            children: [
+                              Container(
+                                width: 38,
+                                height: 38,
+                                decoration: BoxDecoration(
+                                  color: AppTheme.royalBlue.withValues(alpha: 0.1),
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                alignment: Alignment.center,
+                                child: const Icon(
+                                  Icons.description_outlined,
+                                  color: AppTheme.royalBlue,
+                                  size: 19,
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      caseModel.caseTitle,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w700,
+                                        fontSize: 13.5,
+                                        color: AppTheme.darkText,
+                                        height: 1.25,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 5),
+                                    Wrap(
+                                      crossAxisAlignment: WrapCrossAlignment.center,
+                                      spacing: 6,
+                                      runSpacing: 4,
+                                      children: [
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 7,
+                                            vertical: 2,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: Colors.orange.withValues(alpha: 0.12),
+                                            borderRadius: BorderRadius.circular(6),
+                                          ),
+                                          child: Text(
+                                            'DRAFT',
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              color: Colors.orange[800],
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                        ),
+                                        Text(
+                                          '•',
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            color: Colors.grey.shade400,
+                                          ),
+                                        ),
+                                        Text(
+                                          caseModel.caseType,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                            fontSize: 12,
+                                            color: AppTheme.mutedText,
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                        ),
+                                        Text(
+                                          '•',
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            color: Colors.grey.shade400,
+                                          ),
+                                        ),
+                                        Text(
+                                          DateFormat('MMM dd, yyyy').format(caseModel.createdAt),
+                                          style: const TextStyle(
+                                            fontSize: 11.5,
+                                            color: AppTheme.mutedText,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              const Icon(
+                                Icons.chevron_right_rounded,
+                                color: Color(0xFF94A3B8),
+                                size: 20,
+                              ),
+                            ],
+                          ),
+                        ),
                       ),
                     );
                   },

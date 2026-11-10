@@ -183,8 +183,7 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
               .toList();
         }
       }
-      // Never leave _rows null — that is the infinite "Loading reminders…" spinner.
-      _rows = initial;
+      _rows = initial.isNotEmpty ? initial : null;
       _loadingMoreHearings = true;
       _loadWatchdog?.cancel();
       _loadWatchdog = Timer(const Duration(seconds: 8), () {
@@ -727,83 +726,90 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
 
     Future<void> loadHearings() async {
       try {
-        QuerySnapshot<Map<String, dynamic>> snap;
-        try {
-          snap = await fs
+        final queryFutures = <Future<QuerySnapshot<Map<String, dynamic>>>>[
+          fs
               .collection('hearings')
-              .orderBy('createdAt', descending: true)
+              .where('attorneyUid', isEqualTo: userId)
               .limit(80)
               .get()
-              .timeout(const Duration(seconds: 4));
-        } catch (_) {
-          try {
-            snap = await fs
+              .catchError((_) => fs.collection('hearings').limit(0).get()),
+          fs
+              .collection('hearings')
+              .where('attorneyId', isEqualTo: userId)
+              .limit(80)
+              .get()
+              .catchError((_) => fs.collection('hearings').limit(0).get()),
+        ];
+        if (widget.includeGlobalHearingsFallback) {
+          queryFutures.add(
+            fs
                 .collection('hearings')
-                .orderBy('updatedAt', descending: true)
+                .orderBy('createdAt', descending: true)
                 .limit(80)
                 .get()
-                .timeout(const Duration(seconds: 4));
-          } catch (_) {
-            snap = await fs
-                .collection('hearings')
-                .limit(80)
-                .get()
-                .timeout(const Duration(seconds: 4));
-          }
-        }
-        var kept = 0;
-        for (final doc in snap.docs) {
-          final hd = doc.data();
-          if (!HearingNotificationFanoutService.isDisplayableHearingRow(hd)) {
-            continue;
-          }
-          if (HearingCalendarFields.isNonCourtHearingSpam(
-            _slimAttorneyInboxData(hd),
-          )) {
-            continue;
-          }
-          if (keys.contains('hearing_${doc.id}')) continue;
-          var already = false;
-          for (final r in rows) {
-            if (HearingCalendarFields.asDisplayString(r.data['hearingDocId']) ==
-                doc.id) {
-              already = true;
-              break;
-            }
-          }
-          if (already) continue;
-          kept++;
-          final ts = _asDate(hd['createdAt'] ?? hd['updatedAt']);
-          final sort = ts;
-          final caseNo = HearingCalendarFields.asDisplayString(hd['caseNo']);
-          final client = HearingCalendarFields.asDisplayString(hd['clientName']);
-          final summary = HearingCalendarFields.asDisplayString(hd['summary']);
-          final storedTitle = HearingCalendarFields.asDisplayString(hd['title']);
-          final title = caseNo.isNotEmpty
-              ? 'Court hearing — $caseNo'
-              : (storedTitle.isNotEmpty
-                  ? storedTitle
-                  : 'Court hearing / order');
-          add(
-            _rowFromMap(
-              rowKey: 'hearing_${doc.id}',
-              data: _slimAttorneyInboxData({
-                'type': 'hearing_activity',
-                'title': title,
-                'summary': summary.isNotEmpty ? summary : client,
-                'message': summary.isNotEmpty ? summary : client,
-                'hearingDocId': doc.id,
-                if (caseNo.isNotEmpty) 'caseNo': caseNo,
-                if (client.isNotEmpty) 'clientName': client,
-                'createdAt': Timestamp.fromDate(sort),
-                'isRead': readHearingIds.contains(doc.id) ||
-                    readHearingIds.contains('hearing_${doc.id}'),
-              }),
-              sortTime: sort,
-            ),
+                .catchError((_) => fs
+                    .collection('hearings')
+                    .limit(80)
+                    .get()
+                    .catchError((_) => fs.collection('hearings').limit(0).get())),
           );
         }
-        debugPrint('attorney inbox hearings=${snap.docs.length} kept=$kept');
+        final snaps = await Future.wait(queryFutures).timeout(const Duration(seconds: 4));
+        var kept = 0;
+        for (final snap in snaps) {
+          for (final doc in snap.docs) {
+            final hd = doc.data();
+            if (!HearingNotificationFanoutService.isDisplayableHearingRow(hd)) {
+              continue;
+            }
+            if (HearingCalendarFields.isNonCourtHearingSpam(
+              _slimAttorneyInboxData(hd),
+            )) {
+              continue;
+            }
+            if (keys.contains('hearing_${doc.id}')) continue;
+            var already = false;
+            for (final r in rows) {
+              if (HearingCalendarFields.asDisplayString(r.data['hearingDocId']) ==
+                  doc.id) {
+                already = true;
+                break;
+              }
+            }
+            if (already) continue;
+            kept++;
+            final ts = _asDate(hd['createdAt'] ?? hd['updatedAt']);
+            final sort = ts;
+            final caseNo = HearingCalendarFields.asDisplayString(hd['caseNo']);
+            final client = HearingCalendarFields.asDisplayString(hd['clientName']);
+            final summary = HearingCalendarFields.asDisplayString(hd['summary']);
+            final storedTitle = HearingCalendarFields.asDisplayString(hd['title']);
+            final title = caseNo.isNotEmpty
+                ? 'Court hearing — $caseNo'
+                : (storedTitle.isNotEmpty
+                    ? storedTitle
+                    : 'Court hearing / order');
+            add(
+              _rowFromMap(
+                rowKey: 'hearing_${doc.id}',
+                data: _slimAttorneyInboxData({
+                  'type': 'hearing_activity',
+                  'title': title,
+                  'summary': summary.isNotEmpty ? summary : client,
+                  'message': summary.isNotEmpty ? summary : client,
+                  'hearingDocId': doc.id,
+                  if (caseNo.isNotEmpty) 'caseNo': caseNo,
+                  if (client.isNotEmpty) 'clientName': client,
+                  'createdAt': Timestamp.fromDate(sort),
+                  'isRead': readHearingIds.contains(doc.id) ||
+                      readHearingIds.contains('hearing_${doc.id}'),
+                }),
+                sortTime: sort,
+              ),
+            );
+          }
+        }
+        debugPrint('attorney inbox hearings kept=$kept');
       } catch (e) {
         debugPrint('attorney inbox hearings failed: $e');
       }
@@ -1041,6 +1047,7 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
           _rows ??= const [];
           _loadingMoreHearings = false;
         });
+        _attachLiveHearings(userId);
       }
     }
   }
@@ -1082,6 +1089,12 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   ) {
     final current = _rows ?? const <HearingInboxRow>[];
     final keys = current.map((r) => r.rowKey).toSet();
+    // Notification rows (`hearing_inapp_<hid>_<uid>`) already cover a hearing.
+    // Without this the live listener added a second row for every notice.
+    final coveredHearingIds = <String>{
+      for (final r in current)
+        HearingCalendarFields.asDisplayString(r.data['hearingDocId']),
+    }..remove('');
     final added = <HearingInboxRow>[];
     final readIds =
         HearingNotificationFanoutService.instance.peekReadHearingIds(userId);
@@ -1089,6 +1102,7 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
     for (final doc in snap.docs) {
       final rowKey = 'hearing_${doc.id}';
       if (keys.contains(rowKey)) continue;
+      if (coveredHearingIds.contains(doc.id)) continue;
       final hd = doc.data();
       if (!HearingNotificationFanoutService.isDisplayableHearingRow(hd)) {
         continue;
@@ -1196,13 +1210,6 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
     return row;
   }
 
-  int _unreadCount() {
-    if (_useLightweightInbox) {
-      return _lightItems.where((i) => !i.isRead).length;
-    }
-    return _safeRows.where((row) => !_isRowRead(row)).length;
-  }
-
   Future<void> _markRowAsRead(HearingInboxRow row) async {
     final userId = _auth.currentUser?.uid;
     if (userId == null || _isRowRead(row)) return;
@@ -1270,6 +1277,7 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
 
     await HearingNotificationFanoutService.instance.markAllInboxRowsRead(
       userId,
+      allNotificationTypes: true,
       includeGlobalHearingsFallback: widget.includeGlobalHearingsFallback,
       hearingsOnly: widget.hearingsOnly,
     );
@@ -1322,7 +1330,11 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
     }
 
     final summary = HearingCalendarFields.asDisplayString(data['summary']);
-    if (summary.isNotEmpty) return summary;
+    final remarks = HearingCalendarFields.asDisplayString(data['remarks']);
+    if (summary.isNotEmpty) {
+      return remarks.isNotEmpty ? '$summary • Remarks: $remarks' : summary;
+    }
+    if (remarks.isNotEmpty) return 'Remarks: $remarks';
 
     final typeLabel = HearingCalendarFields.asDisplayString(data['type']);
     return _getReminderTitle(typeLabel);
@@ -1435,7 +1447,7 @@ class AttorneyRemindersScreenState extends State<AttorneyRemindersScreen> {
   }
 
   Widget _buildBody() {
-    if (_rows == null) {
+    if (_rows == null || (_safeRows.isEmpty && _loadingMoreHearings)) {
       return const Center(
         child: Padding(
           padding: EdgeInsets.all(32),
@@ -1948,7 +1960,54 @@ class _ReminderCardTileState extends State<_ReminderCardTile> {
                                   return hid.isEmpty ? null : hid;
                                 }(),
                               )
-                            else
+                            else ...[
+                              if (HearingCalendarFields.asDisplayString(detailData['remarks']).isNotEmpty) ...[
+                                Container(
+                                  width: double.infinity,
+                                  margin: const EdgeInsets.only(bottom: 10),
+                                  padding: const EdgeInsets.all(10),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFFFFFBEB),
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(
+                                      color: const Color(0xFFFDE68A),
+                                    ),
+                                  ),
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      const Row(
+                                        children: [
+                                          Icon(
+                                            Icons.notes_rounded,
+                                            size: 15,
+                                            color: Color(0xFFB45309),
+                                          ),
+                                          SizedBox(width: 6),
+                                          Text(
+                                            'Remarks:',
+                                            style: TextStyle(
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.bold,
+                                              color: Color(0xFF92400E),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 4),
+                                      SelectableText(
+                                        HearingCalendarFields.asDisplayString(
+                                          detailData['remarks'],
+                                        ),
+                                        style: const TextStyle(
+                                          fontSize: 13,
+                                          color: Color(0xFF78350F),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
                               SelectableText(
                                 HearingCalendarFields.asDisplayString(
                                   detailData['message'],
@@ -1963,6 +2022,7 @@ class _ReminderCardTileState extends State<_ReminderCardTile> {
                                   color: Colors.grey[800],
                                 ),
                               ),
+                            ],
                           ],
                         ),
                       ),

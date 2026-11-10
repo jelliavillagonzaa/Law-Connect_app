@@ -213,24 +213,31 @@ class HearingCalendarFields {
       } catch (_) {}
     }
 
-    final caseNo = (hd['caseNo'] as String?)?.trim() ?? '';
+    final caseNo = fieldAsDisplayString(hd, 'caseNo');
     if (caseNo.isNotEmpty) {
+      final parsedInt = int.tryParse(caseNo);
+      final queryValues = <Object>[
+        caseNo,
+        if (parsedInt != null) parsedInt,
+      ];
       for (final field in [
         'caseNumber',
         'caseNo',
         'docketNumber',
         'criminalCaseNo',
       ]) {
-        try {
-          final q = await FirebaseFirestore.instance
-              .collection('cases')
-              .where(field, isEqualTo: caseNo)
-              .limit(5)
-              .get();
-          for (final doc in q.docs) {
-            addCase(doc.id, doc.data());
-          }
-        } catch (_) {}
+        for (final qVal in queryValues) {
+          try {
+            final q = await FirebaseFirestore.instance
+                .collection('cases')
+                .where(field, isEqualTo: qVal)
+                .limit(5)
+                .get();
+            for (final doc in q.docs) {
+              addCase(doc.id, doc.data());
+            }
+          } catch (_) {}
+        }
       }
     }
 
@@ -242,12 +249,12 @@ class HearingCalendarFields {
     Map<String, dynamic> hd,
     List<Map<String, dynamic>> pool,
   ) {
-    final caseNo = (hd['caseNo'] as String?)?.trim() ?? '';
+    final caseNo = fieldAsDisplayString(hd, 'caseNo');
     if (caseNo.isEmpty) return const [];
     final norm = _normalizeCaseNo(caseNo);
     final out = <Map<String, dynamic>>[];
     for (final row in pool) {
-      final rowNo = (row['caseNo'] as String?)?.trim() ?? '';
+      final rowNo = fieldAsDisplayString(row, 'caseNo');
       if (rowNo.isEmpty) continue;
       if (_normalizeCaseNo(rowNo) != norm) continue;
       out.add(row);
@@ -321,6 +328,92 @@ class HearingCalendarFields {
     ].join('\n'), 4000);
     if (blob.isEmpty) return '';
 
+    // 1. Philippine court caption style:
+    // [Plaintiff(s)]
+    // Plaintiff,
+    // -versus -
+    // [Civil Case No. ...]
+    // [For: ...]
+    // [Defendant(s)]
+    // Defendants.
+    final lines = blob
+        .split('\n')
+        .map((l) => l.trim())
+        .where((l) => l.isNotEmpty)
+        .toList();
+    final vsIdx = lines.indexWhere((l) =>
+        RegExp(r'^[-–—]?\s*(?:versus|vs\.?)\s*[-–—]?$', caseSensitive: false)
+            .hasMatch(l) ||
+        RegExp(r'[-–—]\s*versus\s*[-–—]', caseSensitive: false).hasMatch(l));
+    if (vsIdx != -1) {
+      final plaintiffLines = <String>[];
+      for (var i = vsIdx - 1; i >= 0; i--) {
+        final line = lines[i];
+        if (RegExp(
+          r'^(?:Republic|REGIONAL|MUNICIPAL|METROPOLITAN|10th|\d+(?:st|nd|rd|th)\s+Judicial|BRANCH|Email|Contact)',
+          caseSensitive: false,
+        ).hasMatch(line)) {
+          break;
+        }
+        if (RegExp(r'^Plaintiffs?,?$', caseSensitive: false).hasMatch(line)) {
+          continue;
+        }
+        plaintiffLines.insert(0, line);
+      }
+      final plaintiff = plaintiffLines.join(' ');
+      final mainPlaintiff = plaintiff
+          .split(RegExp(r',\s*Namely:', caseSensitive: false))
+          .first
+          .split(RegExp(r'Namely:', caseSensitive: false))
+          .first
+          .trim();
+
+      final defLines = <String>[];
+      for (var i = vsIdx + 1; i < lines.length; i++) {
+        final line = lines[i];
+        if (RegExp(r'^(?:Civil|Criminal|Special|Spec\.?)\s*Case',
+                caseSensitive: false)
+            .hasMatch(line)) {
+          continue;
+        }
+        if (RegExp(r'^\d{3,}', caseSensitive: false).hasMatch(line)) continue;
+        if (RegExp(r'^(?:For\s*:|Recovery of|Ownership|Possession|Damages|Injunction)',
+                caseSensitive: false)
+            .hasMatch(line)) {
+          continue;
+        }
+        if (RegExp(r'^[xX]\s*[-–—]+\s*[xX]$').hasMatch(line) ||
+            RegExp(r'^ORDER$', caseSensitive: false).hasMatch(line)) {
+          break;
+        }
+        if (RegExp(r'Defendants?,?\.?$', caseSensitive: false).hasMatch(line)) {
+          final cleaned = line
+              .replaceFirst(
+                RegExp(r',?\s*Defendants?,?\.?$', caseSensitive: false),
+                '',
+              )
+              .trim();
+          if (cleaned.isNotEmpty) defLines.add(cleaned);
+          break;
+        }
+        defLines.add(line);
+      }
+      var defendants = defLines
+          .join(' ')
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .replaceFirst(
+            RegExp(r',?\s*Defendants?,?\.?$', caseSensitive: false),
+            '',
+          )
+          .trim();
+      while (defendants.endsWith(',')) {
+        defendants = defendants.substring(0, defendants.length - 1).trim();
+      }
+      if (mainPlaintiff.length >= 3 && defendants.length >= 3) {
+        return '$mainPlaintiff vs. $defendants';
+      }
+    }
+
     for (final line in blob.split('\n')) {
       final trimmed = line.trim();
       if (trimmed.length < 12) continue;
@@ -365,7 +458,7 @@ class HearingCalendarFields {
         if ((c['id'] as String?) == caseId) return c;
       }
     }
-    final caseNo = (hd['caseNo'] as String?)?.trim() ?? '';
+    final caseNo = fieldAsDisplayString(hd, 'caseNo');
     if (caseNo.isNotEmpty) {
       for (final c in caseMaps) {
         if (HearingNotificationFanoutService.caseMapMatchesHearing(
@@ -450,10 +543,183 @@ class HearingCalendarFields {
     return best ?? '';
   }
 
+  /// True when [raw] is only a branch number/keyword without city, RTC, or courthouse name.
+  /// Example: 'BRANCH 12' or 'Branch 12' -> true. 'BRANCH 12 - OROQUIETA CITY' -> false.
+  static bool isBareLocation(String? raw) {
+    if (raw == null) return true;
+    final t = raw.trim();
+    if (t.isEmpty) return true;
+    if (RegExp(r'^(?:branch\s*\d*|\d+)[\s,.]*$', caseSensitive: false).hasMatch(t)) {
+      return true;
+    }
+    final hasSeparator = t.contains('-') ||
+        t.contains('–') ||
+        t.contains('—') ||
+        t.contains(',');
+    final hasDetails = RegExp(
+      r'\b(city|province|hall of justice|rtc|mtc|mtcc|municipal|regional|court|judicial)\b',
+      caseSensitive: false,
+    ).hasMatch(t);
+    return !hasSeparator && !hasDetails;
+  }
+
+  /// True when [raw] is a test/placeholder token (e.g. 'SAMPLE', 'TEST', 'N/A') rather
+  /// than an authentic court docket number.
+  static bool isPlaceholderCaseNo(String? raw) {
+    if (raw == null) return true;
+    final t = raw.trim();
+    if (t.isEmpty) return true;
+    final lower = t.toLowerCase();
+    const placeholders = {
+      'sample',
+      'test',
+      'court order',
+      'court hearing',
+      'hearing',
+      'order',
+      'n/a',
+      'na',
+      'none',
+      'unknown',
+      'pending',
+      'tbd',
+      'case no. sample',
+      'case no sample',
+      'civil case no. sample',
+      'civil case no sample',
+      'criminal case no. sample',
+      'criminal case no sample',
+      'spec. case no. sample',
+      'special case no. sample',
+    };
+    if (placeholders.contains(lower)) return true;
+    final stripped = lower
+        .replaceFirst(
+          RegExp(
+            r'^(?:civil|criminal|special|spec\.?)?\s*case\s*(?:no\.?|#)?\s*',
+            caseSensitive: false,
+          ),
+          '',
+        )
+        .trim();
+    if (stripped == 'sample' || stripped == 'test') return true;
+    return false;
+  }
+
+  /// Strips prefixes like "Civil Case No.", "Criminal Case No.", "Case No." to return clean docket number.
+  static String cleanCaseDocketNo(dynamic raw) {
+    if (raw == null) return '';
+    var s = asDisplayString(raw).trim();
+    if (s.isEmpty) return '';
+    if (isPlaceholderCaseNo(s)) return s;
+    final stripped = s.replaceFirst(
+      RegExp(
+        r'^(?:civil|criminal|special(?:\s+proceedings)?|spec\.?\s*proc\.?|spec\.?)?\s*case\s*(?:no\.?|#)?\s*[:\-]?\s*',
+        caseSensitive: false,
+      ),
+      '',
+    ).trim();
+    if (stripped.isNotEmpty) {
+      return stripped;
+    }
+    return s;
+  }
+
+  /// Cleans compound venue strings like "Branch 12 - OROQUIETA CITY" to just the city (e.g. "Oroquieta City").
+  static String cleanVenueCity(String venue) {
+    var v = venue.trim();
+    if (v.isEmpty) return '';
+    final m = RegExp(
+      r'^(?:branch\s*\d+\s*[-–—,]\s*)([A-Za-z\s.]+City|[A-Za-z\s.]+)',
+      caseSensitive: false,
+    ).firstMatch(v);
+    if (m != null) {
+      final city = m.group(1)!.trim();
+      if (city.toLowerCase().contains('city')) {
+        return _titleCase(city);
+      }
+    }
+    if (v.toUpperCase() == v && v.length > 3) {
+      return _titleCase(v);
+    }
+    return v;
+  }
+
+  static String _titleCase(String text) {
+    return text.split(' ').map((word) {
+      if (word.isEmpty) return '';
+      return word[0].toUpperCase() + word.substring(1).toLowerCase();
+    }).join(' ');
+  }
+
+  /// Resolves the authentic client name for display.
+  /// If the current client name points to the opposing plaintiff (e.g. "HEIRS OF ..."),
+  /// but answering defendants are represented, resolves to the defendants.
+  static String resolveClientForDisplay(Map<String, dynamic> hd) {
+    final client = fieldAsDisplayString(hd, 'clientName').trim();
+    final title = resolveCaseTitleForDisplay(hd);
+    final vsParts = title.split(RegExp(r'\s+vs\.?\s+', caseSensitive: false));
+    final vsLeft = vsParts.isNotEmpty ? vsParts[0].trim() : '';
+    final vsRight = vsParts.length > 1 ? vsParts[1].trim() : '';
+
+    if (vsRight.isNotEmpty &&
+        (client.isEmpty ||
+            client.toLowerCase().startsWith('heirs of') ||
+            (vsLeft.isNotEmpty && client.toLowerCase() == vsLeft.toLowerCase()))) {
+      return sanitizePartyDisplayName(vsRight);
+    }
+
+    if (client.isNotEmpty && !client.toLowerCase().startsWith('heirs of')) {
+      return sanitizePartyDisplayName(client);
+    }
+
+    final fromText = extractClientFromOrderText(_extractOrderBlob(hd), title);
+    if (fromText.isNotEmpty) return fromText;
+    if (vsRight.isNotEmpty) return sanitizePartyDisplayName(vsRight);
+    return client;
+  }
+
+  static String _extractOrderBlob(Map<String, dynamic> d) {
+    return _capExtractBlob([
+      d['fullText'],
+      d['orderText'],
+      d['message'],
+      d['summary'],
+      d['description'],
+      d['body'],
+    ].whereType<Object>().map((e) => '$e').join('\n').trim());
+  }
+
   /// Full venue: court/branch + city (longest complete text wins).
   static String resolveVenueForDisplay(Map<String, dynamic> d) {
-    final loc = (d['location'] as String?)?.trim() ?? '';
-    final court = (d['courtBranch'] as String?)?.trim() ?? '';
+    var loc = (d['location'] as String?)?.trim() ?? '';
+    var court = (d['courtBranch'] as String?)?.trim() ?? '';
+    if (loc.isEmpty) {
+      loc = (d['venue'] as String?)?.trim() ?? '';
+    }
+    if (court.isEmpty) {
+      court = (d['court'] as String?)?.trim() ??
+          (d['court_branch'] as String?)?.trim() ??
+          '';
+    }
+
+    if (isBareLocation(loc) && !isBareLocation(court)) loc = court;
+    if (isBareLocation(court) && !isBareLocation(loc)) court = loc;
+
+    if (isBareLocation(loc) || isBareLocation(court)) {
+      final blob = _extractOrderBlob(d);
+      if (blob.isNotEmpty) {
+        final extracted = extractLocationFromOrderText(
+          blob,
+          loc.isNotEmpty ? loc : court,
+        );
+        if (extracted.isNotEmpty && !isBareLocation(extracted)) {
+          if (isBareLocation(loc)) loc = extracted;
+          if (isBareLocation(court)) court = extracted;
+        }
+      }
+    }
+
     if (loc.isEmpty) return court;
     if (court.isEmpty) return loc;
     final ll = loc.toLowerCase();
@@ -495,11 +761,13 @@ class HearingCalendarFields {
     out.remove('caseTitle');
 
     if (linked != null) {
-      final cn = (linked['caseNo'] as String?)?.trim() ??
-          (linked['caseNumber'] as String?)?.trim();
-      if (cn != null &&
-          cn.isNotEmpty &&
-          fieldAsDisplayString(anchor, 'caseNo').isEmpty) {
+      final linkedNo = fieldAsDisplayString(linked, 'caseNo');
+      final cn = linkedNo.isNotEmpty
+          ? linkedNo
+          : fieldAsDisplayString(linked, 'caseNumber');
+      if (cn.isNotEmpty &&
+          (fieldAsDisplayString(anchor, 'caseNo').isEmpty ||
+              isPlaceholderCaseNo(fieldAsDisplayString(anchor, 'caseNo')))) {
         out['caseNo'] = cn;
       }
       final client = (linked['clientName'] as String?)?.trim() ??
@@ -512,7 +780,8 @@ class HearingCalendarFields {
       final branch = (linked['courtBranch'] as String?)?.trim();
       if (branch != null &&
           branch.isNotEmpty &&
-          fieldAsDisplayString(anchor, 'courtBranch').isEmpty) {
+          (fieldAsDisplayString(anchor, 'courtBranch').isEmpty ||
+              isBareLocation(fieldAsDisplayString(anchor, 'courtBranch')))) {
         out['courtBranch'] = branch;
       }
     }
@@ -524,7 +793,16 @@ class HearingCalendarFields {
       'hearingTime',
     ]) {
       final v = fieldAsDisplayString(anchor, key);
-      if (v.isNotEmpty) out[key] = v;
+      if (v.isNotEmpty) {
+        if (key == 'caseNo' &&
+            isPlaceholderCaseNo(v) &&
+            fieldAsDisplayString(out, 'caseNo').isNotEmpty &&
+            !isPlaceholderCaseNo(fieldAsDisplayString(out, 'caseNo'))) {
+          // Keep authentic case number from linked case or best candidate
+        } else {
+          out[key] = v;
+        }
+      }
     }
 
     applyResolvedCaseTitle(
@@ -542,14 +820,84 @@ class HearingCalendarFields {
   }
 
   /// Fills Case No, title, client, time, location, date, summary from OCR / order text.
+  /// Sanitize party / alert fields so SMS, push, and inbox match the PDF caption.
+  static Map<String, dynamic> enrichForAlerts(Map<String, dynamic> raw) {
+    final out = Map<String, dynamic>.from(raw);
+    fillStructuredFieldsFromOrderText(out);
+
+    // Prefer resolved schedule when AI left hearingDate empty.
+    if (fieldAsDisplayString(out, 'hearingDate').isEmpty) {
+      final when = resolveEventDate(out) ??
+          resolveEventDateFromHearingDateField(out);
+      if (when != null) {
+        out['hearingDate'] = DateFormat('MMMM d, yyyy').format(when);
+        if (fieldAsDisplayString(out, 'hearingTime').isEmpty) {
+          out['hearingTime'] = DateFormat('h:mm a').format(when);
+        }
+      }
+    }
+
+    final client = sanitizePartyDisplayName(fieldAsDisplayString(out, 'clientName'));
+    if (client.isNotEmpty) {
+      out['clientName'] = client;
+    } else {
+      out.remove('clientName');
+    }
+    final title = sanitizePartyDisplayName(fieldAsDisplayString(out, 'caseTitle'));
+    if (title.isNotEmpty) out['caseTitle'] = title;
+
+    if (fieldAsDisplayString(out, 'location').isEmpty) {
+      final branch = fieldAsDisplayString(out, 'courtBranch');
+      if (branch.isNotEmpty) out['location'] = branch;
+    }
+    return out;
+  }
+
+  /// Strip court emails / SAMPLE noise from a party or caption string.
+  static String sanitizePartyDisplayName(String raw) {
+    var s = raw.trim();
+    if (s.isEmpty) return '';
+    s = s.replaceAll(
+      RegExp(r'[\w.+-]+@,?\s*[\w.-]+\.\w{2,}', caseSensitive: false),
+      ' ',
+    );
+    s = s.replaceAll(
+      RegExp(
+        r'SAMPLE\s*[-–—]?\s*NOT AN OFFICIAL COURT DOCUMENT\.?',
+        caseSensitive: false,
+      ),
+      ' ',
+    );
+    s = s.replaceAll(
+      RegExp(r'Sample document layout only\.?', caseSensitive: false),
+      ' ',
+    );
+    s = s.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return s;
+  }
+
   static void fillStructuredFieldsFromOrderText(Map<String, dynamic> out) {
+    // Always scrub email-in-name even when other fields look complete.
+    final existingClient = fieldAsDisplayString(out, 'clientName');
+    if (existingClient.isNotEmpty) {
+      final clean = sanitizePartyDisplayName(existingClient);
+      if (clean != existingClient) {
+        if (clean.isEmpty) {
+          out.remove('clientName');
+        } else {
+          out['clientName'] = clean;
+        }
+      }
+    }
+
     final summaryNow = fieldAsDisplayString(out, 'summary');
     if (fieldAsDisplayString(out, 'caseNo').isNotEmpty &&
         fieldAsDisplayString(out, 'clientName').isNotEmpty &&
         fieldAsDisplayString(out, 'hearingDate').isNotEmpty &&
         summaryNow.isNotEmpty &&
         !summaryLooksCutOff(summaryNow) &&
-        fieldAsDisplayString(out, 'fullText').isNotEmpty) {
+        fieldAsDisplayString(out, 'fullText').isNotEmpty &&
+        !isBareLocation(fieldAsDisplayString(out, 'location'))) {
       return;
     }
 
@@ -572,8 +920,12 @@ class HearingCalendarFields {
       if (fieldAsDisplayString(out, key).isEmpty) out[key] = v;
     }
 
-    if (fieldAsDisplayString(out, 'caseNo').isEmpty) {
-      putIfEmpty('caseNo', extractCaseNoFromOrderText(blob));
+    final existingCaseNo = fieldAsDisplayString(out, 'caseNo');
+    if (existingCaseNo.isEmpty || isPlaceholderCaseNo(existingCaseNo)) {
+      final extracted = extractCaseNoFromOrderText(blob);
+      if (extracted.isNotEmpty && !isPlaceholderCaseNo(extracted)) {
+        out['caseNo'] = extracted;
+      }
     }
     if (fieldAsDisplayString(out, 'caseTitle').isEmpty) {
       putIfEmpty('caseTitle', extractCaseTitleFromOrderText(blob));
@@ -593,14 +945,18 @@ class HearingCalendarFields {
     if (fieldAsDisplayString(out, 'hearingTime').isEmpty) {
       putIfEmpty('hearingTime', extractHearingTimeFromOrderText(blob));
     }
-    if (fieldAsDisplayString(out, 'location').isEmpty) {
-      putIfEmpty(
-        'location',
-        extractLocationFromOrderText(
-          blob,
-          fieldAsDisplayString(out, 'courtBranch'),
-        ),
+    final currentLoc = fieldAsDisplayString(out, 'location');
+    if (currentLoc.isEmpty || isBareLocation(currentLoc)) {
+      final extracted = extractLocationFromOrderText(
+        blob,
+        fieldAsDisplayString(out, 'courtBranch'),
       );
+      if (extracted.isNotEmpty && !isBareLocation(extracted)) {
+        out['location'] = extracted;
+        out['courtBranch'] = extracted;
+      } else if (currentLoc.isEmpty) {
+        putIfEmpty('location', extracted);
+      }
     }
     putIfEmpty('courtBranch', fieldAsDisplayString(out, 'location'));
 
@@ -633,12 +989,17 @@ class HearingCalendarFields {
         r'case\s*(?:no\.?|number|#)\s*[:\s]*([A-Za-z0-9\-_/]+)',
         caseSensitive: false,
       ),
+      RegExp(
+        r'\b(\d{2,4}-\d{3,}(?:-[A-Za-z0-9]+)?)\b',
+        caseSensitive: false,
+      ),
     ];
     for (final re in patterns) {
       final m = re.firstMatch(text);
       if (m != null) {
         final raw = (m.group(1) ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
         if (raw.isNotEmpty) {
+          if (isPlaceholderCaseNo(raw)) continue;
           if (raw.toLowerCase().startsWith('spec') ||
               raw.toLowerCase().contains('case')) {
             return raw;
@@ -683,12 +1044,19 @@ class HearingCalendarFields {
       HearingPartyNames.split(raw);
 
   static String extractClientFromOrderText(String text, String caseTitle) {
-    final vsLeft = caseTitle.contains(' vs.')
-        ? caseTitle
-            .split(RegExp(r'\s+vs\.?\s+', caseSensitive: false))
-            .first
-            .trim()
-        : '';
+    final vsParts = caseTitle.split(RegExp(r'\s+vs\.?\s+', caseSensitive: false));
+    final vsLeft = vsParts.isNotEmpty ? vsParts[0].trim() : '';
+    final vsRight = vsParts.length > 1 ? vsParts[1].trim() : '';
+
+    final representsDefendants = RegExp(
+      r'(?:appeared\s+in\s+court\s+for|counsel\s+for)\s+(?:the\s+)?(?:answering\s+)?defendants',
+      caseSensitive: false,
+    ).hasMatch(text);
+
+    if ((representsDefendants || vsRight.isNotEmpty) && vsRight.length > 3) {
+      return sanitizePartyDisplayName(vsRight);
+    }
+
     final petitioner = RegExp(
       r'(?:petitioner|plaintiff|applicant)\s*[:\-]\s*([^\n]{3,400})',
       caseSensitive: false,
@@ -704,7 +1072,7 @@ class HearingCalendarFields {
     String pickRichest(List<String> candidates) {
       var best = '';
       for (final c in candidates) {
-        final t = c.trim();
+        final t = sanitizePartyDisplayName(c);
         if (t.isEmpty) continue;
         if (splitHearingPartyNames(t).length > splitHearingPartyNames(best).length) {
           best = t;
@@ -722,14 +1090,14 @@ class HearingCalendarFields {
     final reset = RegExp(
       '(?:reset|set|schedul\\w*|next hearing)\\b[^\\n.]{0,80}?\\bon\\s+'
       '(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\\.?\\s+'
-      r'(\d{1,2}),?\s+(\d{4})',
+      r'(\d{1,2})\s*,?\s+(\d{4})',
       caseSensitive: false,
     ).firstMatch(text);
     if (reset != null) {
       return _monthPhrase(reset.group(1)!, reset.group(2)!, reset.group(3)!);
     }
     final m = RegExp(
-      r'(?:on\s+)?(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})',
+      r'(?:on\s+)?(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\s*,?\s+(\d{4})',
       caseSensitive: false,
     ).firstMatch(text);
     if (m == null) return '';
@@ -750,19 +1118,62 @@ class HearingCalendarFields {
   }
 
   static String extractLocationFromOrderText(String text, String fallback) {
+    // 1. Check for full branch with city/suffix: e.g. "BRANCH 12 - OROQUIETA CITY" or "BRANCH 12, OROQUIETA CITY"
+    final branchFull = RegExp(
+      r'branch\s*(\d+)(?:\s*[-–—]\s*([^\r\n]+)|,\s*([^\r\n]+))',
+      caseSensitive: false,
+    ).firstMatch(text);
+    if (branchFull != null) {
+      final bNum = branchFull.group(1);
+      var city = (branchFull.group(2) ?? branchFull.group(3) ?? '').trim();
+      city = city.replaceAll(RegExp(r'[\r\n]+'), ' ').replaceAll(RegExp(r'[.,\s]+$'), '').trim();
+      if (city.isNotEmpty) {
+        return 'Branch $bNum - $city';
+      }
+    }
+
+    // 2. Check for city before branch, e.g. "QUEZON CITY, BRANCH 45" or "QUEZON CITY - BRANCH 45"
+    final cityBeforeBranch = RegExp(
+      r'([A-Za-z\s.]+City|[A-Za-z\s.]+Province)\s*[,–—-]\s*branch\s*(\d+)',
+      caseSensitive: false,
+    ).firstMatch(text);
+    if (cityBeforeBranch != null) {
+      final cityPre = cityBeforeBranch.group(1)!.trim();
+      final bNum = cityBeforeBranch.group(2)!.trim();
+      return 'Branch $bNum - $cityPre';
+    }
+
     final branch = RegExp(
-      r'branch\s*(\d+)(?:\s*[-–]\s*([A-Za-z .]+))?',
+      r'branch\s*(\d+)(?:\s*[-–—]\s*([A-Za-z .]+))?',
       caseSensitive: false,
     ).firstMatch(text);
     final rtc = RegExp(
-      r'(regional trial court[^\n,]{0,80})',
+      r'((?:regional|municipal|metropolitan)\s+trial\s+court[^\n,]{0,80})',
       caseSensitive: false,
     ).firstMatch(text);
     final region = RegExp(
       r'(\d+(?:st|nd|rd|th)\s+judicial region)',
       caseSensitive: false,
     ).firstMatch(text);
-    final city = branch?.group(2)?.trim() ?? '';
+    var city = branch?.group(2)?.trim() ?? '';
+    if (city.isEmpty) {
+      final nextLineCity = RegExp(
+        r'branch\s*\d+\s*[\r\n]+\s*([A-Za-z\s.]+City|[A-Za-z\s.]+Province|Hall of Justice[^\r\n]*)',
+        caseSensitive: false,
+      ).firstMatch(text);
+      if (nextLineCity != null) {
+        city = nextLineCity.group(1)!.replaceAll(RegExp(r'[.,\s]+$'), '').trim();
+      }
+    }
+    if (city.isEmpty) {
+      final cityInOrder = RegExp(
+        r'\b([A-Za-z\s.]+City|Hall of Justice[^\r\n,]*)\b',
+        caseSensitive: false,
+      ).firstMatch(text);
+      if (cityInOrder != null) {
+        city = cityInOrder.group(1)!.replaceAll(RegExp(r'[.,\s]+$'), '').trim();
+      }
+    }
     final parts = <String>[];
     if (branch != null) parts.add('Branch ${branch.group(1)}');
     if (rtc != null) {
@@ -784,9 +1195,111 @@ class HearingCalendarFields {
   }
 
   /// True when a stored summary was sliced mid-word (`…` / `...`).
+  static String extractProceedingFromOrderText(String text) {
+    if (text.isEmpty) return '';
+    final m = RegExp(
+      r'(?:for\s+|hearing\s+for\s+|stage\s+of\s+)?\b('
+      r'arraignment\s+and\s+pre-trial\s+conference|'
+      r'arraignment\s+and\s+pre-trial|'
+      r'pre-trial\s+conference|'
+      r'pre-trial|'
+      r'arraignment|'
+      r'promulgation\s+of\s+judgment|'
+      r'promulgation|'
+      r'initial\s+presentation\s+of\s+evidence|'
+      r'presentation\s+of\s+evidence|'
+      r'continuation\s+of\s+(?:the\s+)?proceedings|'
+      r'continuation\s+of\s+hearing|'
+      r'bail\s+hearing|'
+      r'clarificatory\s+hearing'
+      r')\b',
+      caseSensitive: false,
+    ).firstMatch(text);
+    if (m != null) {
+      final raw = m.group(1)!.trim();
+      return raw.split(' ').map((w) {
+        if (w.toLowerCase() == 'and' || w.toLowerCase() == 'of' || w.toLowerCase() == 'the') {
+          return w.toLowerCase();
+        }
+        return w.isEmpty ? w : '${w[0].toUpperCase()}${w.substring(1).toLowerCase()}';
+      }).join(' ');
+    }
+    return '';
+  }
+
+  static String cleanSummaryText(String raw) {
+    var s = raw.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (s.isEmpty) return '';
+    s = s.replaceAll(RegExp(r'\s+,'), ',');
+    s = s.replaceAll(RegExp(r'\s+\.'), '.');
+    // Remove trailing cutoffs like " a...", " a.", "...", dangling prepositions
+    s = s.replaceAll(RegExp(r'\s+(?:a|p)\.{0,3}$', caseSensitive: false), '');
+    s = s.replaceAll(RegExp(r'\s+(?:on|at|for|the|and|or|in)\s*\.{0,3}$', caseSensitive: false), '');
+    s = s.replaceAll(RegExp(r'[,;:\s–—]+$'), '').trim();
+    if (s.isNotEmpty && !s.endsWith('.') && !s.endsWith('!') && !s.endsWith('?')) {
+      s = '$s.';
+    }
+    if (s.isNotEmpty && s[0].toLowerCase() == s[0]) {
+      s = '${s[0].toUpperCase()}${s.substring(1)}';
+    }
+    return s;
+  }
+
+  /// Detects the legal role/capacity of an involved party (e.g. Accused, Defendant, Petitioner, Plaintiff).
+  static String detectPartyRole({
+    String? clientName,
+    String? caseTitle,
+    String? fullText,
+  }) {
+    final cn = (clientName ?? '').trim();
+    if (cn.isEmpty) return '';
+
+    final ct = (caseTitle ?? '').trim().toLowerCase();
+    final ft = (fullText ?? '').toLowerCase();
+    final cnLower = cn.toLowerCase();
+
+    if (ct.contains('people of the philippines') || ft.contains('people of the philippines')) {
+      if (ct.contains(cnLower) || ft.contains(cnLower) || ft.contains('accused')) {
+        return 'Accused / Defendant';
+      }
+    }
+    if (ft.contains('accused $cnLower') ||
+        ft.contains('$cnLower, accused') ||
+        ft.contains('$cnLower (accused)') ||
+        ft.contains('accused: $cnLower')) {
+      return 'Accused';
+    }
+    if (ft.contains('defendant $cnLower') ||
+        ft.contains('$cnLower, defendant') ||
+        ft.contains('defendant: $cnLower')) {
+      return 'Defendant';
+    }
+    if (ft.contains('petitioner $cnLower') ||
+        ft.contains('$cnLower, petitioner') ||
+        ft.contains('petitioner: $cnLower')) {
+      return 'Petitioner';
+    }
+    if (ft.contains('respondent $cnLower') ||
+        ft.contains('$cnLower, respondent') ||
+        ft.contains('respondent: $cnLower')) {
+      return 'Respondent';
+    }
+    if (ct.contains(' vs.') || ct.contains(' versus ')) {
+      final parts = ct.split(RegExp(r'\s+(?:vs\.?|versus)\s+'));
+      if (parts.length > 1) {
+        if (parts[1].contains(cnLower)) return 'Defendant / Respondent';
+        if (parts[0].contains(cnLower)) return 'Plaintiff / Petitioner';
+      }
+    }
+    return 'Named Involved Party';
+  }
+
+  /// True when a stored summary was sliced mid-word (`…` / `...` / `a...`).
   static bool summaryLooksCutOff(String summary) {
     final t = summary.trim();
-    return t.endsWith('…') || t.endsWith('...') || t.endsWith('..');
+    if (t.endsWith('…') || t.endsWith('...') || t.endsWith('..')) return true;
+    return RegExp(r'\s+(?:a|p)\.{0,3}$', caseSensitive: false).hasMatch(t) ||
+        RegExp(r'\s+(?:on|at|for|the|and|or|in)\s*$', caseSensitive: false).hasMatch(t);
   }
 
   static String extractSummaryFromOrderText(String text) {
@@ -800,27 +1313,33 @@ class HearingCalendarFields {
       if (stop != null && stop.start > 15) {
         chunk = chunk.substring(0, stop.start);
       }
-      chunk = chunk.replaceAll(RegExp(r'\s+'), ' ').trim();
+      chunk = cleanSummaryText(chunk);
       const max = 420;
       if (chunk.length > max) {
         final dot = chunk.lastIndexOf('.', max);
         if (dot >= 40) chunk = chunk.substring(0, dot + 1).trim();
       }
-      return chunk;
+      return cleanSummaryText(chunk);
     }
     final reset = RegExp(
-      r'(?:reset|set|scheduled)[\s\S]{10,280}?(?:morning|afternoon|a\.m\.|p\.m\.)',
+      r'(?:hearing\s+of\s+the\s+above-entitled\s+case|the\s+continuation\s+of\s+(?:the\s+)?proceedings|the\s+court\s+hereby\s+sets|reset|set|scheduled)[\s\S]{10,400}?(?:morning|afternoon|a\.?m\.?|p\.?m\.?|o[\x27\u2019]?clock)',
       caseSensitive: false,
     ).firstMatch(text);
     if (reset != null) {
-      return reset.group(0)!.replaceAll(RegExp(r'\s+'), ' ').trim();
+      var s = reset.group(0)!;
+      final rest = text.substring(reset.start);
+      final sentenceEnd = RegExp(r'^[\s\S]+?\.\s+').firstMatch(rest);
+      if (sentenceEnd != null && sentenceEnd.group(0)!.length <= 420) {
+        s = sentenceEnd.group(0)!;
+      }
+      return cleanSummaryText(s);
     }
     return '';
   }
 
   static String? _groupKeyForRow(Map<String, dynamic> r) {
-    final cn = (r['caseNo'] as String?)?.trim();
-    if (cn != null && cn.isNotEmpty) return 'no:$cn';
+    final cn = fieldAsDisplayString(r, 'caseNo');
+    if (cn.isNotEmpty) return 'no:$cn';
     final cid = (r['caseId'] as String?)?.trim();
     if (cid != null && cid.isNotEmpty) return 'id:$cid';
     return null;
@@ -866,7 +1385,7 @@ class HearingCalendarFields {
       hearingData,
       ...siblingRows,
     ];
-    final caseNo = (hearingData['caseNo'] as String?)?.trim() ?? '';
+    final caseNo = fieldAsDisplayString(hearingData, 'caseNo');
     if (caseNo.isNotEmpty) {
       try {
         final snap = await FirebaseFirestore.instance
@@ -883,14 +1402,30 @@ class HearingCalendarFields {
       }
     }
 
-    final merged = mergeHearingSources(sources, caseMaps: caseMaps);
+    var effectiveCaseMaps = caseMaps;
+    if (effectiveCaseMaps.isEmpty) {
+      try {
+        effectiveCaseMaps = await loadCaseMapsForHearing(hearingData);
+      } catch (_) {}
+    }
 
-    // Keep identity fields from the selected hearing record stable.
-    // Without this, same-case merges can occasionally pull a client name from
-    // another row and make card preview vs detail dialog inconsistent.
+    final merged = mergeHearingSources(sources, caseMaps: effectiveCaseMaps);
+
+    // Keep identity fields from the selected hearing record stable when authentic.
+    // When anchor is a placeholder like "SAMPLE", preserve richer case number from linked cases.
     final anchorCaseNo = fieldAsDisplayString(hearingData, 'caseNo');
-    if (anchorCaseNo.isNotEmpty) {
+    if (anchorCaseNo.isNotEmpty && !isPlaceholderCaseNo(anchorCaseNo)) {
       merged['caseNo'] = anchorCaseNo;
+    } else if (isPlaceholderCaseNo(fieldAsDisplayString(merged, 'caseNo'))) {
+      for (final cm in effectiveCaseMaps) {
+        final cn = fieldAsDisplayString(cm, 'caseNumber').isNotEmpty
+            ? fieldAsDisplayString(cm, 'caseNumber')
+            : fieldAsDisplayString(cm, 'caseNo');
+        if (cn.isNotEmpty && !isPlaceholderCaseNo(cn)) {
+          merged['caseNo'] = cn;
+          break;
+        }
+      }
     }
     final anchorClient = fieldAsDisplayString(hearingData, 'clientName');
     if (anchorClient.isNotEmpty) {
@@ -901,13 +1436,17 @@ class HearingCalendarFields {
     merged['eventType'] = 'hearing';
     applyResolvedCaseTitle(
       merged,
-      linkedCase: findLinkedCase(merged, caseMaps),
-      caseMaps: caseMaps,
+      linkedCase: findLinkedCase(merged, effectiveCaseMaps),
+      caseMaps: effectiveCaseMaps,
     );
     final when =
         resolveEventDate(merged) ?? resolveEventDate(hearingData);
     if (when != null) {
       merged['eventDate'] = when;
+    }
+    final venue = resolveVenueForDisplay(merged);
+    if (venue.isNotEmpty) {
+      merged['location'] = venue;
     }
     return merged;
   }
@@ -917,8 +1456,8 @@ class HearingCalendarFields {
     List<Map<String, dynamic>> caseMaps = const [],
   }) {
     final enriched = enrichHearingData(hd, caseMaps: caseMaps);
-    final clientName = (enriched['clientName'] as String?)?.trim() ?? '';
-    final caseNo = (enriched['caseNo'] as String?)?.trim() ?? '';
+    final clientName = fieldAsDisplayString(enriched, 'clientName');
+    final caseNo = fieldAsDisplayString(enriched, 'caseNo');
     final courtBranch = (enriched['courtBranch'] as String?)?.trim() ?? '';
     final caseTitle = (enriched['caseTitle'] as String?)?.trim();
     final caseId = (enriched['caseId'] as String?)?.trim();
@@ -1028,6 +1567,7 @@ class HearingCalendarFields {
           : (clientName.isNotEmpty
               ? clientName
               : (caseTitle.isNotEmpty ? caseTitle : 'Hearing'));
+      final venue = resolveVenueForDisplay(merged);
       return {
         'hearingDocId': hearingDocId,
         'eventType': 'hearing',
@@ -1038,6 +1578,7 @@ class HearingCalendarFields {
         'title': title,
         'hearingDate': fieldAsDisplayString(merged, 'hearingDate'),
         'hearingTime': fieldAsDisplayString(merged, 'hearingTime'),
+        if (venue.isNotEmpty) 'location': venue,
         ...HearingNotificationFormatter.pickCalendarHearingFields(merged),
       };
     } catch (_) {
@@ -1214,7 +1755,7 @@ class HearingCalendarFields {
     return DateTime(day.year, day.month, day.day, hour, minute);
   }
 
-  /// "{branch} · Hearing {Month D, YYYY}" line used under Order / notice.
+  /// "{branch} · Hearing {Month D, YYYY}". Calendar helpers only; the push uses the SMS text.
   static String pushHearingWhenLine(Map<String, dynamic> hd) {
     final branch = hearingFieldAsString(hd, 'courtBranch');
     final when = nextSetHearingDate(hd);
@@ -1229,7 +1770,7 @@ class HearingCalendarFields {
     ].join(' · ');
   }
 
-  /// Same locked body as the hearing push. Do not shorten this.
+  /// Same body as the hearing SMS and the phone push.
   static String pushHearingContext(Map<String, dynamic> hd) {
     return HearingNotificationFormatter.buildPopupBody(hd);
   }
@@ -1250,14 +1791,17 @@ class HearingCalendarFields {
 
   /// Calendar cell date: prefer AI `hearingDate` / `hearingTime` (e.g. April 22 → day 22),
   /// not upload `createdAt` or stale `hearingDateTime`.
+  ///
+  /// The structured AI fields are checked first so a new automated hearing
+  /// can land on the grid without scanning the full court-order text.
   static DateTime? resolveEventDate(Map<String, dynamic> hd) {
     try {
-      final reset = nextSetHearingDate(hd);
-      if (reset != null) return reset;
-
       final normalized = normalizeHearingDoc(hd);
       final fromFields = _scheduleFromHearingFields(normalized);
       if (fromFields != null) return fromFields;
+
+      final reset = nextSetHearingDate(hd);
+      if (reset != null) return reset;
 
       // Stored hearing timestamp wins over the first date in the OCR blob
       // (signing lines like "this 8th day of September" used to move rows).
@@ -1270,11 +1814,8 @@ class HearingCalendarFields {
       final fromOrderText = _dateFromHearingOrderText(normalized);
       if (fromOrderText != null) return fromOrderText;
 
-      final hearingDateStr = hearingFieldAsString(normalized, 'hearingDate');
-      if (hearingDateStr.isNotEmpty) return null;
-
       final fullText = (hd['fullText'] as String?)?.trim() ?? '';
-      if (fullText.isNotEmpty && _isCourtOrderText(fullText)) {
+      if (fullText.isNotEmpty) {
         final parsed =
             CourtNoticeRuleExtractor().extract(fullText).hearingDateTime;
         if (parsed != null) return parsed;
@@ -1285,6 +1826,15 @@ class HearingCalendarFields {
         final parsed =
             CourtNoticeRuleExtractor().extract(message).hearingDateTime;
         if (parsed != null) return parsed;
+      }
+
+      // Do not abort when hearingDate string failed earlier — keep trying
+      // caseTitle / summary blobs (SAMPLE orders often put the date there).
+      for (final key in const ['caseTitle', 'title', 'summary', 'clientName']) {
+        final blob = hearingFieldAsString(normalized, key);
+        if (blob.isEmpty) continue;
+        final fromBlob = _dateFromHearingOrderText({'hearingDate': blob});
+        if (fromBlob != null) return fromBlob;
       }
 
       return null;
@@ -1359,7 +1909,8 @@ class HearingCalendarFields {
     final iso = DateTime.tryParse(normalized);
     if (iso != null) return iso;
     final mdy = RegExp(
-      r'(?i)(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),?\s+(\d{4})',
+      r'(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})\s*,?\s+(\d{4})',
+      caseSensitive: false,
     ).firstMatch(normalized);
     if (mdy != null) {
       final monthName = mdy.group(1)!;
@@ -1410,10 +1961,12 @@ class HearingCalendarFields {
       (hd['summary'] as String?)?.trim() ?? '',
     ];
     final re = RegExp(
-      r'(?i)(?:on\s+)?(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),?\s+(\d{4})',
+      r'(?:on\s+)?(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})\s*,?\s+(\d{4})',
+      caseSensitive: false,
     );
     final yearless = RegExp(
-      r'(?i)(?:on\s+)?(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})\b(?!\s*,?\s*\d{4})',
+      r'(?:on\s+)?(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})\b(?!\s*,?\s*\d{4})',
+      caseSensitive: false,
     );
     final hint = _yearHint(hd);
     for (final blob in blobs) {
@@ -1495,6 +2048,54 @@ class HearingCalendarFields {
     return false;
   }
 
+  /// Head and tail only. Reminders loads dozens of hearings on the UI thread;
+  /// joining an entire court-order `fullText` for each one freezes Android
+  /// ("Law Connect isn't responding"). Promo and closing lines stay visible.
+  static String _forSpamScan(dynamic value) {
+    if (value == null) return '';
+    final raw = value is String ? value : value.toString();
+    if (raw.isEmpty) return '';
+    const head = 1800;
+    const tail = 500;
+    final clipped = raw.length <= head + tail
+        ? raw
+        : '${raw.substring(0, head)} ${raw.substring(raw.length - tail)}';
+    return clipped.toLowerCase();
+  }
+
+  static String _spamBlob(Map<String, dynamic> d, List<String> keys) {
+    final parts = <String>[];
+    for (final key in keys) {
+      final piece = _forSpamScan(d[key]);
+      if (piece.isNotEmpty) parts.add(piece);
+    }
+    return parts.join(' ');
+  }
+
+  /// First non-empty field, clipped before [String.trim] so a court order
+  /// is not copied in full on the UI thread.
+  static String _firstClippedField(Map<String, dynamic> d, List<String> keys) {
+    for (final key in keys) {
+      final value = d[key];
+      if (!hasNonEmptyText(value)) continue;
+      return _forSpamScan(value).trim();
+    }
+    return '';
+  }
+
+  /// True when [value] has a non-whitespace character, without copying a long order.
+  static bool hasNonEmptyText(dynamic value) {
+    if (value == null) return false;
+    if (value is String) {
+      for (var i = 0; i < value.length; i++) {
+        final c = value.codeUnitAt(i);
+        if (c != 32 && c != 9 && c != 10 && c != 13) return true;
+      }
+      return false;
+    }
+    return value.toString().trim().isNotEmpty;
+  }
+
   /// Promotional / test / misclassified rows (not a court order).
   static bool isNonCourtHearingSpam(Map<String, dynamic> d) {
     if (isEatingHearingJunk(d)) return true;
@@ -1504,18 +2105,18 @@ class HearingCalendarFields {
     final fromN8n = source == 'n8n' ||
         activity == 'court_import' ||
         source.contains('n8n');
-    final blob = [
-      d['title'],
-      d['caseTitle'],
-      d['summary'],
-      d['fullText'],
-      d['message'],
-      d['subject'],
-      d['description'],
-      d['activityType'],
-      d['body'],
-      d['notes'],
-    ].whereType<Object>().map((e) => '$e'.toLowerCase()).join(' ');
+    final blob = _spamBlob(d, const [
+      'title',
+      'caseTitle',
+      'summary',
+      'fullText',
+      'message',
+      'subject',
+      'description',
+      'activityType',
+      'body',
+      'notes',
+    ]);
     final compact = blob.replaceAll(RegExp(r'[^a-z0-9]+'), ' ');
     if (blob.contains('blasttv') ||
         blob.contains('voucher code') ||
@@ -1547,49 +2148,39 @@ class HearingCalendarFields {
         caseNoKey == 'order' ||
         caseNoKey == 'n/a' ||
         caseNoKey == 'none';
-    final importedText = asDisplayString(d['fullText']).isNotEmpty
-        ? asDisplayString(d['fullText'])
-        : asDisplayString(d['message']);
+    final importedText = hasNonEmptyText(d['fullText'])
+        ? _forSpamScan(d['fullText'])
+        : _forSpamScan(d['message']);
     final importedCourtRow =
         !placeholderCaseNo && caseNo.isNotEmpty && importedText.isNotEmpty;
     // Real n8n / court-order import — show unless promo junk above.
-    if (fromN8n && !placeholderCaseNo) return false;
-    if (importedCourtRow) return false;
-    if (placeholderCaseNo) return true;
+    if (fromN8n) return false;
+    if (importedCourtRow || importedText.isNotEmpty) return false;
     if (_isCourtOrderText(blob) ||
         blob.contains('regional trial court') ||
         blob.contains('wherefore') ||
         blob.contains('so ordered') ||
         blob.contains('people of the philippines') ||
-        blob.contains('in open court')) {
+        blob.contains('in open court') ||
+        blob.contains('sample')) {
       return false;
     }
+    if (placeholderCaseNo) return true;
     if (compact.contains('eating') &&
         !compact.contains('court') &&
         !compact.contains('branch') &&
         !compact.contains('versus')) {
       return true;
     }
-    final fullText = asDisplayString(d['fullText']);
+    final fullText = _forSpamScan(d['fullText']);
     if (fullText.length > 160 && _isCourtOrderText(fullText)) {
       return false;
     }
-    final title = [
-      d['title'],
-      d['caseTitle'],
-    ].whereType<Object>().map((e) => '$e'.trim()).firstWhere(
-          (s) => s.isNotEmpty,
-          orElse: () => '',
-        );
-    final body = [
-      d['description'],
-      d['message'],
-      d['summary'],
-      d['body'],
-    ].whereType<Object>().map((e) => '$e'.trim()).firstWhere(
-          (s) => s.isNotEmpty,
-          orElse: () => '',
-        );
+    final title = _firstClippedField(d, const ['title', 'caseTitle']);
+    final body = _firstClippedField(
+      d,
+      const ['description', 'message', 'summary', 'body'],
+    );
     if (title.isNotEmpty && isGibberishNoticeText(title)) return true;
     if (body.isNotEmpty && isGibberishNoticeText(body)) return true;
     return false;
@@ -1597,20 +2188,20 @@ class HearingCalendarFields {
 
   /// Test mash like "[AI] Hearing (eating)" — never a real court order.
   static bool isEatingHearingJunk(Map<String, dynamic> d) {
-    final blob = [
-      d['title'],
-      d['caseTitle'],
-      d['action'],
-      d['details'],
-      d['summary'],
-      d['fullText'],
-      d['message'],
-      d['subject'],
-      d['description'],
-      d['activityType'],
-      d['body'],
-      d['notes'],
-    ].whereType<Object>().map((e) => '$e'.toLowerCase()).join(' ');
+    final blob = _spamBlob(d, const [
+      'title',
+      'caseTitle',
+      'action',
+      'details',
+      'summary',
+      'fullText',
+      'message',
+      'subject',
+      'description',
+      'activityType',
+      'body',
+      'notes',
+    ]);
     final compact = blob.replaceAll(RegExp(r'[^a-z0-9]+'), ' ');
     if (blob.contains('[ai hearing (eating)]') ||
         blob.contains('hearing (eating)') ||
@@ -1653,7 +2244,7 @@ class HearingCalendarFields {
     String message,
     String? activityType,
   ) {
-    final blob = '${fullText}\n$message'.toLowerCase();
+    final blob = '$fullText\n$message'.toLowerCase();
     for (final phrase in [
       'arraignment and pre-trial',
       'pre-trial conference',
@@ -1760,7 +2351,7 @@ class HearingCalendarFields {
     add(caseTitle);
     add(courtBranch);
     add(senderName);
-    add((hd['caseNo'] as String?)?.trim());
+    add(fieldAsDisplayString(hd, 'caseNo'));
 
     return parts;
   }

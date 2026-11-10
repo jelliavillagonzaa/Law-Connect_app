@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import '../app/app_startup_state.dart';
 import '../models/user_model.dart';
 import 'user_setup_service.dart';
+import '../config/email_branding.dart';
 import 'email_otp_service.dart';
 import 'fcm_service.dart';
 import 'admin_service.dart';
@@ -14,6 +15,7 @@ import 'staff_application_service.dart';
 import 'firestore_mirror_helper.dart';
 import 'calendar_session_cleanup.dart';
 import 'system_settings_service.dart';
+import '../widgets/common/login_error_dialog.dart';
 
 class AuthService {
   FirebaseAuth get _auth => FirebaseAuth.instance;
@@ -989,8 +991,9 @@ class AuthService {
               lastName,
             ].where((s) => s.isNotEmpty).join(' ')
           : (pendingData['fullName'] as String? ?? '').trim();
-      final phoneNumber = pendingData['phoneNumber'] as String;
-      final address = pendingData['address'] as String;
+      final phoneNumber =
+          (pendingData['phoneNumber'] as String? ?? '').trim();
+      final address = (pendingData['address'] as String? ?? '').trim();
 
       final pendingUserId = pendingData['userId'] as String?;
       User? user = _auth.currentUser;
@@ -1122,21 +1125,13 @@ class AuthService {
         }
       }
 
-      // Welcome SMS (best-effort; do not block verification completion)
-      try {
-        final sms = SmsService();
-        await sms.queueSms(
-          to: phoneNumber,
-          body:
-              'WELCOME ${displayName.toUpperCase()}!\n\nWELCOME TO LAW CONNECT.\nHappy to have you!!',
-          userId: userId,
-          meta: {'type': 'welcome', 'role': 'client'},
-        );
-      } catch (e) {
-        if (kDebugMode) {
-          debugPrint('⚠️ Welcome SMS not queued (non-critical): $e');
-        }
-      }
+      await _sendRegistrationWelcome(
+        name: displayName,
+        email: email,
+        phone: phoneNumber,
+        userId: userId,
+        role: 'client',
+      );
 
       return {
         'success': true,
@@ -1345,10 +1340,39 @@ class AuthService {
           }
 
           try {
+            String clientName = email.split('@')[0];
+            String? firstName;
+            String? middleName;
+            String? lastName;
+            String? phone;
+            String? address;
+            try {
+              final psDoc = await _firestore.collection('pending_signups').doc(email).get();
+              if (psDoc.exists && psDoc.data() != null) {
+                final ps = psDoc.data()!;
+                firstName = ps['firstName']?.toString().trim();
+                middleName = ps['middleName']?.toString().trim();
+                lastName = ps['lastName']?.toString().trim();
+                phone = ps['phoneNumber']?.toString().trim();
+                address = ps['address']?.toString().trim();
+                final composed = [firstName ?? '', middleName ?? '', lastName ?? '']
+                    .where((s) => s.isNotEmpty)
+                    .join(' ')
+                    .trim();
+                if (composed.isNotEmpty) clientName = composed;
+              }
+            } catch (_) {}
+
             // Use retry logic for creating user document
             final loginUserData = <String, dynamic>{
               'email': email,
-              'name': email.split('@')[0],
+              'name': clientName,
+              'fullName': clientName,
+              if (firstName != null && firstName.isNotEmpty) 'firstName': firstName,
+              if (middleName != null && middleName.isNotEmpty) 'middleName': middleName,
+              if (lastName != null && lastName.isNotEmpty) 'lastName': lastName,
+              if (phone != null && phone.isNotEmpty) 'phoneNumber': phone,
+              if (address != null && address.isNotEmpty) 'address': address,
               'role': defaultRole,
               'isVerified':
                   defaultRole !=
@@ -1436,7 +1460,7 @@ class AuthService {
             'email': email,
             'name': email.split('@')[0],
             'role': defaultRole,
-            'isVerified': defaultRole != 'client',
+            'isVerified': true,
             'createdAt': FieldValue.serverTimestamp(),
           };
           await _retryFirestoreOperation(
@@ -1465,7 +1489,7 @@ class AuthService {
             'email': email,
             'name': email.split('@')[0],
             'role': defaultRole,
-            'isVerified': defaultRole != 'client',
+            'isVerified': true,
           };
 
           // Use temp data to allow login to proceed
@@ -1504,7 +1528,7 @@ class AuthService {
           'email': email,
           'name': email.split('@')[0],
           'role': defaultRole,
-          'isVerified': defaultRole != 'client',
+          'isVerified': true,
         };
 
         return {
@@ -1529,7 +1553,7 @@ class AuthService {
       final emailLower = email.toLowerCase().trim();
       final finalRole = resolvePortalRole(emailLower, firestoreRole: role);
       var finalIsVerified = isVerified;
-      if (['admin', 'attorney', 'staff'].contains(finalRole)) {
+      if (['admin', 'attorney', 'staff'].contains(finalRole) || user.emailVerified) {
         finalIsVerified = true;
       }
 
@@ -1606,32 +1630,20 @@ class AuthService {
         };
       }
 
-      // Block client login if not verified
-      // Admin, Attorney, and Staff don't need verification (they are created by admin)
-      // Only require verification for client role
-      final security = await SystemSettingsService.instance.load();
-      final rolesThatDontNeedVerification = security.enableTwoFactor
-          ? ['admin']
-          : ['admin', 'attorney', 'staff'];
-      final needsVerification = !rolesThatDontNeedVerification.contains(
-        finalRole.toLowerCase(),
-      );
-
-      if (needsVerification && !finalIsVerified) {
-        unawaited(SystemSettingsService.instance.clearFailedLogins(email));
-        // Keep the session: OTP / verification screens need currentUser.
-        // Login UI treats success + needsVerification → verification flow (not a red error).
-        final pendingUserData = Map<String, dynamic>.from(userDataMap);
-        pendingUserData['role'] = finalRole;
-        pendingUserData['isVerified'] = finalIsVerified;
-        return {
-          'success': true,
-          'needsVerification': true,
-          'role': finalRole,
-          'message':
-              'Please verify your email to continue. Check your inbox or complete verification on the next screen.',
-          'user': UserModel.fromFirestore(pendingUserData, user.uid),
-        };
+      // Registered users logging in with valid credentials must not be blocked by OTP.
+      // Auto-heal isVerified in Firestore so they proceed directly to their portal.
+      if (!finalIsVerified) {
+        finalIsVerified = true;
+        unawaited(
+          FirestoreMirror.patch(
+            collection: 'users',
+            id: user.uid,
+            patch: {
+              'isVerified': true,
+              'updatedAt': FieldValue.serverTimestamp(),
+            },
+          ),
+        );
       }
 
       // Non-blocking: FCM + audit log must not delay navigation (prevents ANR/crash).
@@ -1657,23 +1669,32 @@ class AuthService {
       }
       String message = 'Login failed';
       switch (e.code) {
-        case 'user-not-found':
-          message = 'No user found with this email';
-          break;
+        case 'invalid-credential':
+        case 'INVALID_LOGIN_CREDENTIALS':
         case 'wrong-password':
-          message = 'Incorrect password';
+          message = 'Incorrect password or email. Please try again.';
+          break;
+        case 'user-not-found':
+          message = 'No account found with this email.';
           break;
         case 'invalid-email':
-          message = 'Invalid email address';
+          message = 'Please enter a valid email address.';
           break;
         case 'user-disabled':
-          message = 'This account has been disabled';
+          message = 'This account has been disabled. Please contact support.';
+          break;
+        case 'too-many-requests':
+          message =
+              'Too many failed login attempts. Please wait a few minutes before trying again.';
+          break;
+        case 'network-request-failed':
+          message =
+              'Network error. Please check your internet connection and try again.';
           break;
         case 'invalid-api-key':
         case 'api-key-not-valid':
           message =
-              'Firebase is not configured for this app build. Reinstall the latest '
-              'app from your PC (flutter run) and try again.';
+              'Authentication service is temporarily unavailable. Please try again later.';
           break;
         default:
           final raw = e.message ?? '';
@@ -1684,17 +1705,16 @@ class AuthService {
                 'registered in Firebase. Run scripts\\fix_mobile_firebase.ps1 '
                 'from the project folder (use the Gmail that owns jurislink-app), '
                 'then uninstall the app and run flutter clean && flutter run.';
-          } else if (raw.toLowerCase().contains('api key')) {
-            message =
-                'Firebase connection error. Ensure the app was rebuilt after the '
-                'latest update, then try again.';
           } else {
-            message = raw.isNotEmpty ? raw : 'Login failed';
+            message = LoginErrorHelper.sanitize(raw.isNotEmpty ? raw : e.code);
           }
       }
       return {'success': false, 'message': message};
     } catch (e) {
-      return {'success': false, 'message': 'Unexpected error: $e'};
+      if (kDebugMode) {
+        debugPrint('❌ Error during login: $e');
+      }
+      return {'success': false, 'message': LoginErrorHelper.sanitize(e)};
     }
   }
 
@@ -1881,6 +1901,14 @@ class AuthService {
         operationName: 'Mark attorney signup as verified',
       );
 
+      await _sendRegistrationWelcome(
+        name: fullName,
+        email: email,
+        phone: phoneNumber,
+        userId: userId,
+        role: 'attorney',
+      );
+
       // Notify all admins about new attorney signup
       await _notifyAdminsOfNewAttorneySignup(userId, fullName, email);
 
@@ -1911,6 +1939,43 @@ class AuthService {
         debugPrint('❌ Error in verifyOtpAndCreateAttorneyAccount: $e');
       }
       return {'success': false, 'message': 'Unexpected error: $e'};
+    }
+  }
+
+  /// After OTP verification, send the welcome note on email and SMS.
+  Future<void> _sendRegistrationWelcome({
+    required String name,
+    required String email,
+    required String phone,
+    required String userId,
+    required String role,
+  }) async {
+    final display = name.trim().isEmpty ? 'there' : name.trim();
+    final link = EmailBranding.websiteUrl;
+    final body =
+        'Welcome To Law Connect $display. You can install the application now: $link';
+
+    if (phone.trim().isNotEmpty) {
+      try {
+        await SmsService().queueSms(
+          to: phone,
+          body: body,
+          userId: userId,
+          meta: {'type': 'welcome', 'role': role},
+        );
+      } catch (e) {
+        if (kDebugMode) {
+          debugPrint('⚠️ Welcome SMS not queued (non-critical): $e');
+        }
+      }
+    }
+
+    try {
+      await EmailOtpService().sendWelcome(email: email, name: display);
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('⚠️ Welcome email not sent (non-critical): $e');
+      }
     }
   }
 

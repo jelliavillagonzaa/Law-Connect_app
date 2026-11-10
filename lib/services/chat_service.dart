@@ -1,10 +1,12 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
-import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode, kIsWeb;
 import 'dart:io';
 import 'dart:async';
 import '../models/message_model.dart';
+import '../models/user_model.dart';
+import '../utils/chat_push_title.dart';
 import 'notification_service.dart';
 import 'firestore_mirror_helper.dart';
 import 'fcm_service.dart';
@@ -18,12 +20,585 @@ class ChatService {
   final Map<String, DateTime> _lastNotificationTime = {};
   final Map<String, Timer> _seenMarkDebounce = {};
 
+  Future<_ChatSender> _lockedSenderProfile(String senderId) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      throw Exception('Please log in to send messages.');
+    }
+    if (user.uid != senderId) {
+      throw Exception('Messages must be sent from your own account.');
+    }
+
+    var name = (user.displayName ?? '').trim();
+    String? role;
+    try {
+      final doc = await _firestore.collection('users').doc(senderId).get();
+      final data = doc.data();
+      if (data != null) {
+        role = (data['role'] as String?)?.toLowerCase();
+        final resolved = UserModel.resolveDisplayName(data);
+        if (resolved.trim().isNotEmpty && resolved != 'User') {
+          name = resolved.trim();
+        }
+      }
+    } catch (_) {}
+
+    if (name.isEmpty) {
+      final email = (user.email ?? '').trim();
+      name = email.contains('@') ? email.split('@').first : 'User';
+    }
+    return _ChatSender(id: senderId, name: name, role: role);
+  }
+
+  Future<void> _assertClientSender(String clientId) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null || user.uid != clientId) {
+      throw Exception(
+        'Log in with the client account to send messages. Sign out first if another account is still open.',
+      );
+    }
+    final doc = await _firestore.collection('users').doc(clientId).get();
+    final role = (doc.data()?['role'] as String?)?.toLowerCase() ?? '';
+    if (role != 'client') {
+      throw Exception(
+        'This login is not a client account. Sign out and sign in as the client.',
+      );
+    }
+  }
+
+
+  Future<void> _bindChatToClient(
+    String chatId,
+    String clientId, {
+    String? clientName,
+  }) async {
+    final chatDoc = await _firestore.collection('messages').doc(chatId).get();
+    if (!chatDoc.exists) return;
+    final data = chatDoc.data() ?? {};
+    final participants = List<String>.from(data['participants'] ?? []);
+    final patch = <String, dynamic>{};
+    if (data['clientId'] != clientId) {
+      patch['clientId'] = clientId;
+    }
+    final named = clientName?.trim() ?? '';
+    if (named.isNotEmpty && data['clientName'] != named) {
+      patch['clientName'] = named;
+    }
+    if (!participants.contains(clientId)) {
+      participants.add(clientId);
+      patch['participants'] = participants;
+    }
+    if (patch.isEmpty) return;
+    await HybridDatastore.updateChat(id: chatId, patch: patch);
+  }
+
+  Future<({String id, String name})> officeChatCounterpart(String chatId) async {
+    final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+    final info = await chatCounterpartInfo(chatId: chatId, currentUserId: currentUid);
+    return (id: info.id, name: info.name);
+  }
+
+  /// Resolves the counterpart (id, name, role) for any chat and current user.
+  /// For clients: default counterpart is the attorney's staff, unless an attorney has
+  /// messaged the client in this conversation.
+  Future<({String id, String name, String role})> chatCounterpartInfo({
+    required String chatId,
+    required String currentUserId,
+    Map<String, dynamic>? cachedChatData,
+  }) async {
+    Map<String, dynamic> data = cachedChatData ?? {};
+    if (data.isEmpty && chatId.isNotEmpty) {
+      try {
+        final chatDoc = await _firestore.collection('messages').doc(chatId).get();
+        data = chatDoc.data() ?? {};
+      } catch (_) {}
+    }
+
+    final attorneyId = (data['attorneyId'] as String?)?.trim() ?? '';
+    final staffId = (data['staffId'] as String?)?.trim() ?? '';
+    final clientId = (data['clientId'] as String?)?.trim() ?? '';
+
+    // If current user is the client:
+    // Business rule: The client communicates with the attorney's staff by default.
+    // Display attorney only if the attorney actually sent a message to the client.
+    final isClientUser = currentUserId == clientId ||
+        (FirebaseAuth.instance.currentUser?.uid == currentUserId &&
+            currentUserId.isNotEmpty &&
+            currentUserId != attorneyId &&
+            currentUserId != staffId);
+
+    if (isClientUser) {
+      final isStaffChat = (data['chatType'] as String?) == 'client_staff' ||
+          staffId.isNotEmpty ||
+          data.containsKey('staffEmail') ||
+          attorneyId.isEmpty;
+
+      if (isStaffChat) {
+        // Direct Client-Staff private consultation: Always resolve and return Staff!
+        if (staffId.isNotEmpty && staffId != currentUserId) {
+          try {
+            final doc = await _firestore.collection('users').doc(staffId).get();
+            if (doc.exists) {
+              final udata = doc.data() ?? {};
+              var name = UserModel.resolveDisplayName(udata).trim();
+              if (name.isNotEmpty &&
+                  name.toLowerCase() != 'user' &&
+                  name.toLowerCase() != 'attorney' &&
+                  !name.toLowerCase().startsWith('atty.')) {
+                return (id: staffId, name: name, role: 'staff');
+              }
+            }
+          } catch (_) {}
+          return (id: staffId, name: 'Legal Staff', role: 'staff');
+        }
+
+        final staffEmail = (data['staffEmail'] as String?)?.trim() ?? '';
+        if (staffEmail.isNotEmpty) {
+          try {
+            final matches = await _firestore
+                .collection('users')
+                .where('email', isEqualTo: staffEmail)
+                .where('role', isEqualTo: 'staff')
+                .limit(1)
+                .get();
+            if (matches.docs.isNotEmpty) {
+              final sdoc = matches.docs.first;
+              var name = UserModel.resolveDisplayName(sdoc.data()).trim();
+              if (name.isEmpty || name.toLowerCase() == 'user' || name.toLowerCase() == 'attorney') {
+                name = 'Legal Staff';
+              }
+              return (id: sdoc.id, name: name, role: 'staff');
+            }
+          } catch (_) {}
+        }
+
+        try {
+          final staffContact = await _officeStaffContact(null);
+          if (staffContact.id != null) {
+            final sdoc = await _firestore.collection('users').doc(staffContact.id).get();
+            if (sdoc.exists) {
+              var name = UserModel.resolveDisplayName(sdoc.data() ?? {}).trim();
+              if (name.isNotEmpty && name.toLowerCase() != 'user' && name.toLowerCase() != 'attorney') {
+                return (id: staffContact.id!, name: name, role: 'staff');
+              }
+            }
+            return (id: staffContact.id!, name: 'Legal Staff', role: 'staff');
+          }
+        } catch (_) {}
+
+        return (id: '', name: 'Legal Staff', role: 'staff');
+      }
+
+      // Direct client-attorney chat (only if explicitly client-attorney without staff)
+      if (attorneyId.isNotEmpty && attorneyId != currentUserId) {
+        var attName = 'Attorney';
+        try {
+          final doc = await _firestore.collection('users').doc(attorneyId).get();
+          if (doc.exists) {
+            final udata = doc.data() ?? {};
+            var name = UserModel.resolveDisplayName(udata).trim();
+            if (name.isNotEmpty &&
+                name.toLowerCase() != 'user' &&
+                name.toLowerCase() != 'staff' &&
+                name.toLowerCase() != 'legal staff') {
+              if (name.toLowerCase() == 'attorney') {
+                attName = 'Attorney';
+              } else if (!name.startsWith('Atty.')) {
+                attName = 'Atty. $name';
+              } else {
+                attName = name;
+              }
+            }
+          }
+        } catch (_) {}
+        return (id: attorneyId, name: attName, role: 'attorney');
+      }
+    }
+
+    // Default for non-client currentUserId (e.g. staff or attorney logged in):
+    if (attorneyId.isNotEmpty && attorneyId != currentUserId) {
+      try {
+        final doc = await _firestore.collection('users').doc(attorneyId).get();
+        if (doc.exists) {
+          final udata = doc.data() ?? {};
+          var name = UserModel.resolveDisplayName(udata).trim();
+          if (name.isEmpty ||
+              name.toLowerCase() == 'user' ||
+              name.toLowerCase() == 'staff' ||
+              name.toLowerCase() == 'legal staff') {
+            name = 'Attorney';
+          } else if (!name.startsWith('Atty.') && name.toLowerCase() != 'attorney') {
+            name = 'Atty. $name';
+          }
+          return (id: attorneyId, name: name, role: 'attorney');
+        }
+      } catch (_) {}
+      return (id: attorneyId, name: 'Attorney', role: 'attorney');
+    }
+
+    if (staffId.isNotEmpty && staffId != currentUserId) {
+      try {
+        final doc = await _firestore.collection('users').doc(staffId).get();
+        if (doc.exists) {
+          final udata = doc.data() ?? {};
+          var name = UserModel.resolveDisplayName(udata).trim();
+          if (name.isEmpty ||
+              name.toLowerCase() == 'user' ||
+              name.toLowerCase() == 'attorney' ||
+              name.toLowerCase().startsWith('atty.')) {
+            name = 'Legal Staff';
+          }
+          return (id: staffId, name: name, role: 'staff');
+        }
+      } catch (_) {}
+      return (id: staffId, name: 'Legal Staff', role: 'staff');
+    }
+
+    // Fallback: check other participant
+    final participants = List<String>.from(data['participants'] ?? []);
+    final otherId = participants.firstWhere(
+      (id) => id != currentUserId && !id.startsWith('staff_'),
+      orElse: () => '',
+    );
+    if (otherId.isNotEmpty) {
+      try {
+        final doc = await _firestore.collection('users').doc(otherId).get();
+        if (doc.exists) {
+          final udata = doc.data() ?? {};
+          final role = (udata['role'] as String?)?.toLowerCase() ?? '';
+          var name = UserModel.resolveDisplayName(udata).trim();
+          if (role == 'attorney') {
+            if (name.isEmpty ||
+                name.toLowerCase() == 'user' ||
+                name.toLowerCase() == 'staff' ||
+                name.toLowerCase() == 'legal staff') {
+              name = 'Attorney';
+            } else if (!name.startsWith('Atty.') && name.toLowerCase() != 'attorney') {
+              name = 'Atty. $name';
+            }
+            return (id: otherId, name: name, role: 'attorney');
+          } else if (role == 'staff') {
+            if (name.isEmpty ||
+                name.toLowerCase() == 'user' ||
+                name.toLowerCase() == 'attorney' ||
+                name.toLowerCase().startsWith('atty.')) {
+              name = 'Legal Staff';
+            }
+            return (id: otherId, name: name, role: 'staff');
+          }
+          return (id: otherId, name: name.isNotEmpty ? name : 'User', role: role);
+        }
+      } catch (_) {}
+    }
+
+    final staffEmail = (data['staffEmail'] as String?)?.trim() ?? '';
+    if (staffEmail.isNotEmpty) {
+      try {
+        final matches = await _firestore
+            .collection('users')
+            .where('email', isEqualTo: staffEmail)
+            .where('role', isEqualTo: 'staff')
+            .limit(1)
+            .get();
+        if (matches.docs.isNotEmpty) {
+          final sdoc = matches.docs.first;
+          var name = UserModel.resolveDisplayName(sdoc.data()).trim();
+          if (name.isEmpty || name.toLowerCase() == 'user' || name.toLowerCase() == 'attorney') {
+            name = 'Legal Staff';
+          }
+          return (id: sdoc.id, name: name, role: 'staff');
+        }
+      } catch (_) {}
+    }
+
+    return (id: '', name: 'Legal Staff', role: 'staff');
+  }
+
+  Future<_OfficeStaff> _officeStaffContact(String? attorneyId) async {
+    try {
+      if (attorneyId != null && attorneyId.isNotEmpty) {
+        // 1. Staff assigned to this attorney by assignedAttorneyId
+        final snap = await _firestore
+            .collection('users')
+            .where('role', isEqualTo: 'staff')
+            .where('assignedAttorneyId', isEqualTo: attorneyId)
+            .limit(5)
+            .get();
+        if (snap.docs.isNotEmpty) {
+          final doc = snap.docs.first;
+          final email = (doc.data()['email'] as String?)?.trim() ?? '';
+          return _OfficeStaff(
+            id: doc.id,
+            email: email.isNotEmpty ? email : 'staff@gmail.com',
+          );
+        }
+
+        // 2. Staff assigned to this attorney by attorneyId
+        final snap2 = await _firestore
+            .collection('users')
+            .where('role', isEqualTo: 'staff')
+            .where('attorneyId', isEqualTo: attorneyId)
+            .limit(5)
+            .get();
+        if (snap2.docs.isNotEmpty) {
+          final doc = snap2.docs.first;
+          final email = (doc.data()['email'] as String?)?.trim() ?? '';
+          return _OfficeStaff(
+            id: doc.id,
+            email: email.isNotEmpty ? email : 'staff@gmail.com',
+          );
+        }
+      }
+
+      // 3. Fallback: Any staff user in users collection
+      final anyStaffSnap = await _firestore
+          .collection('users')
+          .where('role', isEqualTo: 'staff')
+          .limit(5)
+          .get();
+      if (anyStaffSnap.docs.isNotEmpty) {
+        final doc = anyStaffSnap.docs.first;
+        final email = (doc.data()['email'] as String?)?.trim() ?? '';
+        return _OfficeStaff(
+          id: doc.id,
+          email: email.isNotEmpty ? email : 'staff@gmail.com',
+        );
+      }
+
+      // 4. Check if staff@gmail.com exists to get its UID
+      final emailStaffSnap = await _firestore
+          .collection('users')
+          .where('email', isEqualTo: 'staff@gmail.com')
+          .limit(1)
+          .get();
+      if (emailStaffSnap.docs.isNotEmpty) {
+        return _OfficeStaff(
+          id: emailStaffSnap.docs.first.id,
+          email: 'staff@gmail.com',
+        );
+      }
+    } catch (_) {}
+    return const _OfficeStaff(id: null, email: 'staff@gmail.com');
+  }
+
+  Future<void> _ensureOfficeRouting({
+    required String chatId,
+    required Map<String, dynamic> data,
+    required String clientId,
+    String? attorneyId,
+    required _OfficeStaff staff,
+    String? clientName,
+  }) async {
+    final participants = List<String>.from(data['participants'] ?? []);
+    final patch = <String, dynamic>{};
+    if (data['clientId'] != clientId) {
+      patch['clientId'] = clientId;
+    }
+    if (clientName != null &&
+        clientName.trim().isNotEmpty &&
+        data['clientName'] != clientName.trim()) {
+      patch['clientName'] = clientName.trim();
+    }
+    // Client-staff chat is private between client and staff - do NOT link attorneyId
+    if (data.containsKey('attorneyId') && data['attorneyId'] != null) {
+      patch['attorneyId'] = FieldValue.delete();
+    }
+    if (data['chatType'] != 'client_staff') {
+      patch['chatType'] = 'client_staff';
+    }
+    if (staff.id != null && data['staffId'] != staff.id) {
+      patch['staffId'] = staff.id;
+    }
+    if ((data['staffEmail'] as String?)?.trim().isNotEmpty != true) {
+      patch['staffEmail'] = staff.email;
+    }
+    if (!participants.contains(clientId)) participants.add(clientId);
+    if (staff.id != null && !participants.contains(staff.id)) {
+      participants.add(staff.id!);
+    }
+    // Remove any attorney UID from participants so client-counsel chat is handled exclusively by staff
+    final docAttorneyId = (data['attorneyId'] as String?)?.trim();
+    if (docAttorneyId != null && docAttorneyId.isNotEmpty) {
+      participants.remove(docAttorneyId);
+    }
+    if (attorneyId != null &&
+        attorneyId.isNotEmpty &&
+        participants.contains(attorneyId)) {
+      participants.remove(attorneyId);
+    }
+    final staffToken = 'staff_${staff.email}';
+    if (!participants.contains(staffToken)) participants.add(staffToken);
+    if (participants.join(',') !=
+        List<String>.from(data['participants'] ?? []).join(',')) {
+      patch['participants'] = participants;
+    }
+    if (patch.isEmpty) return;
+    await HybridDatastore.updateChat(id: chatId, patch: patch);
+  }
+
+  /// Existing office thread for this client, if any. Does not create a chat.
+  Future<String?> findClientOfficeChat(String clientId) async {
+    await _assertClientSender(clientId);
+    try {
+      final existing = await _firestore
+          .collection('messages')
+          .where('clientId', isEqualTo: clientId)
+          .limit(20)
+          .get();
+      final docs = [...existing.docs];
+      docs.sort((a, b) {
+        final aAt = (a.data()['updatedAt'] as Timestamp?)?.toDate() ??
+            DateTime.fromMillisecondsSinceEpoch(0);
+        final bAt = (b.data()['updatedAt'] as Timestamp?)?.toDate() ??
+            DateTime.fromMillisecondsSinceEpoch(0);
+        return bAt.compareTo(aAt);
+      });
+      String? emptyId;
+      for (final doc in docs) {
+        final last = (doc.data()['lastMessage'] as String?)?.trim() ?? '';
+        if (last.isNotEmpty) return doc.id;
+        emptyId ??= doc.id;
+      }
+      return emptyId;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Fast and complete: returns both chatId and counterpart info.
+  Future<({String chatId, ({String id, String name, String role}) counterpart})>
+      getOrCreateClientOfficeChatWithCounterpart(String clientId) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null || user.uid != clientId) {
+      throw Exception('Please log in to send messages.');
+    }
+
+    // 1. Fast path: check if client already has an existing office chat
+    try {
+      final existing = await _firestore
+          .collection('messages')
+          .where('clientId', isEqualTo: clientId)
+          .limit(10)
+          .get();
+
+      if (existing.docs.isNotEmpty) {
+        final docs = [...existing.docs];
+        docs.sort((a, b) {
+          final aAt = (a.data()['updatedAt'] as Timestamp?)?.toDate() ??
+              DateTime.fromMillisecondsSinceEpoch(0);
+          final bAt = (b.data()['updatedAt'] as Timestamp?)?.toDate() ??
+              DateTime.fromMillisecondsSinceEpoch(0);
+          return bAt.compareTo(aAt);
+        });
+
+        QueryDocumentSnapshot<Map<String, dynamic>>? withMessage;
+        for (final doc in docs) {
+          final last = (doc.data()['lastMessage'] as String?)?.trim() ?? '';
+          if (last.isNotEmpty) {
+            withMessage = doc;
+            break;
+          }
+        }
+        final chosen = withMessage ?? docs.first;
+
+        final counterpart = await chatCounterpartInfo(
+          chatId: chosen.id,
+          currentUserId: clientId,
+          cachedChatData: chosen.data(),
+        );
+
+        return (chatId: chosen.id, counterpart: counterpart);
+      }
+    } catch (_) {}
+
+    // 2. Slow path: No chat exists yet, create one
+    final chatId = await getOrCreateClientOfficeChat(clientId);
+    final counterpart = await chatCounterpartInfo(
+      chatId: chatId,
+      currentUserId: clientId,
+    );
+    return (chatId: chatId, counterpart: counterpart);
+  }
+
+  /// Client Messages: always an office/staff thread for THIS client account.
+  Future<String> getOrCreateClientOfficeChat(String clientId) async {
+    // 1. Fast check for existing chat
+    try {
+      final existing = await _firestore
+          .collection('messages')
+          .where('clientId', isEqualTo: clientId)
+          .limit(10)
+          .get();
+      if (existing.docs.isNotEmpty) {
+        final docs = [...existing.docs];
+        docs.sort((a, b) {
+          final aAt = (a.data()['updatedAt'] as Timestamp?)?.toDate() ??
+              DateTime.fromMillisecondsSinceEpoch(0);
+          final bAt = (b.data()['updatedAt'] as Timestamp?)?.toDate() ??
+              DateTime.fromMillisecondsSinceEpoch(0);
+          return bAt.compareTo(aAt);
+        });
+        QueryDocumentSnapshot<Map<String, dynamic>>? withMessage;
+        for (final doc in docs) {
+          final last = (doc.data()['lastMessage'] as String?)?.trim() ?? '';
+          if (last.isNotEmpty) {
+            withMessage = doc;
+            break;
+          }
+        }
+        final chosen = withMessage ?? docs.first;
+        final cdata = chosen.data();
+        final staffId = (cdata['staffId'] as String?)?.trim();
+        final staffEmail = (cdata['staffEmail'] as String?)?.trim() ?? 'staff@gmail.com';
+        final attId = (cdata['attorneyId'] as String?)?.trim();
+        unawaited(_ensureOfficeRouting(
+          chatId: chosen.id,
+          data: cdata,
+          clientId: clientId,
+          attorneyId: attId,
+          staff: _OfficeStaff(id: staffId, email: staffEmail),
+          clientName: (cdata['clientName'] as String?)?.trim(),
+        ));
+        return chosen.id;
+      }
+    } catch (_) {}
+
+    // 2. Only if no existing chat, perform profile and routing queries concurrently
+    await _assertClientSender(clientId);
+    final sender = await _lockedSenderProfile(clientId);
+    final staff = await _officeStaffContact(null);
+
+    final participants = <String>[
+      clientId,
+      'staff_${staff.email}',
+    ];
+    if (staff.id != null) participants.add(staff.id!);
+
+    final chatData = <String, dynamic>{
+      'participants': participants,
+      'clientId': clientId,
+      'clientName': sender.name,
+      'staffEmail': staff.email,
+      'chatType': 'client_staff',
+      'lastMessage': null,
+      'updatedAt': FieldValue.serverTimestamp(),
+      if (staff.id != null) 'staffId': staff.id,
+    };
+
+    final result = await HybridDatastore.addChat(data: chatData);
+    if (!result.isSuccess || result.id == null) {
+      throw Exception(result.failureMessage);
+    }
+    return result.id!;
+  }
+
   // Get or create a chat with staff by email (no need to find staff user first)
   // Messages go directly to staff@gmail.com - staff will see it when they log in
   Future<String> getOrCreateChatByStaffEmail({
     required String clientId,
     required String staffEmail,
   }) async {
+    await _assertClientSender(clientId);
     try {
       // Check if chat already exists for this client and staff email
       final existingChats = await _firestore
@@ -34,18 +609,23 @@ class ChatService {
           .get();
 
       if (existingChats.docs.isNotEmpty) {
-        return existingChats.docs.first.id;
+        final existing = existingChats.docs.first;
+        if (existing.data().containsKey('attorneyId')) {
+          await HybridDatastore.updateChat(
+            id: existing.id,
+            patch: {'attorneyId': FieldValue.delete(), 'chatType': 'client_staff'},
+          );
+        }
+        return existing.id;
       }
 
       // Create new chat with staffEmail identifier
-      // Staff will be able to access it by their email when they log in
+      final participants = <String>[clientId, 'staff_$staffEmail'];
       final chatData = <String, dynamic>{
-        'participants': [
-          clientId,
-          'staff_$staffEmail',
-        ], // Use email as identifier
+        'participants': participants,
         'clientId': clientId,
-        'staffEmail': staffEmail, // Store email for staff lookup
+        'staffEmail': staffEmail,
+        'chatType': 'client_staff',
         'lastMessage': null,
         'updatedAt': FieldValue.serverTimestamp(),
       };
@@ -63,6 +643,12 @@ class ChatService {
   // Get or create a chat between two users
   // Can be used for client-attorney or client-staff chats
   Future<String> getOrCreateChat(String userId1, String userId2) async {
+    if (userId1.trim().isEmpty || userId2.trim().isEmpty) {
+      throw Exception('Invalid chat participants.');
+    }
+    if (userId1 == userId2) {
+      throw Exception('Cannot start a chat with the same account.');
+    }
     try {
       // Check if chat already exists
       final existingChats = await _firestore
@@ -132,9 +718,16 @@ class ChatService {
             staffId = userId2;
           }
 
+          if (clientId != null) {
+            final storedClient = (data['clientId'] as String?)?.trim() ?? '';
+            if (storedClient.isNotEmpty && storedClient != clientId) {
+              continue;
+            }
+          }
+
           // Update chat document if needed
           final updateData = <String, dynamic>{};
-          if (clientId != null && data['clientId'] == null) {
+          if (clientId != null && data['clientId'] != clientId) {
             updateData['clientId'] = clientId;
           }
           // Only set attorneyId if it's a direct staff-attorney chat (no client) or client-attorney chat (no staff)
@@ -254,24 +847,21 @@ class ChatService {
     String? senderRole,
   }) async {
     try {
-      // Get sender role if not provided
-      String? finalSenderRole = senderRole;
-      if (finalSenderRole == null) {
-        try {
-          final senderDoc = await _firestore
-              .collection('users')
-              .doc(senderId)
-              .get();
-          finalSenderRole = senderDoc.data()?['role'];
-        } catch (e) {
-          // If can't get role, continue without it
-        }
+      final sender = await _lockedSenderProfile(senderId);
+      if (senderRole == 'client' &&
+          sender.role != null &&
+          sender.role != 'client') {
+        throw Exception(
+          'This login is not a client account. Sign out and sign in as the client.',
+        );
       }
+      final finalSenderRole = sender.role ?? senderRole;
 
       // Add message to subcollection
       final msgData = <String, dynamic>{
         'chatId': chatId,
         'senderId': senderId,
+        'senderName': sender.name,
         'text': text,
         'timestamp': FieldValue.serverTimestamp(),
         'isSeen': false,
@@ -283,21 +873,34 @@ class ChatService {
       );
       if (!msgResult.isSuccess) throw Exception(msgResult.failureMessage);
 
-      // Update chat last message
+      final chatPatch = <String, dynamic>{
+        'lastMessage': text,
+        'updatedAt': FieldValue.serverTimestamp(),
+      };
+      if (finalSenderRole == 'attorney') {
+        chatPatch['hasAttorneyMessage'] = true;
+      }
       final chatResult = await HybridDatastore.updateChat(
         id: chatId,
-        patch: {
-          'lastMessage': text,
-          'updatedAt': FieldValue.serverTimestamp(),
-        },
+        patch: chatPatch,
       );
       if (!chatResult.isSuccess) throw Exception(chatResult.failureMessage);
+
+      if (finalSenderRole == 'client') {
+        await _bindChatToClient(
+          chatId,
+          senderId,
+          clientName: sender.name,
+        );
+      }
 
       unawaited(
         _pushNewMessageToRecipients(
           chatId: chatId,
           senderId: senderId,
           text: text,
+          knownSenderName: sender.name,
+          knownSenderRole: finalSenderRole,
         ),
       );
     } catch (e) {
@@ -324,14 +927,18 @@ class ChatService {
       final snapshot = await uploadTask;
       final downloadUrl = await snapshot.ref.getDownloadURL();
 
+      final sender = await _lockedSenderProfile(senderId);
+
       // Add message with attachment
       final msgData = <String, dynamic>{
         'chatId': chatId,
         'senderId': senderId,
+        'senderName': sender.name,
         'text': text,
         'attachmentUrl': downloadUrl,
         'timestamp': FieldValue.serverTimestamp(),
         'isSeen': false,
+        if (sender.role != null) 'senderRole': sender.role,
       };
       final msgResult = await HybridDatastore.addChatMessage(
         chatId: chatId,
@@ -342,12 +949,16 @@ class ChatService {
       final lastMessage = text.isEmpty ? 'Attachment' : text;
 
       // Update chat last message
+      final chatPatch = <String, dynamic>{
+        'lastMessage': lastMessage,
+        'updatedAt': FieldValue.serverTimestamp(),
+      };
+      if (sender.role == 'attorney') {
+        chatPatch['hasAttorneyMessage'] = true;
+      }
       final chatResult = await HybridDatastore.updateChat(
         id: chatId,
-        patch: {
-          'lastMessage': lastMessage,
-          'updatedAt': FieldValue.serverTimestamp(),
-        },
+        patch: chatPatch,
       );
       if (!chatResult.isSuccess) throw Exception(chatResult.failureMessage);
 
@@ -356,6 +967,8 @@ class ChatService {
           chatId: chatId,
           senderId: senderId,
           text: lastMessage,
+          knownSenderName: sender.name,
+          knownSenderRole: sender.role,
         ),
       );
     } catch (e) {
@@ -368,26 +981,43 @@ class ChatService {
     required String chatId,
     required String senderId,
     required String text,
+    String? knownSenderName,
+    String? knownSenderRole,
   }) async {
     try {
       final chatDoc = await _firestore.collection('messages').doc(chatId).get();
       if (!chatDoc.exists) return;
       final data = chatDoc.data() ?? {};
       final recipients = await _messageRecipientIds(data, senderId);
+      unawaited(
+        _incrementUnreadFor(
+          chatId: chatId,
+          data: data,
+          senderId: senderId,
+          recipients: recipients,
+        ),
+      );
       if (recipients.isEmpty) return;
 
-      var senderName = 'New message';
-      try {
-        final senderDoc = await _firestore.collection('users').doc(senderId).get();
-        final senderData = senderDoc.data();
-        final name = (senderData?['fullName'] ??
-                senderData?['name'] ??
-                senderData?['displayName'] ??
-                '')
-            .toString()
-            .trim();
-        if (name.isNotEmpty) senderName = name;
-      } catch (_) {}
+      var senderName = knownSenderName?.trim() ?? '';
+      var senderRole = knownSenderRole?.trim() ?? '';
+      if (senderName.isEmpty || senderRole.isEmpty) {
+        try {
+          final senderDoc =
+              await _firestore.collection('users').doc(senderId).get();
+          final profile = senderDoc.data() ?? {};
+          if (senderName.isEmpty) {
+            senderName = UserModel.resolveDisplayName(profile);
+          }
+          if (senderRole.isEmpty) {
+            senderRole = (profile['role'] as String?)?.trim() ?? '';
+          }
+        } catch (_) {}
+      }
+      final title = ChatPushTitle.format(name: senderName, role: senderRole);
+      if (senderName.isEmpty || senderName == 'User') {
+        senderName = title;
+      }
 
       final trimmed = text.trim();
       final preview = trimmed.isEmpty
@@ -398,7 +1028,7 @@ class ChatService {
       for (final userId in recipients) {
         await fcm.sendChatPush(
           userId: userId,
-          title: senderName,
+          title: title,
           body: preview,
           chatId: chatId,
           senderId: senderId,
@@ -431,10 +1061,23 @@ class ChatService {
     }
     addId(data['clientId']);
     addId(data['staffId']);
-    addId(data['attorneyId']);
+    final staffId = data['staffId']?.toString().trim() ?? '';
+    final staffEmail = data['staffEmail']?.toString().trim() ?? '';
+    final clientId = data['clientId']?.toString().trim() ?? '';
+    final attorneyId = (data['attorneyId'] as String?)?.trim() ?? '';
+    final officeThread = staffId.isNotEmpty || staffEmail.isNotEmpty || (clientId.isNotEmpty && attorneyId.isNotEmpty);
+
+    if (!officeThread) {
+      addId(attorneyId);
+    } else {
+      // In office thread, client messages are handled by staff, never by attorney directly
+      if (attorneyId.isNotEmpty) {
+        ids.remove(attorneyId);
+      }
+    }
 
     final emails = <String>{};
-    final staffEmail = data['staffEmail']?.toString().trim() ?? '';
+
     if (staffEmail.isNotEmpty) emails.add(staffEmail);
     if (participants is List) {
       for (final participant in participants) {
@@ -457,8 +1100,322 @@ class ChatService {
       } catch (_) {}
     }
 
+    // When client sends message, ensure attorney's staff receives it
+    if (clientId.isNotEmpty && senderId == clientId && officeThread) {
+      if (attorneyId.isNotEmpty) {
+        try {
+          final staffSnap = await _firestore
+              .collection('users')
+              .where('role', isEqualTo: 'staff')
+              .where('assignedAttorneyId', isEqualTo: attorneyId)
+              .get();
+          for (final doc in staffSnap.docs) {
+            if (doc.id != senderId) ids.add(doc.id);
+          }
+          final staffSnap2 = await _firestore
+              .collection('users')
+              .where('role', isEqualTo: 'staff')
+              .where('attorneyId', isEqualTo: attorneyId)
+              .get();
+          for (final doc in staffSnap2.docs) {
+            if (doc.id != senderId) ids.add(doc.id);
+          }
+        } catch (_) {}
+      }
+      if (ids.isEmpty) {
+        try {
+          final anyStaff = await _firestore
+              .collection('users')
+              .where('role', isEqualTo: 'staff')
+              .limit(5)
+              .get();
+          for (final doc in anyStaff.docs) {
+            if (doc.id != senderId) ids.add(doc.id);
+          }
+        } catch (_) {}
+      }
+      if (attorneyId.isNotEmpty) {
+        ids.remove(attorneyId);
+      }
+    }
+
     ids.remove(senderId);
     return ids;
+  }
+
+  Future<void> _incrementUnreadFor({
+    required String chatId,
+    required Map<String, dynamic> data,
+    required String senderId,
+    required Set<String> recipients,
+  }) async {
+    try {
+      final updates = <String, dynamic>{};
+      for (final id in recipients) {
+        updates['unreadFor.$id'] = FieldValue.increment(1);
+      }
+
+      final clientId = data['clientId']?.toString().trim() ?? '';
+      final staffId = data['staffId']?.toString().trim() ?? '';
+      final staffEmail = data['staffEmail']?.toString().trim() ?? '';
+      final fromClient = clientId.isNotEmpty && senderId == clientId;
+      final fromStaff = staffId.isNotEmpty && senderId == staffId;
+
+      if (!fromStaff && staffEmail.isNotEmpty) {
+        updates['unreadFor.${ChatModel.officeUnreadKey}'] =
+            FieldValue.increment(1);
+      } else if (fromClient &&
+          staffId.isNotEmpty &&
+          !recipients.contains(staffId)) {
+        updates['unreadFor.$staffId'] = FieldValue.increment(1);
+      }
+
+      if (updates.isEmpty) return;
+      await _firestore.collection('messages').doc(chatId).update(updates);
+    } catch (e) {
+      if (kDebugMode) debugPrint('Unread increment skipped: $e');
+    }
+  }
+
+  Future<void> _clearUnreadFor(String chatId, String userId) async {
+    try {
+      final patch = <String, dynamic>{'unreadFor.$userId': 0};
+      final viewer = await _unreadViewer(userId);
+      if (viewer.isStaff) {
+        patch['unreadFor.${ChatModel.officeUnreadKey}'] = 0;
+      }
+      await _firestore.collection('messages').doc(chatId).update(patch);
+    } catch (_) {}
+  }
+
+  Future<_UnreadViewer> _unreadViewer(String userId) async {
+    var role = '';
+    var email = '';
+    var assignedAttorneyId = '';
+    try {
+      final doc = await _firestore.collection('users').doc(userId).get();
+      final data = doc.data() ?? {};
+      role = (data['role'] as String?)?.toLowerCase() ?? '';
+      email = (data['email'] as String?)?.trim() ?? '';
+      assignedAttorneyId =
+          (data['assignedAttorneyId'] as String?)?.trim() ?? '';
+    } catch (_) {}
+    return _UnreadViewer(
+      id: userId,
+      role: role,
+      email: email,
+      assignedAttorneyId: assignedAttorneyId,
+    );
+  }
+
+  List<(String, Query<Map<String, dynamic>>)> _inboxQueries(_UnreadViewer v) {
+    final col = _firestore.collection('messages');
+    final queries = <(String, Query<Map<String, dynamic>>)>[
+      ('participants', col.where('participants', arrayContains: v.id)),
+    ];
+    if (v.isStaff) {
+      queries.add(('staffId', col.where('staffId', isEqualTo: v.id)));
+      if (v.email.isNotEmpty) {
+        queries.add(('staffEmail', col.where('staffEmail', isEqualTo: v.email)));
+      }
+      if (v.email != 'staff@gmail.com') {
+        queries.add((
+          'office',
+          col.where('staffEmail', isEqualTo: 'staff@gmail.com'),
+        ));
+      }
+      if (v.assignedAttorneyId.isNotEmpty) {
+        queries.add((
+          'assignedAttorney',
+          col.where('attorneyId', isEqualTo: v.assignedAttorneyId),
+        ));
+      }
+      queries.add(('clientStaff', col.where('chatType', isEqualTo: 'client_staff')));
+    }
+    // Attorneys only query chats where they are explicitly in 'participants'
+    return queries;
+  }
+
+  ChatModel? _chatFromInboxDoc(
+    QueryDocumentSnapshot<Map<String, dynamic>> doc,
+    String userId,
+  ) {
+    final deletedFor = List<String>.from(doc.data()['deletedFor'] ?? []);
+    if (deletedFor.contains(userId)) return null;
+    return ChatModel.fromFirestore(doc);
+  }
+
+  bool _visibleInInbox(ChatModel chat, _UnreadViewer v) {
+    if (!chat.hasMessages) return false;
+    if (v.isStaff) {
+      final hasClient = chat.clientId != null && chat.clientId!.isNotEmpty;
+      if (hasClient) {
+        final matchesAttorney = v.assignedAttorneyId.isNotEmpty &&
+            chat.attorneyId == v.assignedAttorneyId;
+        final matchesStaff = chat.staffId == v.id;
+        final matchesOwnEmail =
+            v.email.isNotEmpty && chat.staffEmail == v.email;
+        final matchesOffice = chat.staffEmail == 'staff@gmail.com';
+        final isClientStaff = chat.isClientStaffChat || chat.chatType == 'client_staff';
+        final unassignedStaffFallback = v.assignedAttorneyId.isEmpty;
+        return matchesAttorney ||
+            matchesStaff ||
+            matchesOwnEmail ||
+            matchesOffice ||
+            isClientStaff ||
+            unassignedStaffFallback;
+      }
+      if (v.assignedAttorneyId.isNotEmpty &&
+          chat.attorneyId == v.assignedAttorneyId &&
+          chat.staffId == v.id) {
+        return true;
+      }
+      return chat.participants.contains(v.id);
+    }
+    if (v.isAttorney) {
+      // Client-staff chats are strictly private between client and staff - NEVER visible in attorney portal!
+      if (chat.isClientStaffChat || chat.chatType == 'client_staff') {
+        return false;
+      }
+      if (chat.staffId != null && chat.staffId!.isNotEmpty) {
+        return false;
+      }
+      if (chat.staffEmail != null && chat.staffEmail!.isNotEmpty) {
+        return false;
+      }
+      // Attorney only sees direct chats where attorney is an actual participant
+      return chat.participants.contains(v.id);
+    }
+    return chat.participants.contains(v.id) || chat.clientId == v.id;
+  }
+
+  List<ChatModel> _inboxChatsFromMap(
+    Map<String, ChatModel> chats,
+    _UnreadViewer v,
+  ) {
+    final visible = chats.values.where((c) => _visibleInInbox(c, v)).toList();
+    return ChatModel.oneThreadPerClient(visible);
+  }
+
+  int _storedUnreadTotal(List<ChatModel> chats, _UnreadViewer v) {
+    var total = 0;
+    for (final chat in chats) {
+      total += chat.unreadCountFor(v.id, includeOfficeStaff: v.isStaff);
+    }
+    return total;
+  }
+
+  Future<int> _peekUnseenFallback(
+    List<ChatModel> chats,
+    _UnreadViewer v, {
+    int maxChats = 8,
+  }) async {
+    if (kIsWeb) return 0;
+    var extra = 0;
+    var peeked = 0;
+    for (final chat in chats) {
+      if (chat.unreadCountFor(v.id, includeOfficeStaff: v.isStaff) > 0) {
+        continue;
+      }
+      if (peeked >= maxChats) break;
+      peeked++;
+      try {
+        QuerySnapshot<Map<String, dynamic>> snap;
+        final col = _firestore
+            .collection('messages')
+            .doc(chat.id)
+            .collection('messages')
+            .limit(8);
+        try {
+          snap = await col
+              .get(const GetOptions(source: Source.cache))
+              .timeout(const Duration(milliseconds: 400));
+          if (snap.docs.isEmpty) {
+            snap = await col.get().timeout(const Duration(milliseconds: 800));
+          }
+        } catch (_) {
+          snap = await col.get().timeout(const Duration(milliseconds: 800));
+        }
+        for (final msgDoc in snap.docs) {
+          final msg = msgDoc.data();
+          if (msg['senderId'] != v.id && msg['isSeen'] != true) {
+            extra++;
+          }
+        }
+      } catch (_) {}
+    }
+    return extra;
+  }
+
+  Future<QuerySnapshot<Map<String, dynamic>>> _inboxQueryGet(
+    Query<Map<String, dynamic>> query,
+  ) async {
+    final limited = query.limit(40);
+    try {
+      final cache = await limited
+          .get(const GetOptions(source: Source.cache))
+          .timeout(const Duration(seconds: 1));
+      if (cache.docs.isNotEmpty) return cache;
+    } catch (_) {}
+    try {
+      return await limited.get().timeout(const Duration(seconds: 2));
+    } catch (_) {
+      try {
+        return await limited.get(const GetOptions(source: Source.cache));
+      } catch (_) {
+        return await limited.get().timeout(const Duration(seconds: 1));
+      }
+    }
+  }
+
+  /// Inbox chats used by Messages lists and unread badges (role-aware).
+  Stream<List<ChatModel>> watchInboxChats(String userId) {
+    final controller = StreamController<List<ChatModel>>.broadcast();
+    final bySource = <String, Map<String, ChatModel>>{};
+    final subs = <StreamSubscription>[];
+    var cancelled = false;
+
+    void emit(_UnreadViewer viewer) {
+      if (cancelled || controller.isClosed) return;
+      final merged = <String, ChatModel>{};
+      for (final map in bySource.values) {
+        merged.addAll(map);
+      }
+      controller.add(_inboxChatsFromMap(merged, viewer));
+    }
+
+    () async {
+      final viewer = await _unreadViewer(userId);
+      if (cancelled || controller.isClosed) return;
+      emit(viewer);
+      for (final entry in _inboxQueries(viewer)) {
+        if (cancelled || controller.isClosed) return;
+        final source = entry.$1;
+        final query = entry.$2.limit(40);
+        subs.add(
+          query.snapshots().listen(
+            (snap) {
+              final next = <String, ChatModel>{};
+              for (final doc in snap.docs) {
+                final chat = _chatFromInboxDoc(doc, userId);
+                if (chat != null) next[chat.id] = chat;
+              }
+              bySource[source] = next;
+              emit(viewer);
+            },
+            onError: (_) {},
+          ),
+        );
+      }
+    }();
+
+    controller.onCancel = () {
+      cancelled = true;
+      for (final sub in subs) {
+        unawaited(sub.cancel());
+      }
+    };
+    return controller.stream;
   }
 
   // Get messages for a chat (real-time stream)
@@ -600,23 +1557,25 @@ class ChatService {
         toMark.add(doc);
       }
 
-      if (toMark.isEmpty) return;
+      if (toMark.isNotEmpty) {
+        final batch = _firestore.batch();
+        for (final doc in toMark) {
+          batch.update(doc.reference, {'isSeen': true});
+        }
+        await batch.commit();
 
-      final batch = _firestore.batch();
-      for (final doc in toMark) {
-        batch.update(doc.reference, {'isSeen': true});
+        for (final doc in toMark) {
+          unawaited(
+            HybridDatastore.updateChatMessage(
+              chatId: chatId,
+              id: doc.id,
+              patch: {'isSeen': true},
+            ),
+          );
+        }
       }
-      await batch.commit();
 
-      for (final doc in toMark) {
-        unawaited(
-          HybridDatastore.updateChatMessage(
-            chatId: chatId,
-            id: doc.id,
-            patch: {'isSeen': true},
-          ),
-        );
-      }
+      await _clearUnreadFor(chatId, userId);
 
       try {
         await _firestore.collection('messages').doc(chatId).update({
@@ -634,50 +1593,25 @@ class ChatService {
     }
   }
 
-  // Unread badge: cache-first, never N+1 message scans (those ANR the client).
-  Future<int> getUnreadCount(String userId, {int maxChats = 6}) async {
+  // Unread badge: staff/attorney office inbox + per-user unreadFor.
+  Future<int> getUnreadCount(String userId, {int maxChats = 40}) async {
     try {
-      final query = _firestore
-          .collection('messages')
-          .where('participants', arrayContains: userId)
-          .limit(maxChats);
-      QuerySnapshot<Map<String, dynamic>> chats;
-      try {
-        chats = await query
-            .get(const GetOptions(source: Source.cache))
-            .timeout(const Duration(seconds: 1));
-        if (chats.docs.isEmpty) {
-          chats = await query.get().timeout(const Duration(seconds: 1));
-        }
-      } catch (_) {
-        return 0;
-      }
-
-      var totalUnread = 0;
-      var peeked = 0;
-      for (final chatDoc in chats.docs) {
-        final data = chatDoc.data();
-        final deletedFor = List<String>.from(data['deletedFor'] ?? []);
-        if (deletedFor.contains(userId)) continue;
-        if (peeked >= 3) break;
-        peeked++;
+      final viewer = await _unreadViewer(userId);
+      final merged = <String, ChatModel>{};
+      for (final entry in _inboxQueries(viewer)) {
         try {
-          final snap = await _firestore
-              .collection('messages')
-              .doc(chatDoc.id)
-              .collection('messages')
-              .limit(8)
-              .get(const GetOptions(source: Source.cache))
-              .timeout(const Duration(milliseconds: 400));
-          for (final msgDoc in snap.docs) {
-            final msg = msgDoc.data();
-            if (msg['senderId'] != userId && msg['isSeen'] != true) {
-              totalUnread++;
-            }
+          final snap = await _inboxQueryGet(entry.$2);
+          for (final doc in snap.docs) {
+            final chat = _chatFromInboxDoc(doc, userId);
+            if (chat != null) merged[chat.id] = chat;
           }
         } catch (_) {}
       }
-      return totalUnread;
+
+      final chats = _inboxChatsFromMap(merged, viewer);
+      final total = _storedUnreadTotal(chats, viewer) +
+          await _peekUnseenFallback(chats, viewer, maxChats: maxChats);
+      return total;
     } catch (_) {
       return 0;
     }
@@ -740,37 +1674,50 @@ class ChatService {
   /// Live unread badge stream — refreshes when conversations update.
   Stream<int> watchUnreadCount(String userId, {int maxChats = 25}) {
     final controller = StreamController<int>.broadcast();
-    Timer? debounce;
     StreamSubscription<List<ChatModel>>? chatsSub;
+    Timer? debounce;
+    _UnreadViewer? viewer;
 
-    Future<void> refresh() async {
-      try {
-        final count = await getUnreadCount(userId, maxChats: maxChats);
-        if (!controller.isClosed) controller.add(count);
-      } catch (_) {
-        if (!controller.isClosed) controller.add(0);
+    var fallbackChecked = false;
+    var cachedFallback = 0;
+    DateTime? lastFallbackTime;
+
+    Future<void> publish(List<ChatModel> chats) async {
+      final v = viewer;
+      if (v == null) return;
+      final stored = _storedUnreadTotal(chats, v);
+      final now = DateTime.now();
+      if (!fallbackChecked ||
+          (lastFallbackTime != null &&
+              now.difference(lastFallbackTime!) > const Duration(minutes: 2))) {
+        fallbackChecked = true;
+        lastFallbackTime = now;
+        try {
+          cachedFallback = await _peekUnseenFallback(chats, v, maxChats: kIsWeb ? 4 : 8);
+        } catch (_) {}
       }
+      final total = stored + cachedFallback;
+      if (!controller.isClosed) controller.add(total);
     }
 
-    void scheduleRefresh() {
-      debounce?.cancel();
-      debounce = Timer(const Duration(milliseconds: 400), refresh);
-    }
-
-    chatsSub = getUserChats(userId).listen(
-      (_) => scheduleRefresh(),
-      onError: (_) {},
-    );
-    unawaited(refresh());
-
-    final poll = Timer.periodic(
-      const Duration(seconds: 10),
-      (_) => scheduleRefresh(),
-    );
+    () async {
+      viewer = await _unreadViewer(userId);
+      if (controller.isClosed) return;
+      chatsSub = watchInboxChats(userId).listen(
+        (chats) {
+          debounce?.cancel();
+          debounce = Timer(const Duration(milliseconds: 250), () {
+            unawaited(publish(chats));
+          });
+        },
+        onError: (_) {
+          if (!controller.isClosed) controller.add(0);
+        },
+      );
+    }();
 
     controller.onCancel = () {
       debounce?.cancel();
-      poll.cancel();
       chatsSub?.cancel();
     };
 
@@ -880,24 +1827,36 @@ class ChatService {
       StreamSubscription? attorneySub;
       StreamSubscription? staffSub;
       StreamSubscription? staffEmailSub;
+      StreamSubscription? officeInboxSub;
 
       void updateStream() {
-        // Filter out attorney-client conversations (where attorneyId is set but staffId is not)
-        // Staff should only see direct staff-client chats
         final List<ChatModel> filteredChats = allChatsMap.values.where((chat) {
-          // Exclude pure attorney-client conversations (no staffId and no staffEmail)
-          if (chat.attorneyId != null &&
-              chat.staffId == null &&
-              chat.staffEmail == null) {
-            return false; // This is an attorney-client chat, exclude it
+          final hasClient =
+              chat.clientId != null && chat.clientId!.isNotEmpty;
+          if (!chat.hasMessages) return false;
+          if (hasClient) {
+            final matchesAttorney =
+                attorneyId.isNotEmpty && chat.attorneyId == attorneyId;
+            final matchesStaff = chat.staffId == staffId;
+            final matchesOwnEmail =
+                staffEmail != null && chat.staffEmail == staffEmail;
+            final matchesOfficeInbox = chat.staffEmail == 'staff@gmail.com';
+            return matchesAttorney ||
+                matchesStaff ||
+                matchesOwnEmail ||
+                matchesOfficeInbox;
           }
-          // Include all other chats (staff-client chats)
-          return true;
+          if (attorneyId.isNotEmpty &&
+              chat.attorneyId == attorneyId &&
+              chat.staffId == staffId) {
+            return chat.hasMessages;
+          }
+          return false;
         }).toList();
 
         filteredChats.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
         if (!controller.isClosed) {
-          controller.add(filteredChats);
+          controller.add(ChatModel.oneThreadPerClient(filteredChats));
         }
       }
 
@@ -958,11 +1917,32 @@ class ChatService {
         );
       }
 
+      if (staffEmail != 'staff@gmail.com') {
+        officeInboxSub = _firestore
+            .collection('messages')
+            .where('staffEmail', isEqualTo: 'staff@gmail.com')
+            .snapshots()
+            .listen(
+          (snapshot) {
+            for (var doc in snapshot.docs) {
+              allChatsMap[doc.id] = ChatModel.fromFirestore(doc);
+            }
+            updateStream();
+          },
+          onError: (error) {
+            if (!controller.isClosed) {
+              controller.addError(error);
+            }
+          },
+        );
+      }
+
       // Cleanup on cancel
       controller.onCancel = () {
         attorneySub?.cancel();
         staffSub?.cancel();
         staffEmailSub?.cancel();
+        officeInboxSub?.cancel();
       };
 
       // Yield the stream
@@ -1181,4 +2161,43 @@ class ChatService {
       return false;
     }
   }
+}
+
+class _UnreadViewer {
+  const _UnreadViewer({
+    required this.id,
+    required this.role,
+    required this.email,
+    required this.assignedAttorneyId,
+  });
+
+  final String id;
+  final String role;
+  final String email;
+  final String assignedAttorneyId;
+
+  bool get isStaff => role == 'staff';
+  bool get isAttorney => role == 'attorney';
+}
+
+class _ChatSender {
+  const _ChatSender({
+    required this.id,
+    required this.name,
+    this.role,
+  });
+
+  final String id;
+  final String name;
+  final String? role;
+}
+
+class _OfficeStaff {
+  const _OfficeStaff({
+    required this.id,
+    required this.email,
+  });
+
+  final String? id;
+  final String email;
 }

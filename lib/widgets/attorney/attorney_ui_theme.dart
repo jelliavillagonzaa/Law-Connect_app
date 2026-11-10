@@ -27,7 +27,7 @@ class AttorneyUi {
   static const LinearGradient sidebarGradient = LinearGradient(
     begin: Alignment.topCenter,
     end: Alignment.bottomCenter,
-    colors: [Color(0xFF102A61), Color(0xFF0A1931)],
+    colors: [Color(0xFF07152B), Color(0xFF0A1B36), Color(0xFF07152B)],
   );
 
   static const LinearGradient heroGradient = LinearGradient(

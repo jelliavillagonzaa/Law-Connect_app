@@ -17,7 +17,6 @@ class BackupSettingsScreen extends StatefulWidget {
 class _BackupSettingsScreenState extends State<BackupSettingsScreen> {
   final BackupService _backupService = BackupService();
   bool _isRestoring = false;
-  String? _deletingBackupId;
 
   Widget _buildMainColumn() {
     return Column(
@@ -150,7 +149,7 @@ class _BackupSettingsScreenState extends State<BackupSettingsScreen> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Deleted users, staff applications, and cases (removed from Archive Storage) appear here. Use Recover to restore the Firestore record, or the trash icon to remove the backup copy permanently.',
+                  'Deleted users, staff applications, and cases (removed from Archive Storage) appear here. Use Recover to restore the Firestore record.',
                   style: TextStyle(color: Colors.grey[700], fontSize: 14),
                 ),
                 const SizedBox(height: 16),
@@ -213,7 +212,7 @@ class _BackupSettingsScreenState extends State<BackupSettingsScreen> {
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    'When you delete a user, staff application, or archived case, a snapshot is saved automatically. Restoring re-creates the Firestore document (Firebase Auth accounts are separate). Tap the trash icon to permanently remove a backup row.',
+                    'When you delete a user, staff application, or archived case, a snapshot is saved automatically. Restoring re-creates the Firestore document (Firebase Auth accounts are separate).',
                     style: TextStyle(
                       fontSize: 13,
                       color: const Color(0xFF6D6D6D),
@@ -404,41 +403,19 @@ class _BackupSettingsScreenState extends State<BackupSettingsScreen> {
         : collection;
 
     final backupId = backup['id'] as String;
-    final isDeletingThis = _deletingBackupId == backupId;
 
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
       elevation: 1,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       child: ListTile(
-        leading: Material(
-          color: Colors.transparent,
-          child: InkWell(
-            onTap: _deletingBackupId != null
-                ? null
-                : () => _confirmPermanentDelete(backupId, itemName),
+        leading: Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: Colors.orange.withOpacity(0.1),
             borderRadius: BorderRadius.circular(8),
-            child: Tooltip(
-              message: 'Permanently delete this backup',
-              child: Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.orange.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: isDeletingThis
-                    ? SizedBox(
-                        width: 22,
-                        height: 22,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.orange.shade800,
-                        ),
-                      )
-                    : Icon(Icons.delete_outline, color: Colors.orange.shade800),
-              ),
-            ),
           ),
+          child: Icon(Icons.inventory_2_outlined, color: Colors.orange.shade800),
         ),
         title: Text(itemName, style: TextStyle(fontWeight: FontWeight.w600)),
         subtitle: Column(
@@ -452,100 +429,22 @@ class _BackupSettingsScreenState extends State<BackupSettingsScreen> {
               ),
           ],
         ),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            OutlinedButton(
-              onPressed: _deletingBackupId != null
-                  ? null
-                  : () => _confirmPermanentDelete(backupId, itemName),
-              style: OutlinedButton.styleFrom(
-                foregroundColor: Colors.red.shade700,
-                side: BorderSide(color: Colors.red.shade300),
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-              child: const Text('Delete permanently'),
+        trailing: ElevatedButton(
+          onPressed: _isRestoring
+              ? null
+              : () => _restoreBackup(backupId, itemName),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: AppTheme.royalBlue,
+            foregroundColor: Colors.white,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
             ),
-            const SizedBox(width: 8),
-            ElevatedButton(
-              onPressed: _deletingBackupId != null
-                  ? null
-                  : () => _restoreBackup(backupId, itemName),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: AppTheme.royalBlue,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-              child: const Text('Restore'),
-            ),
-          ],
+          ),
+          child: const Text('Restore'),
         ),
       ),
     );
-  }
-
-  Future<void> _confirmPermanentDelete(String backupId, String itemName) async {
-    final confirm = await Get.dialog<bool>(
-      AlertDialog(
-        title: const Text('Delete backup forever?'),
-        content: Text(
-          'Remove the saved copy of "$itemName" from Backup. '
-          'You will not be able to recover this item from here unless it still exists in Firestore.\n\n'
-          'This does not delete live data elsewhere — only this backup snapshot.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Get.back(result: false),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () => Get.back(result: true),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.red.shade700,
-              foregroundColor: Colors.white,
-            ),
-            child: const Text('Delete forever'),
-          ),
-        ],
-      ),
-    );
-
-    if (confirm != true || !mounted) return;
-
-    setState(() => _deletingBackupId = backupId);
-
-    try {
-      final result = await _backupService.permanentlyDeleteBackup(backupId);
-      if (mounted) {
-        Get.snackbar(
-          result['success'] == true ? 'Deleted' : 'Error',
-          result['message'] as String,
-          backgroundColor:
-              result['success'] == true ? Colors.green.shade700 : Colors.red,
-          colorText: Colors.white,
-          duration: const Duration(seconds: 3),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        Get.snackbar(
-          'Error',
-          'Failed to delete backup: $e',
-          backgroundColor: Colors.red,
-          colorText: Colors.white,
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _deletingBackupId = null);
-      }
-    }
   }
 
   Future<void> _restoreBackup(String backupId, String itemName) async {

@@ -32,38 +32,94 @@ class HearingSmsFormatter {
     String location = '',
     String reminderKind = '',
   }) {
-    final lines = <String>[brand, ''];
-    final kind = reminderKind.trim().toLowerCase();
-    if (kind == 'd5') {
-      lines.add(fiveDayLeadIn);
-      lines.add('');
-    } else if (kind == 'd2') {
-      lines.add(twoDayLeadIn);
-      lines.add('');
-    } else if (kind == 'hearing_day' || kind == 'day_noon') {
-      lines.add(hearingDayLeadIn);
-      lines.add('');
-    }
+    return _compose(
+      caseNo: caseNo,
+      caseTitle: caseTitle,
+      clientName: clientName,
+      hearingDate: hearingDate,
+      hearingTime: hearingTime,
+      location: location,
+      reminderKind: reminderKind,
+      dateFirst: false,
+    );
+  }
 
+  /// Phone push tray copy. [Date:] is the first line so collapsed Android/iOS
+  /// notifications always show the hearing date.
+  static String buildPush({
+    String caseNo = '',
+    String caseTitle = '',
+    String clientName = '',
+    String hearingDate = '',
+    String hearingTime = '',
+    String location = '',
+    String reminderKind = '',
+  }) {
+    return _compose(
+      caseNo: caseNo,
+      caseTitle: caseTitle,
+      clientName: clientName,
+      hearingDate: hearingDate,
+      hearingTime: hearingTime,
+      location: location,
+      reminderKind: reminderKind,
+      dateFirst: true,
+    );
+  }
+
+  static String _compose({
+    required String caseNo,
+    required String caseTitle,
+    required String clientName,
+    required String hearingDate,
+    required String hearingTime,
+    required String location,
+    required String reminderKind,
+    required bool dateFirst,
+  }) {
+    final lines = <String>[];
+    final kind = reminderKind.trim().toLowerCase();
+    final date = hearingDate.trim();
+    final time = formatTime(hearingTime);
+    final loc = formatLocation(location);
     final caseLine = formatCaseNumber(caseNo);
-    if (caseLine.isNotEmpty) lines.add(caseLine);
+
+    if (dateFirst) {
+      if (date.isNotEmpty) lines.add('Date: $date');
+      if (time.isNotEmpty) lines.add('Time: $time');
+      if (loc.isNotEmpty) lines.add('Location: $loc');
+      if (caseLine.isNotEmpty) lines.add(caseLine);
+      if (kind == 'd5') {
+        lines.add(fiveDayLeadIn);
+      } else if (kind == 'd2') {
+        lines.add(twoDayLeadIn);
+      } else if (kind == 'hearing_day' || kind == 'day_noon') {
+        lines.add(hearingDayLeadIn);
+      }
+    } else {
+      lines.add(brand);
+      lines.add('');
+      if (kind == 'd5') {
+        lines.add(fiveDayLeadIn);
+        lines.add('');
+      } else if (kind == 'd2') {
+        lines.add(twoDayLeadIn);
+        lines.add('');
+      } else if (kind == 'hearing_day' || kind == 'day_noon') {
+        lines.add(hearingDayLeadIn);
+        lines.add('');
+      }
+      if (caseLine.isNotEmpty) lines.add(caseLine);
+      if (date.isNotEmpty) lines.add('Date: $date');
+      if (time.isNotEmpty) lines.add('Time: $time');
+      if (loc.isNotEmpty) lines.add('Location: $loc');
+    }
 
     final caption = captionLines(caseTitle, clientName: clientName);
-    lines.addAll(caption);
-
-    if (kind.isEmpty) {
+    if (caption.isNotEmpty) {
       lines.add('');
-      lines.add('Hearing Details:');
-    } else {
-      lines.add('');
+      lines.addAll(caption);
     }
-
-    final date = hearingDate.trim();
-    if (date.isNotEmpty) lines.add('Date: $date');
-    final time = formatTime(hearingTime);
-    if (time.isNotEmpty) lines.add('Time: $time');
-    final loc = formatLocation(location);
-    if (loc.isNotEmpty) lines.add('Location: $loc');
 
     lines.add('');
     if (kind == 'd5') {
@@ -80,7 +136,7 @@ class HearingSmsFormatter {
     if (text.length > maxSmsLength) {
       final shortenedTitle = _etAlCaseTitle(caseTitle);
       if (shortenedTitle != caseTitle) {
-        return build(
+        return _compose(
           caseNo: caseNo,
           caseTitle: shortenedTitle,
           clientName: clientName,
@@ -88,6 +144,7 @@ class HearingSmsFormatter {
           hearingTime: hearingTime,
           location: location,
           reminderKind: reminderKind,
+          dateFirst: dateFirst,
         );
       }
     }

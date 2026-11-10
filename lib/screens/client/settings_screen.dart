@@ -6,6 +6,7 @@ import '../../widgets/primary_button.dart';
 import '../../services/auth_service.dart';
 import '../../controllers/auth_controller.dart';
 import '../../routes/portal_navigation.dart';
+import 'help_center_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
@@ -130,14 +131,7 @@ class SettingsScreen extends StatelessWidget {
               label: 'Help & Support',
               value: 'Get help and contact support',
               icon: Icons.help_outline,
-              onTap: () {
-                Get.snackbar(
-                  'Help & Support',
-                  'Support features coming soon',
-                  backgroundColor: AppTheme.navy,
-                  colorText: AppTheme.white,
-                );
-              },
+              onTap: () => Get.to(() => const HelpCenterScreen()),
             ),
             Padding(
               padding: const EdgeInsets.all(16),

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
@@ -62,35 +63,73 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) return;
 
-      // Get staff members assigned to this attorney
-      final staffQuery = await _firestore
+      var staffQuery = await _firestore
           .collection('users')
           .where('role', isEqualTo: 'staff')
-          .where('assignedAttorneyId', isEqualTo: user.uid)
           .get();
 
-      setState(() {
-        _staffList = staffQuery.docs.map((doc) {
-          final data = doc.data();
-          return {
-            'id': doc.id,
-            'name': data['fullName'] ?? data['name'] ?? 'Staff Member',
-            'email': data['email'] ?? '',
-          };
+      if (staffQuery.docs.isEmpty) {
+        staffQuery = await _firestore
+            .collection('users')
+            .where('email', isEqualTo: 'staff@gmail.com')
+            .limit(1)
+            .get();
+      }
+
+      var docs = staffQuery.docs;
+
+      // 1. Filter out inactive accounts (isActive == false)
+      final activeOnly = docs.where((d) => d.data()['isActive'] != false).toList();
+      if (activeOnly.isNotEmpty) docs = activeOnly;
+
+      // 2. Prioritize staff explicitly assigned to this attorney
+      final assignedToMe = docs.where((d) {
+        final aid = (d.data()['assignedAttorneyId'] ?? d.data()['attorneyId'] ?? '').toString().trim();
+        return aid == user.uid;
+      }).toList();
+      if (assignedToMe.isNotEmpty) {
+        docs = assignedToMe;
+      } else if (docs.length > 1) {
+        // 3. Prioritize 'apaostaff' (official office staff) over generic/dummy account
+        final apao = docs.where((d) {
+          final email = (d.data()['email'] ?? '').toString().toLowerCase();
+          final name = (d.data()['fullName'] ?? d.data()['name'] ?? '').toString().toLowerCase();
+          return email.contains('apao') || name.contains('apao');
         }).toList();
+        if (apao.isNotEmpty) {
+          docs = apao;
+        }
+      }
+
+      // 4. Ensure only 1 active staff member remains so no manual filtering or dropdown is needed
+      if (docs.length > 1) {
+        docs = [docs.first];
+      }
+
+      final list = docs.map((doc) {
+        final data = doc.data();
+        return {
+          'id': doc.id,
+          'name': data['fullName'] ?? data['name'] ?? 'Staff Member',
+          'email': data['email'] ?? '',
+        };
+      }).toList();
+
+      if (!mounted) return;
+      setState(() {
+        _staffList = list;
+        if (_staffList.isNotEmpty) {
+          _selectedStaffId = _staffList.first['id'] as String;
+        }
         _isLoadingStaff = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _isLoadingStaff = false;
       });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error loading staff: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
+      if (kDebugMode) {
+        debugPrint('Error loading staff: $e');
       }
     }
   }
@@ -156,10 +195,13 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
       return;
     }
 
+    _selectedStaffId ??=
+        (_staffList.isNotEmpty ? _staffList.first['id'] as String? : null);
+
     if (_selectedStaffId == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Please select a staff member to assign the task to'),
+          content: Text('No staff member available to assign the task to'),
           backgroundColor: Colors.orange,
         ),
       );
@@ -277,75 +319,138 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
               ),
               const SizedBox(height: 20),
 
-              // Assign To Staff Dropdown
+              // Assign To Staff
               Container(
                 width: double.infinity,
-                padding: const EdgeInsets.symmetric(horizontal: 12),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                 decoration: BoxDecoration(
                   color: Colors.white,
                   borderRadius: BorderRadius.circular(12),
                   border: Border.all(color: Colors.grey[300]!),
                 ),
                 child: _isLoadingStaff
-                    ? const Padding(
-                        padding: EdgeInsets.all(16),
-                        child: Center(child: CircularProgressIndicator()),
-                      )
-                    : DropdownButtonFormField<String>(
-                        isExpanded: true,
-                        initialValue: _selectedStaffId,
-                        decoration: const InputDecoration(
-                          labelText: 'Assign Staff *',
-                          border: InputBorder.none,
-                          prefixIcon: Icon(Icons.person),
-                          isDense: true,
+                    ? const Center(
+                        child: Padding(
+                          padding: EdgeInsets.all(8),
+                          child: CircularProgressIndicator(),
                         ),
-                        hint: const Text('Select staff member'),
-                        items: _staffList.isEmpty
-                            ? [
-                                const DropdownMenuItem<String>(
-                                  value: null,
-                                  enabled: false,
-                                  child: Text('No staff members available'),
-                                ),
-                              ]
-                            : _staffList.map((staff) {
-                                return DropdownMenuItem<String>(
-                                  value: staff['id'] as String,
-                                  child: dropdownEllipsisText(
-                                    staff['name'] as String,
-                                    fontSize: 16,
-                                  ),
-                                );
-                              }).toList(),
-                        selectedItemBuilder: (context) {
-                          if (_staffList.isEmpty) {
-                            return [
-                              dropdownSelectedLabel(
-                                'No staff members available',
+                      )
+                    : (_staffList.isEmpty
+                        ? const Row(
+                            children: [
+                              Icon(Icons.person_outline, color: Colors.grey),
+                              SizedBox(width: 12),
+                              Text(
+                                'No staff account found in system',
+                                style: TextStyle(color: Colors.grey),
                               ),
-                            ];
-                          }
-                          return dropdownSelectedLabels(
-                            _staffList
-                                .map((staff) => staff['name'] as String)
-                                .toList(),
-                          );
-                        },
-                        onChanged: _staffList.isEmpty
-                            ? null
-                            : (value) {
-                                setState(() {
-                                  _selectedStaffId = value;
-                                });
-                              },
-                        validator: (value) {
-                          if (value == null || value.isEmpty) {
-                            return 'Please select a staff member';
-                          }
-                          return null;
-                        },
-                      ),
+                            ],
+                          )
+                        : (_staffList.length == 1
+                            ? Row(
+                                children: [
+                                  Container(
+                                    padding: const EdgeInsets.all(8),
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFF1E6BFF)
+                                          .withValues(alpha: 0.1),
+                                      shape: BoxShape.circle,
+                                    ),
+                                    child: const Icon(
+                                      Icons.person,
+                                      color: Color(0xFF1E6BFF),
+                                      size: 20,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        const Text(
+                                          'Assign Staff',
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w600,
+                                            color: Colors.grey,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 2),
+                                        Text(
+                                          _staffList.first['name'] as String,
+                                          style: const TextStyle(
+                                            fontSize: 15,
+                                            fontWeight: FontWeight.w700,
+                                            color: Color(0xFF1A2744),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 5,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFF10B981)
+                                          .withValues(alpha: 0.12),
+                                      borderRadius: BorderRadius.circular(20),
+                                    ),
+                                    child: const Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(
+                                          Icons.check_circle_rounded,
+                                          size: 14,
+                                          color: Color(0xFF10B981),
+                                        ),
+                                        SizedBox(width: 4),
+                                        Text(
+                                          'Auto-assigned',
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w600,
+                                            color: Color(0xFF10B981),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              )
+                            : DropdownButtonFormField<String>(
+                                isExpanded: true,
+                                initialValue: _selectedStaffId,
+                                decoration: const InputDecoration(
+                                  labelText: 'Assign Staff *',
+                                  border: InputBorder.none,
+                                  prefixIcon: Icon(Icons.person),
+                                  isDense: true,
+                                ),
+                                hint: const Text('Select staff member'),
+                                items: _staffList.map((staff) {
+                                  return DropdownMenuItem<String>(
+                                    value: staff['id'] as String,
+                                    child: dropdownEllipsisText(
+                                      staff['name'] as String,
+                                      fontSize: 16,
+                                    ),
+                                  );
+                                }).toList(),
+                                selectedItemBuilder: (context) =>
+                                    dropdownSelectedLabels(
+                                  _staffList
+                                      .map((staff) => staff['name'] as String)
+                                      .toList(),
+                                ),
+                                onChanged: (value) {
+                                  setState(() {
+                                    _selectedStaffId = value;
+                                  });
+                                },
+                              ))),
               ),
               const SizedBox(height: 20),
 
@@ -460,36 +565,6 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
                   ),
                 ),
               ),
-              const SizedBox(height: 20),
-
-              // Priority Selection
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.grey[300]!),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Priority',
-                      style: TextStyle(fontSize: 12, color: Colors.grey),
-                    ),
-                    const SizedBox(height: 12),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        _buildPriorityChip(TaskPriority.high, 'High'),
-                        _buildPriorityChip(TaskPriority.normal, 'Normal'),
-                        _buildPriorityChip(TaskPriority.low, 'Low'),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
               const SizedBox(height: 30),
 
               // Create Button
@@ -526,30 +601,6 @@ class _AttorneyCreateTaskScreenState extends State<AttorneyCreateTaskScreen> {
             ],
           ),
         ),
-      ),
-    );
-  }
-
-  Widget _buildPriorityChip(int priority, String label) {
-    final color = TaskPriority.color(priority);
-    final isSelected = TaskPriority.coerce(_selectedPriority) == priority;
-    return FilterChip(
-      label: Text(label),
-      selected: isSelected,
-      onSelected: (_) {
-        setState(() {
-          _selectedPriority = priority;
-        });
-      },
-      selectedColor: color.withValues(alpha: 0.2),
-      checkmarkColor: color,
-      labelStyle: TextStyle(
-        color: isSelected ? color : Colors.black87,
-        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-      ),
-      side: BorderSide(
-        color: isSelected ? color : Colors.grey[300]!,
-        width: isSelected ? 2 : 1,
       ),
     );
   }

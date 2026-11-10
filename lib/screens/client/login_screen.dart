@@ -7,7 +7,7 @@ import '../../services/auth_service.dart';
 import 'signup_screen.dart';
 import '../../routes/portal_navigation.dart';
 import '../../pages/auth/forgot_password_page.dart';
-import '../../pages/auth/otp_verification.dart';
+import '../../widgets/common/login_error_dialog.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -40,52 +40,29 @@ class _LoginScreenState extends State<LoginScreen> {
       if (mounted) {
         if (result['success'] == true) {
           final role = result['role'] ?? 'client';
-
-          if (result['needsVerification'] == true && role == 'client') {
-            Get.snackbar(
-              'Verification Required',
-              result['message'] ?? 'Please verify your email first.',
-              backgroundColor: AppTheme.gold,
-              colorText: AppTheme.deepNavy,
-              duration: const Duration(seconds: 3),
-            );
-            Get.offAll(() => const OtpVerificationPage());
-          } else {
-            navigateToPortalDashboard(role);
-          }
+          navigateToPortalDashboard(role);
         } else {
           // Show error message
           final message =
               result['message'] ?? 'Login failed. Please try again.';
 
-          if (result['needsVerification'] == true) {
-            Get.snackbar(
-              'Verification Required',
-              message,
-              backgroundColor: AppTheme.gold,
-              colorText: AppTheme.deepNavy,
-              duration: const Duration(seconds: 4),
-            );
-            Get.offAll(() => const OtpVerificationPage());
-          } else {
-            Get.snackbar(
-              'Login Failed',
-              message,
-              backgroundColor: Colors.red,
-              colorText: AppTheme.cleanWhite,
-              duration: const Duration(seconds: 3),
-            );
-          }
+          await showLoginErrorDialog(
+            context,
+            message: message,
+            onForgotPassword: () {
+              Get.to(() => const ForgotPasswordPage());
+            },
+          );
         }
       }
     } catch (e) {
       if (mounted) {
-        Get.snackbar(
-          'Error',
-          'An unexpected error occurred: ${e.toString()}',
-          backgroundColor: Colors.red,
-          colorText: AppTheme.cleanWhite,
-          duration: const Duration(seconds: 3),
+        await showLoginErrorDialog(
+          context,
+          message: e,
+          onForgotPassword: () {
+            Get.to(() => const ForgotPasswordPage());
+          },
         );
       }
     } finally {

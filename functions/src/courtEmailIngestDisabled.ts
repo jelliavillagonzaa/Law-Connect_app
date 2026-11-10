@@ -33,7 +33,11 @@ export const imapCourtEmailManual = onRequest(
   },
 );
 
-export const processCourtEmailQueue = onSchedule(
+/**
+ * Renamed from processCourtEmailQueue — that name was still a callable in
+ * production, and Firebase blocks callable → scheduled in place. Idle stub only.
+ */
+export const processCourtEmailQueueIdle = onSchedule(
   {
     schedule: "every 10 minutes",
     timeZone: "UTC",
@@ -41,7 +45,7 @@ export const processCourtEmailQueue = onSchedule(
     memory: "128MiB",
   },
   async () => {
-    logger.info("processCourtEmailQueue: idle (hearings written by n8n)");
+    logger.info("processCourtEmailQueueIdle: idle (hearings written by n8n)");
   },
 );
 
