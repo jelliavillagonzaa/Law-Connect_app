@@ -51,12 +51,10 @@ class DefaultFirebaseOptions {
     measurementId: "G-S7G14B5T35",
   );
 
-  // Debug uses the web API key so `flutter run` is not blocked when this PC's
-  // debug SHA-1 is missing from the Android-restricted Firebase key.
-  static FirebaseOptions get android => FirebaseOptions(
-    apiKey: kDebugMode
-        ? web.apiKey
-        : 'AIzaSyDYhAD-NA5fr_xayommEg9vGP0WyuqGLqM',
+  // Use web.apiKey for Android across all build modes (debug & release)
+  // so standalone APKs downloaded directly are not blocked by Google Cloud SHA-1 restrictions.
+  static const FirebaseOptions android = FirebaseOptions(
+    apiKey: "AIzaSyCPcq-fpSxaLnnq4T5s_19vem0fIVuI11Q",
     appId: '1:969711743833:android:12db52dbd2114b941e1248',
     messagingSenderId: '969711743833',
     projectId: 'jurislink-app',

@@ -17,9 +17,9 @@ Future<void> initializeFirebaseInBackground() async {
       await Firebase.initializeApp(
         options: options,
       ).timeout(const Duration(seconds: 20));
-    } else if (!kIsWeb && kDebugMode) {
-      // google-services.json may auto-init first with the SHA-restricted Android
-      // key. Recreate the default app so debug login matches firebase_options.
+    } else if (!kIsWeb) {
+      // Recreate the default app if native auto-init used a different API key,
+      // ensuring login matches the working firebase_options key in both debug and release.
       final existing = Firebase.app();
       if (existing.options.apiKey != options.apiKey) {
         await existing.delete();
@@ -29,20 +29,9 @@ Future<void> initializeFirebaseInBackground() async {
       }
     }
 
-    // App Check on mobile only in release — debug builds skip it so Firestore reads work
-    // without registering a debug token (web never uses App Check here).
-    if (!kIsWeb && kReleaseMode) {
-      try {
-        await FirebaseAppCheck.instance.activate(
-          androidProvider: AndroidProvider.playIntegrity,
-          appleProvider: AppleProvider.appAttest,
-        );
-      } catch (e) {
-        if (kDebugMode) {
-          appLog('App Check activate skipped: $e', name: 'startup');
-        }
-      }
-    }
+    // App Check: Sideloaded APKs distributed directly outside Google Play Store
+    // do not support Play Integrity (Play Store installation is required).
+    // Skipping Play Integrity avoids invalid App Check tokens blocking Auth and Firestore.
 
     try {
       FirebaseFirestore.instance.settings = const Settings(
