@@ -1950,28 +1950,29 @@ class AuthService {
     required String userId,
     required String role,
   }) async {
-    final display = name.trim().isEmpty ? '' : ', ${name.trim()}';
+    final cleanName = name.trim();
+    final greeting = cleanName.isNotEmpty ? ', $cleanName' : '';
     final link = EmailBranding.downloadAppUrl;
     final body =
-        'Welcome from Law Connect$display! You can download the app to explore: $link';
+        'Welcome to Law Connect$greeting! Your account is ready. You can now download the app to explore cases, appointments & legal services: $link';
 
     if (phone.trim().isNotEmpty) {
       try {
-        await SmsService().queueSms(
-          to: phone,
+        await SmsService().sendWelcomeSms(
+          to: phone.trim(),
           body: body,
           userId: userId,
-          meta: {'type': 'welcome', 'role': role},
+          role: role,
         );
       } catch (e) {
         if (kDebugMode) {
-          debugPrint('⚠️ Welcome SMS not queued (non-critical): $e');
+          debugPrint('⚠️ Welcome SMS not sent (non-critical): $e');
         }
       }
     }
 
     try {
-      await EmailOtpService().sendWelcome(email: email, name: display);
+      await EmailOtpService().sendWelcome(email: email, name: cleanName);
     } catch (e) {
       if (kDebugMode) {
         debugPrint('⚠️ Welcome email not sent (non-critical): $e');

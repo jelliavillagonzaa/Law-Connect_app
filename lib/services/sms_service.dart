@@ -62,6 +62,9 @@ class SmsService {
   static bool _isSignupOtpMeta(Map<String, dynamic>? meta) =>
       meta != null && meta['type'] == 'otp';
 
+  static bool _isWelcomeMeta(Map<String, dynamic>? meta) =>
+      meta != null && meta['type'] == 'welcome';
+
   String _normalizePhoneE164Ph(String input) => normalizePhoneE164Ph(input);
 
   /// `09…` and `+63…` for the same SIM become one key.
@@ -153,6 +156,93 @@ class SmsService {
     );
   }
 
+  /// Welcome SMS after registration — sends immediately via Semaphore and PhilSMS.
+  Future<SmsDeliveryOutcome> sendWelcomeSms({
+    required String to,
+    required String body,
+    String? userId,
+    String? role,
+  }) async {
+    final cleanTo = _normalizePhoneE164Ph(to);
+    final cleanBody = body.trim();
+    if (cleanTo.isEmpty || cleanBody.isEmpty) {
+      return const SmsDeliveryOutcome(
+        status: SmsDeliveryStatus.failed,
+        error: 'Missing phone number or message.',
+      );
+    }
+
+    var semOk = false;
+    String? semError;
+    if (SemaphoreConfig.isConfigured) {
+      final sem = await SemaphoreService.instance.sendSmsWithResult(
+        to: cleanTo,
+        message: cleanBody,
+      );
+      semOk = sem.success;
+      semError = sem.errorMessage;
+      if (kDebugMode) {
+        debugPrint(
+          semOk
+              ? '✅ Welcome SMS sent via Semaphore'
+              : '⚠️ Semaphore welcome SMS failed: $semError',
+        );
+      }
+    }
+
+    var philOk = false;
+    String? philError;
+    if (PhilSmsConfig.isConfigured) {
+      final phil = await PhilSmsService.instance.sendSmsWithResult(
+        to: cleanTo,
+        message: cleanBody,
+      );
+      philOk = phil.success;
+      philError = phil.errorMessage;
+      if (kDebugMode) {
+        debugPrint(
+          philOk
+              ? '✅ Welcome SMS sent via PhilSMS'
+              : '⚠️ PhilSMS welcome SMS failed: $philError',
+        );
+      }
+    }
+
+    if (semOk || philOk) {
+      return SmsDeliveryOutcome(
+        status: SmsDeliveryStatus.sent,
+        provider: semOk ? 'semaphore' : 'philsms',
+        queueResult: semOk
+            ? SmsQueueResult.sentViaSemaphore
+            : SmsQueueResult.sentViaPhilSms,
+      );
+    }
+
+    // Best-effort Firestore queue fallback if auth/user context exists
+    try {
+      final effectiveUid = _auth.currentUser?.uid ?? userId ?? 'welcome_service';
+      final reqId = await _queueSmsFirestore(
+        cleanTo: cleanTo,
+        cleanBody: cleanBody,
+        createdBy: effectiveUid,
+        userId: userId ?? effectiveUid,
+        meta: {'type': 'welcome', 'role': role ?? 'client'},
+      );
+      return SmsDeliveryOutcome(
+        status: SmsDeliveryStatus.sent,
+        provider: 'firestore_queue',
+        queueResult: SmsQueueResult.queuedInFirestore,
+        requestId: reqId,
+      );
+    } catch (_) {}
+
+    return SmsDeliveryOutcome(
+      status: SmsDeliveryStatus.failed,
+      error: semError ?? philError ?? 'Failed to deliver welcome SMS',
+      provider: SemaphoreConfig.isConfigured ? 'semaphore' : 'philsms',
+    );
+  }
+
   /// Queues or sends SMS. Returns how it was handed off (not guaranteed delivery).
   Future<({SmsQueueResult result, String? requestId})> queueSms({
     required String to,
@@ -160,8 +250,8 @@ class SmsService {
     String? userId,
     Map<String, dynamic>? meta,
   }) async {
-    final uid = _auth.currentUser?.uid;
-    if (uid == null) {
+    final uid = _auth.currentUser?.uid ?? userId;
+    if (uid == null && !_isSignupOtpMeta(meta) && !_isWelcomeMeta(meta)) {
       throw StateError('Not logged in');
     }
 
@@ -192,6 +282,21 @@ class SmsService {
       throw StateError(
         outcome.error ?? 'Could not send verification code via SMS.',
       );
+    }
+
+    if (_isWelcomeMeta(meta)) {
+      final outcome = await sendWelcomeSms(
+        to: cleanTo,
+        body: cleanBody,
+        userId: userId,
+        role: meta?['role']?.toString(),
+      );
+      if (outcome.isSent) {
+        return (
+          result: outcome.queueResult ?? SmsQueueResult.sentViaSemaphore,
+          requestId: outcome.requestId,
+        );
+      }
     }
 
     // Browser calls to PhilSMS are blocked by CORS. Web queues the SMS so
@@ -269,11 +374,12 @@ class SmsService {
       );
     }
 
+    final effectiveUid = uid ?? userId ?? 'unauthenticated';
     final requestId = await _queueSmsFirestore(
       cleanTo: cleanTo,
       cleanBody: cleanBody,
-      createdBy: uid,
-      userId: userId ?? uid,
+      createdBy: effectiveUid,
+      userId: userId ?? effectiveUid,
       meta: meta,
     );
     return (result: SmsQueueResult.queuedInFirestore, requestId: requestId);

@@ -2,6 +2,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 
+import '../config/email_branding.dart';
 import '../models/staff_model.dart';
 import '../models/user_model.dart';
 import 'email_otp_service.dart';
@@ -373,7 +374,7 @@ class StaffAuthService {
           final sms = SmsService();
           final welcome = welcomeSettings.applyTemplate(
             welcomeSettings.welcomeEmail,
-            'Welcome to Law Connect, $name! Your staff account is ready. Please login using your email.',
+            'Welcome to Law Connect, $name! Your staff account is ready. You can now download the app to explore: ${EmailBranding.downloadAppUrl}',
             {'name': name},
           );
           await sms.queueSms(
@@ -519,8 +520,8 @@ class StaffAuthService {
           await sms.queueSms(
             to: phone.trim(),
             body: awaitingAppApproval
-                ? 'Law Connect: your staff profile was created. You can sign in after an administrator approves your application.'
-                : 'Law Connect: your staff profile is ready. You can sign in with your email and password.',
+                ? 'Law Connect: your staff profile was created. You can download our app to explore: ${EmailBranding.downloadAppUrl} (login enabled after admin approval).'
+                : 'Welcome to Law Connect! Your staff account is ready. You can now download the app to explore: ${EmailBranding.downloadAppUrl}',
             userId: staffId,
             meta: {'type': 'welcome', 'role': 'staff'},
           );
